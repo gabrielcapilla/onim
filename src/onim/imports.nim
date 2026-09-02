@@ -7,18 +7,32 @@ type
     importModule
     fromModule
 
+  ImportSymbol* = object
+    name*: string
+    startOffset*: int
+    endOffset*: int
+
   ImportInfo* = object
     form*: ImportForm
     module*: string
     alias*: string
     imported*: HashSet[string]
     excluded*: HashSet[string]
+    importedSymbols*: seq[ImportSymbol]
     startOffset*: int
     endOffset*: int
+    moduleStartOffset*: int
+    moduleEndOffset*: int
+    diagnosticNameStartOffset*: int
+    diagnosticNameEndOffset*: int
+    itemStartOffset*: int
+    itemEndOffset*: int
+    separatorStartOffset*: int
     line*: int
     indent*: string
     synthetic*: bool
     conditional*: bool
+    keep*: bool
 
   SourceImports* = object
     tokens*: seq[Token]
@@ -41,6 +55,22 @@ proc lineIndent(source: string, offset: int): string =
   while start < offset and source[start] in {' ', '\t'}:
     result.add source[start]
     inc start
+
+proc keepImport(source: string, tokens: seq[Token], start, finish: int): bool =
+  if start < 0 or start >= tokens.len or finish <= start or finish > tokens.len:
+    return false
+  var lineStart = tokens[start].startOffset
+  while lineStart > 0 and source[lineStart - 1] != '\n':
+    dec lineStart
+  var lineEnd = tokens[start].endOffset
+  while lineEnd < source.len and source[lineEnd] != '\n':
+    inc lineEnd
+  let line = source[lineStart ..< lineEnd].toLowerAscii
+  if line.contains("# onim: keep") or line.contains("// onim: keep"):
+    return true
+  var statement = source[tokens[start].startOffset ..< tokens[finish - 1].endOffset]
+  statement = statement.replace(" ", "").replace("\t", "").replace("\r", "")
+  statement.contains("{.all.}")
 
 proc conditionalImport(source: string, token: Token): bool =
   if token.line <= 0:
@@ -87,14 +117,41 @@ proc statementEnd(tokens: seq[Token], start: int): int =
     inc index
   index
 
-proc addImportedName(info: var ImportInfo, name: string) =
-  if name.len > 0 and name != "*":
-    info.imported.incl name
+proc addImportedName(info: var ImportInfo, token: Token) =
+  if token.kind == tkIdentifier and token.text != "*":
+    info.imported.incl token.text
+    info.importedSymbols.add ImportSymbol(
+      name: token.text, startOffset: token.startOffset, endOffset: token.endOffset
+    )
+
+proc addFromImportedName(
+    info: var ImportInfo, tokens: seq[Token], cursor: var int, finish: int
+) =
+  while cursor < finish and
+      (tokens[cursor].kind != tkIdentifier or tokens[cursor].text == "as"):
+    inc cursor
+  if cursor >= finish or tokens[cursor].text == "except":
+    return
+  let start = tokens[cursor].startOffset
+  var name = tokens[cursor].text
+  var finishOffset = tokens[cursor].endOffset
+  inc cursor
+  if cursor < finish and tokens[cursor].text == "as":
+    inc cursor
+    if cursor < finish and tokens[cursor].kind == tkIdentifier:
+      name = tokens[cursor].text
+      finishOffset = tokens[cursor].endOffset
+      inc cursor
+  info.imported.incl name
+  info.importedSymbols.add ImportSymbol(
+    name: name, startOffset: start, endOffset: finishOffset
+  )
 
 proc parseImport(
     tokens: seq[Token], source: string, index: int
 ): tuple[items: seq[ImportInfo], next: int] =
   let endIndex = statementEnd(tokens, index)
+  let keep = keepImport(source, tokens, index, endIndex)
   var cursor = index + 1
   var prefix = ""
   while cursor < endIndex and tokens[cursor].text != "[" and tokens[cursor].text != "as" and
@@ -115,10 +172,17 @@ proc parseImport(
           module: module,
           imported: initHashSet[string](),
           excluded: initHashSet[string](),
+          moduleStartOffset: tokens[cursor].startOffset,
+          moduleEndOffset: tokens[cursor].endOffset,
+          diagnosticNameStartOffset: tokens[cursor].startOffset,
+          diagnosticNameEndOffset: tokens[cursor].endOffset,
+          itemStartOffset: tokens[cursor].startOffset,
+          itemEndOffset: tokens[cursor].endOffset,
           startOffset: tokens[index].startOffset,
           endOffset: tokens[endIndex - 1].endOffset,
           line: tokens[index].line,
           indent: lineIndent(source, tokens[index].startOffset),
+          keep: keep,
         )
         result.items.add item
       inc cursor
@@ -137,20 +201,37 @@ proc parseImport(
       let module = moduleText(tokens, moduleStart, cursor)
       if module.len == 0:
         continue
+      let separatorStart =
+        if result.items.len > 0 and moduleStart > 0 and
+            tokens[moduleStart - 1].text == ",":
+          tokens[moduleStart - 1].startOffset
+        else:
+          -1
       var item = ImportInfo(
         form: importModule,
         module: module,
         imported: initHashSet[string](),
         excluded: initHashSet[string](),
+        moduleStartOffset: tokens[moduleStart].startOffset,
+        moduleEndOffset: tokens[cursor - 1].endOffset,
+        diagnosticNameStartOffset: tokens[moduleStart].startOffset,
+        diagnosticNameEndOffset: tokens[cursor - 1].endOffset,
+        itemStartOffset: tokens[moduleStart].startOffset,
+        itemEndOffset: tokens[cursor - 1].endOffset,
+        separatorStartOffset: separatorStart,
         startOffset: tokens[index].startOffset,
         endOffset: tokens[endIndex - 1].endOffset,
         line: tokens[index].line,
         indent: lineIndent(source, tokens[index].startOffset),
+        keep: keep,
       )
       if cursor < endIndex and tokens[cursor].text == "as":
         inc cursor
         if cursor < endIndex and tokens[cursor].kind == tkIdentifier:
           item.alias = tokens[cursor].text
+          item.diagnosticNameStartOffset = tokens[cursor].startOffset
+          item.diagnosticNameEndOffset = tokens[cursor].endOffset
+          item.itemEndOffset = tokens[cursor].endOffset
           inc cursor
       result.items.add item
 
@@ -165,6 +246,7 @@ proc parseImport(
       if tokens[cursorExcept].kind == tkIdentifier:
         result.items[^1].excluded.incl tokens[cursorExcept].text
       inc cursorExcept
+    result.items[^1].itemEndOffset = tokens[endIndex - 1].endOffset
   result.next = endIndex
 
 proc parseFrom(
@@ -186,11 +268,21 @@ proc parseFrom(
     endOffset: tokens[endIndex - 1].endOffset,
     line: tokens[index].line,
     indent: lineIndent(source, tokens[index].startOffset),
+    keep: keepImport(source, tokens, index, endIndex),
   )
-  for cursor in importIndex + 1 ..< endIndex:
-    if tokens[cursor].kind == tkIdentifier and tokens[cursor].text != "except" and
-        tokens[cursor].text != "as":
-      info.addImportedName tokens[cursor].text
+  if info.module.len > 0:
+    info.moduleStartOffset = tokens[index + 1].startOffset
+    info.moduleEndOffset = tokens[importIndex - 1].endOffset
+    info.diagnosticNameStartOffset = info.moduleStartOffset
+    info.diagnosticNameEndOffset = info.moduleEndOffset
+  var cursor = importIndex + 1
+  while cursor < endIndex and tokens[cursor].text != "except":
+    info.addFromImportedName(tokens, cursor, endIndex)
+    while cursor < endIndex and tokens[cursor].text != "," and
+        tokens[cursor].text != "except":
+      inc cursor
+    if cursor < endIndex and tokens[cursor].text == ",":
+      inc cursor
   result.item = info
   result.next = endIndex
   result.valid = info.module.len > 0
@@ -299,10 +391,13 @@ proc cloneSourceImports*(source: SourceImports): SourceImports =
     var copied = item
     copied.imported = initHashSet[string]()
     copied.excluded = initHashSet[string]()
+    copied.importedSymbols = @[]
     for name in item.imported:
       copied.imported.incl name
     for name in item.excluded:
       copied.excluded.incl name
+    for symbol in item.importedSymbols:
+      copied.importedSymbols.add symbol
     result.imports.add copied
 
 proc hasModuleImport*(imports: SourceImports, module: string): bool =

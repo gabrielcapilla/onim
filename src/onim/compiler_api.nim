@@ -3,12 +3,21 @@ import std/[os, osproc, strutils, tables]
 when defined(onimEmbedded):
   import nimsuggest/nimsuggest
 
-type CompilerDiagnostic* = object
-  name*: string
-  file*: string
-  line*: int
-  column*: int
-  message*: string
+type
+  CompilerDiagnosticKind* = enum
+    diagnosticError
+    diagnosticHint
+    diagnosticWarning
+
+  CompilerDiagnostic* = object
+    kind*: CompilerDiagnosticKind
+    isUnusedImport*: bool
+    isUnusedDeclaration*: bool
+    name*: string
+    file*: string
+    line*: int
+    column*: int
+    message*: string
 
 const maxDiagnosticCacheEntries = 16
 
@@ -28,6 +37,54 @@ proc extractUndeclaredName(message: string): string =
   let colon = message.find(':', markerPosition + marker.len)
   if colon >= 0:
     return message[colon + 1 .. ^1].strip(chars = {' ', '\t', '\"'})
+
+proc extractUnusedImportName(message: string): string =
+  let normalized = message.toLowerAscii
+  let markerPosition = normalized.find("[unusedimport]")
+  if markerPosition < 0:
+    return
+  let descriptionPosition = normalized.find("imported and not used")
+  if descriptionPosition < 0:
+    return
+  let colon = message.find(':', descriptionPosition)
+  if colon < 0 or colon >= markerPosition:
+    return
+  for position in colon + 1 ..< markerPosition:
+    if message[position] notin {'\'', '"', '`'}:
+      continue
+    let quote = message[position]
+    let finish = message.find(quote, position + 1)
+    if finish > position:
+      return message[position + 1 ..< finish]
+  message[colon + 1 ..< markerPosition].strip
+
+proc extractUnusedDeclarationName(message: string): string =
+  let normalized = message.toLowerAscii
+  let markerPosition = normalized.find("[xdeclaredbutnotused]")
+  if markerPosition < 0 or
+      not normalized[0 ..< markerPosition].contains("is declared but not used"):
+    return
+  let quoteStart = message.find('\'')
+  if quoteStart >= 0 and quoteStart < markerPosition:
+    let quoteEnd = message.find('\'', quoteStart + 1)
+    if quoteEnd > quoteStart and quoteEnd < markerPosition:
+      return message[quoteStart + 1 ..< quoteEnd]
+  message[0 ..< markerPosition].strip
+
+proc diagnosticKind(level: string): CompilerDiagnosticKind =
+  case level.toLowerAscii
+  of "hint": diagnosticHint
+  of "warning": diagnosticWarning
+  else: diagnosticError
+
+proc lineDiagnosticKind(line: string): CompilerDiagnosticKind =
+  let normalized = line.toLowerAscii
+  if normalized.contains("warning:"):
+    diagnosticWarning
+  elif normalized.contains("hint:"):
+    diagnosticHint
+  else:
+    diagnosticError
 
 proc parseLocation(message: string): tuple[file: string, line: int, column: int] =
   result.line = 0
@@ -54,11 +111,27 @@ proc parseLocation(message: string): tuple[file: string, line: int, column: int]
 
 proc parseCompilerOutput(output: string): seq[CompilerDiagnostic] =
   for line in output.splitLines:
-    let name = extractUndeclaredName(line)
+    let unusedName = extractUnusedImportName(line)
+    let unusedDeclarationName = extractUnusedDeclarationName(line)
+    let undeclaredName = extractUndeclaredName(line)
+    let name =
+      if unusedName.len > 0:
+        unusedName
+      elif unusedDeclarationName.len > 0:
+        unusedDeclarationName
+      else:
+        undeclaredName
     if name.len == 0:
       continue
     let location = parseLocation(line)
     result.add CompilerDiagnostic(
+      kind:
+        if unusedName.len > 0:
+          lineDiagnosticKind(line)
+        else:
+          diagnosticError,
+      isUnusedImport: unusedName.len > 0,
+      isUnusedDeclaration: unusedDeclarationName.len > 0,
       name: name,
       file: location.file,
       line: location.line,
@@ -68,14 +141,25 @@ proc parseCompilerOutput(output: string): seq[CompilerDiagnostic] =
 
 proc parseSuggestOutput(output: string): seq[CompilerDiagnostic] =
   for line in output.splitLines:
-    let name = extractUndeclaredName(line)
+    let unusedName = extractUnusedImportName(line)
+    let unusedDeclarationName = extractUnusedDeclarationName(line)
+    let undeclaredName = extractUndeclaredName(line)
+    let name =
+      if unusedName.len > 0:
+        unusedName
+      elif unusedDeclarationName.len > 0:
+        unusedDeclarationName
+      else:
+        undeclaredName
     if name.len == 0:
       continue
     let fields = line.split('\t')
     var file = ""
     var lineNumber = 0
     var column = 0
+    var level = "Error"
     if fields.len >= 8 and fields[0] == "chk":
+      level = fields[3]
       file = fields[4]
       try:
         lineNumber = parseInt(fields[5]) - 1
@@ -83,7 +167,18 @@ proc parseSuggestOutput(output: string): seq[CompilerDiagnostic] =
       except ValueError:
         discard
     result.add CompilerDiagnostic(
-      name: name, file: file, line: lineNumber, column: column, message: line
+      kind:
+        if unusedName.len > 0:
+          diagnosticKind(level)
+        else:
+          diagnosticError,
+      isUnusedImport: unusedName.len > 0,
+      isUnusedDeclaration: unusedDeclarationName.len > 0,
+      name: name,
+      file: file,
+      line: lineNumber,
+      column: column,
+      message: line,
     )
 
 proc commandWithArgs(
@@ -102,7 +197,7 @@ proc compilerDiagnostics*(filePath: string): seq[CompilerDiagnostic] =
   if executable.len == 0:
     return
   let workingDir = splitFile(filePath).dir
-  let command = ["check", "--hints:off", "--warnings:off", "--errorMax:1000", filePath]
+  let command = ["check", "--hints:on", "--warnings:on", "--errorMax:1000", filePath]
   let output = commandWithArgs(executable, workingDir, command).output
   parseCompilerOutput(output)
 
@@ -112,7 +207,7 @@ proc nimsuggestDiagnostics*(filePath: string): seq[CompilerDiagnostic] =
     return
   let workingDir = splitFile(filePath).dir
   let command =
-    quoteShell(executable) & " --stdin --v4 --hints:off --warnings:off " &
+    quoteShell(executable) & " --stdin --v4 --hints:on --warnings:on " &
     quoteShell(filePath)
   let request = "chkfile \"" & filePath.replace("\"", "\\\"") & "\":0:0\nquit\n"
   try:
@@ -163,10 +258,27 @@ when defined(onimEmbedded):
     for suggestion in cachedSuggest.runCmd(
       ideChk, AbsoluteFile(project), AbsoluteFile(dirty), 0, -1
     ):
-      if suggestion.section == ideChk and suggestion.forth == "Error" and
-          suggestion.doc.startsWith("undeclared identifier"):
+      let unusedName = extractUnusedImportName(suggestion.doc)
+      let unusedDeclarationName = extractUnusedDeclarationName(suggestion.doc)
+      let undeclaredName = extractUndeclaredName(suggestion.doc)
+      if suggestion.section == ideChk and (
+        undeclaredName.len > 0 or unusedName.len > 0 or unusedDeclarationName.len > 0
+      ):
         result.add CompilerDiagnostic(
-          name: extractUndeclaredName(suggestion.doc),
+          kind:
+            if unusedName.len > 0 or unusedDeclarationName.len > 0:
+              diagnosticKind(suggestion.forth)
+            else:
+              diagnosticError,
+          isUnusedImport: unusedName.len > 0,
+          isUnusedDeclaration: unusedDeclarationName.len > 0,
+          name:
+            if unusedName.len > 0:
+              unusedName
+            elif unusedDeclarationName.len > 0:
+              unusedDeclarationName
+            else:
+              undeclaredName,
           file: suggestion.filePath,
           line: suggestion.line,
           column: suggestion.column,

@@ -2,7 +2,7 @@
 
 `onim` is a standalone Nim 2.0+ language server and compiler-backed organize-imports provider. It is an independent implementation; it does not fork `nimlangserver` or `nimsuggest`.
 
-When Zed requests `source.organizeImports`, onim asks the embedded Nim compiler/nimsuggest API for real `undeclared identifier` diagnostics, resolves the name against the generated standard-library map, and returns a minimal `WorkspaceEdit`. The LSP never writes the document. The CLI applies the same edit to a file.
+When Zed requests `source.organizeImports`, onim asks the embedded Nim compiler/nimsuggest API for real undeclared-identifier and unused-import diagnostics, resolves missing names against the generated standard-library map, and returns a minimal `WorkspaceEdit`. It removes unused imports and names, then sorts and groups remaining `std/*` imports. The LSP never writes the document. The CLI applies the same edit to a file.
 
 ## Build and run
 
@@ -71,7 +71,7 @@ receives `import std/os` before the formatter runs. Existing `import`, `from …
 
 ## Tests and measurement
 
-The fixtures under `tests/before` and `tests/after` cover `walkDir`, `Table`, `parseJson`, ambiguous `split`, `from`/`except`, aliases, conditionals, includes, ordering, shadowing, comments, strings, BOM, CRLF, and the legacy stdlib spelling.
+The fixtures under `tests/before` and `tests/after` cover `walkDir`, `Table`, `parseJson`, ambiguous `split`, adding and removing plain, grouped, and `from` imports, `from`/`except`, aliases, conditionals, includes, ordering, shadowing, comments, strings, BOM, CRLF, and the legacy stdlib spelling.
 
 The warm-path benchmark uses a 1,800-line source:
 

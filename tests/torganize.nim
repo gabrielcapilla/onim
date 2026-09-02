@@ -1,11 +1,14 @@
 import std/[os, strutils, unittest]
 
+import onim/compiler_api
 import onim/organize
 
 const cases = [
   "walkdir", "table", "parsejson", "split", "from", "except", "qualified", "alias",
   "conditional", "conditional_inactive", "included", "multiple", "order", "grouped",
-  "grouped_std", "shadowed", "text_only",
+  "grouped_std", "unused", "unused_grouped", "unused_from", "unused_separate",
+  "shadowed", "unused_from_empty", "unused_except", "unused_keep", "unused_all",
+  "text_only",
 ]
 
 suite "organize imports":
@@ -66,3 +69,14 @@ suite "organize imports":
     check edits.len == 1
     check applyEdits(before, edits) ==
       readFile(root / "tests" / "after" / "grouped_std.nim")
+
+  test "retains compiler unused declaration hints":
+    let root = currentSourcePath().parentDir.parentDir
+    let path = root / "tests" / "before" / "unused.nim"
+    var foundUnusedImport = false
+    var foundUnusedDeclaration = false
+    for diagnostic in checkFileCached(path, path):
+      foundUnusedImport = foundUnusedImport or diagnostic.isUnusedImport
+      foundUnusedDeclaration = foundUnusedDeclaration or diagnostic.isUnusedDeclaration
+    check foundUnusedImport
+    check foundUnusedDeclaration
