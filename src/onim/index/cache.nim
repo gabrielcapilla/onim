@@ -1,4 +1,4 @@
-import std/[algorithm, os, sets, streams, strutils]
+import std/[algorithm, os, sets, streams, strutils, times]
 
 import ../syntax/imports
 import ../syntax/lexer
@@ -6,11 +6,28 @@ import ./source_index
 
 const
   cacheMagic = "ONIMIDX1"
+  manifestMagic = "ONIMMAN1"
   cacheVersion = 1'u32
   cacheEndian = 1'u8
   maxCacheBytes = 64 * 1024 * 1024
   maxStringBytes = 4 * 1024 * 1024
   maxRecordCount = 1_000_000
+
+type
+  FileStamp* = object
+    size*: int64
+    modifiedSeconds*: int64
+    modifiedNanoseconds*: int32
+
+  ManifestEntry* = object
+    path*: string
+    sourceHash*: uint64
+    byteLength*: int64
+    stamp*: FileStamp
+
+  ProjectManifest* = object
+    root*: string
+    entries*: seq[ManifestEntry]
 
 proc invalidCache(message: string) {.noreturn.} =
   raise newException(IOError, message)
@@ -270,6 +287,165 @@ proc cacheFilePath*(projectRoot, modulePath: string): string =
   if root.len == 0 or module.len == 0:
     return ""
   projectCacheDirectory(root) / ($contentFingerprint(module) & ".idx")
+
+proc projectManifestPath*(projectRoot: string): string =
+  let modules = projectCacheDirectory(projectRoot)
+  if modules.len == 0:
+    return ""
+  splitFile(modules).dir / "manifest"
+
+proc fileStamp*(path: string): FileStamp =
+  try:
+    let info = getFileInfo(path)
+    result.size = int64(info.size)
+    result.modifiedSeconds = info.lastWriteTime.toUnix
+    result.modifiedNanoseconds = int32(info.lastWriteTime.nanosecond)
+  except CatchableError:
+    result.size = -1
+    result.modifiedSeconds = -1
+    result.modifiedNanoseconds = -1
+
+proc sameFileStamp*(left, right: FileStamp): bool =
+  left.size == right.size and left.modifiedSeconds == right.modifiedSeconds and
+    left.modifiedNanoseconds == right.modifiedNanoseconds
+
+proc writeManifestPayload(stream: Stream, entries: openArray[ManifestEntry]) =
+  writeCount(stream, entries.len, maxRecordCount)
+  for entry in entries:
+    writeString(stream, canonicalPath(entry.path))
+    stream.write(entry.sourceHash)
+    stream.write(entry.byteLength)
+    stream.write(entry.stamp.size)
+    stream.write(entry.stamp.modifiedSeconds)
+    stream.write(entry.stamp.modifiedNanoseconds)
+
+proc readManifestPayload(stream: Stream, root: string): ProjectManifest =
+  result.root = root
+  let count = readCount(stream, maxRecordCount)
+  result.entries = newSeqOfCap[ManifestEntry](count)
+  var paths = initHashSet[string]()
+  for _ in 0 ..< count:
+    let path = canonicalPath(readString(stream))
+    if path.len == 0 or path in paths:
+      invalidCache("manifest path is invalid or duplicated")
+    paths.incl path
+    var entry = ManifestEntry(path: path)
+    entry.sourceHash = stream.readUint64()
+    entry.byteLength = stream.readInt64()
+    entry.stamp.size = stream.readInt64()
+    entry.stamp.modifiedSeconds = stream.readInt64()
+    entry.stamp.modifiedNanoseconds = stream.readInt32()
+    if entry.byteLength < 0 or entry.stamp.size < -1 or
+        entry.stamp.modifiedNanoseconds < -1 or
+        entry.stamp.modifiedNanoseconds >= 1_000_000_000:
+      invalidCache("manifest file stamp is invalid")
+    result.entries.add entry
+
+proc readManifestEnvelope(stream: Stream, projectRoot: string): ProjectManifest =
+  if stream.readStr(manifestMagic.len) != manifestMagic:
+    invalidCache("manifest magic does not match")
+  if stream.readUint32() != cacheVersion or stream.readUint8() != cacheEndian:
+    invalidCache("manifest version does not match")
+  let storedRoot = readString(stream)
+  let root = canonicalPath(projectRoot)
+  if storedRoot != root:
+    invalidCache("manifest identity does not match")
+  let payloadLength = stream.readUint64()
+  if payloadLength > uint64(maxCacheBytes):
+    invalidCache("manifest payload is out of bounds")
+  let payloadHash = stream.readUint64()
+  let payload = stream.readStr(int(payloadLength))
+  if payload.len != int(payloadLength) or contentFingerprint(payload) != payloadHash:
+    invalidCache("manifest checksum does not match")
+  if not stream.atEnd:
+    invalidCache("manifest contains trailing data")
+  let payloadStream = newStringStream(payload)
+  result = readManifestPayload(payloadStream, root)
+  if not payloadStream.atEnd:
+    invalidCache("manifest payload contains trailing data")
+
+proc loadProjectManifest*(projectRoot: string): ProjectManifest =
+  result.root = canonicalPath(projectRoot)
+  let path = projectManifestPath(projectRoot)
+  if path.len == 0 or not fileExists(path):
+    return
+  var stream: FileStream
+  try:
+    stream = newFileStream(path, fmRead)
+    if stream == nil:
+      return
+    result = readManifestEnvelope(stream, projectRoot)
+  except CatchableError:
+    result = ProjectManifest(root: canonicalPath(projectRoot))
+  finally:
+    if stream != nil:
+      try:
+        stream.close()
+      except CatchableError:
+        discard
+
+proc saveProjectManifest*(
+    projectRoot: string, entries: openArray[ManifestEntry]
+): bool =
+  let root = canonicalPath(projectRoot)
+  if root.len == 0:
+    return false
+  var ordered: seq[ManifestEntry] = @[]
+  for entry in entries:
+    if entry.path.len == 0 or entry.byteLength < 0:
+      return false
+    var copied = entry
+    copied.path = canonicalPath(entry.path)
+    ordered.add copied
+  ordered.sort(
+    proc(left, right: ManifestEntry): int =
+      cmp(left.path, right.path)
+  )
+  for index in 1 ..< ordered.len:
+    if ordered[index - 1].path == ordered[index].path:
+      return false
+
+  let path = projectManifestPath(root)
+  let directory = splitFile(path).dir
+  let temporary = path & ".tmp"
+  var payloadStream = newStringStream()
+  var stream: FileStream
+  try:
+    writeManifestPayload(payloadStream, ordered)
+    payloadStream.flush()
+    let payload = payloadStream.data
+    if payload.len > maxCacheBytes:
+      return false
+    createDir(directory)
+    stream = newFileStream(temporary, fmWrite)
+    if stream == nil:
+      return false
+    stream.write(manifestMagic)
+    stream.write(cacheVersion)
+    stream.write(cacheEndian)
+    writeString(stream, root)
+    stream.write(uint64(payload.len))
+    stream.write(contentFingerprint(payload))
+    if payload.len > 0:
+      stream.write(payload)
+    stream.flush()
+    stream.close()
+    stream = nil
+    moveFile(temporary, path)
+    result = true
+  except CatchableError:
+    result = false
+  finally:
+    if stream != nil:
+      try:
+        stream.close()
+      except CatchableError:
+        discard
+    if not result and fileExists(temporary):
+      try:
+        removeFile(temporary)
+      except CatchableError:
+        discard
 
 proc encodeSourceIndex(index: SourceIndex): string =
   let payload = newStringStream()

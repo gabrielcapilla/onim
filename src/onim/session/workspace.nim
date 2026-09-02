@@ -40,6 +40,7 @@ type
 
   Workspace* = ref object
     root*: string
+    manifest*: ProjectManifest
     snapshotId: SnapshotId
     configGeneration: ConfigGeneration
     nextFileId: uint32
@@ -62,6 +63,7 @@ proc initWorkspace*(root = ""): Workspace =
   result.nextFileId = 1
   result.nextContentGeneration = 1
   result.paths = initTable[string, FileId]()
+  result.manifest = loadProjectManifest(result.root)
 
 proc bumpSnapshot(workspace: Workspace) =
   workspace.snapshotId = SnapshotId(uint64(workspace.snapshotId) + 1'u64)
@@ -75,6 +77,23 @@ proc indexDiskSource(workspace: Workspace, path, source: string): SourceIndex =
   if result == nil:
     result = indexSource(source)
     discard saveCachedSourceIndex(workspace.root, path, source, result)
+
+proc persistManifest(workspace: Workspace) =
+  var entries: seq[ManifestEntry] = @[]
+  for file in workspace.files:
+    if file.state != workspaceOnDisk or file.index == nil:
+      continue
+    let stamp = fileStamp(file.path)
+    if stamp.size < 0:
+      continue
+    entries.add ManifestEntry(
+      path: file.path,
+      sourceHash: file.index.contentHash,
+      byteLength: int64(file.index.byteLength),
+      stamp: stamp,
+    )
+  workspace.manifest = ProjectManifest(root: workspace.root, entries: entries)
+  discard saveProjectManifest(workspace.root, entries)
 
 proc ensureRecord(
     workspace: Workspace, path: string
@@ -296,7 +315,10 @@ proc installText(
 
 proc indexWorkspace*(workspace: Workspace, root = "") =
   if root.len > 0:
-    workspace.root = canonicalPath(root)
+    let canonicalRoot = canonicalPath(root)
+    if canonicalRoot != workspace.root:
+      workspace.root = canonicalRoot
+      workspace.manifest = loadProjectManifest(workspace.root)
   if workspace.root.len == 0 or not dirExists(workspace.root):
     return
 
@@ -332,6 +354,7 @@ proc indexWorkspace*(workspace: Workspace, root = "") =
       workspace.files[id.recordIndex].index = indexSource("")
   rebuildDependencies(workspace)
   workspace.bumpSnapshot()
+  workspace.persistManifest()
 
 proc fileIdForPath*(workspace: Workspace, path: string): FileId =
   let key = canonicalPath(path)
@@ -415,6 +438,7 @@ proc refreshDiskFile*(workspace: Workspace, path: string, deleted = false) =
       discard installText(workspace, ensured.id, "", workspaceMissing, -1, true)
   if ensured.created:
     rebuildDependencies(workspace)
+  workspace.persistManifest()
 
 proc closeDocument*(workspace: Workspace, uri, path: string) =
   let id = workspace.fileIdForPath(path)
@@ -431,6 +455,7 @@ proc closeDocument*(workspace: Workspace, uri, path: string) =
       discard installText(workspace, id, "", workspaceMissing, -1, true)
   else:
     discard installText(workspace, id, "", workspaceMissing, -1, true)
+  workspace.persistManifest()
 
 proc configurationChanged*(workspace: Workspace) =
   workspace.configGeneration =

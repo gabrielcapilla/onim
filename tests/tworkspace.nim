@@ -76,7 +76,12 @@ suite "workspace index":
     let firstId = firstWorkspace.fileIdForPath(filePath)
     let firstSnapshot = firstWorkspace.snapshotForFile(firstId)
     let path = cacheFilePath(root, filePath)
+    let manifestPath = projectManifestPath(root)
     check fileExists(path)
+    check fileExists(manifestPath)
+    check firstWorkspace.manifest.root == absolutePath(root)
+    check firstWorkspace.manifest.entries.len == 1
+    check firstWorkspace.manifest.entries[0].path == absolutePath(filePath)
     check firstSnapshot.index != nil
     check loadCachedSourceIndex(root, filePath, source) != nil
     check loadCachedSourceIndex(root, filePath, source & "# changed\n") == nil
@@ -85,6 +90,9 @@ suite "workspace index":
     secondWorkspace.indexWorkspace()
     let secondSnapshot =
       secondWorkspace.snapshotForFile(secondWorkspace.fileIdForPath(filePath))
+    check secondWorkspace.manifest.entries.len == 1
+    check secondWorkspace.manifest.entries[0].sourceHash ==
+      firstWorkspace.manifest.entries[0].sourceHash
     check secondSnapshot.index != nil
     check secondSnapshot.index.contentHash == firstSnapshot.index.contentHash
     check secondSnapshot.index.tokenCount == firstSnapshot.index.tokenCount
@@ -97,6 +105,10 @@ suite "workspace index":
     check loadCachedSourceIndex(root, filePath, source) == nil
     writeFile(path, "corrupt")
     check loadCachedSourceIndex(root, filePath, source) == nil
+
+    let manifestBytes = readFile(manifestPath)
+    writeFile(manifestPath, manifestBytes & "trailing")
+    check loadProjectManifest(root).entries.len == 0
 
   test "indexes dependencies and invalidates reverse closure":
     let root = getTempDir() / ("onim-workspace-" & $getCurrentProcessId())
