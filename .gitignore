@@ -1,0 +1,4 @@
+nimcache/
+bin/
+tests/torganize
+gen_stdlib_map
