@@ -1,8 +1,8 @@
 import std/[json, osproc, streams]
 import std/os except FileId
 
-import ./organize
-import ./workspace_ids
+import ../features/organize
+import ../session/ids
 
 type
   SemanticWorkKind* = enum

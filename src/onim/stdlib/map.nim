@@ -12,7 +12,7 @@ type
     symbols*: Table[string, seq[SymbolCandidate]]
     modules*: Table[string, bool]
 
-const bundledStdlibMap = staticRead("../../stdlib_map.json")
+const bundledStdlibMap = staticRead("../../../stdlib_map.json")
 
 proc canonicalModule*(module: string): string =
   result = module.strip(chars = {'"', '\'', '`'})

@@ -1,9 +1,9 @@
 import std/[json, streams, strutils, tables, uri]
 
-import ./organize
-import ./semantic_worker
-import ./workspace
-import ./workspace_ids
+import ../features/organize
+import ../semantic/worker
+import ../session/ids
+import ../session/workspace
 
 type
   CachedAction = object

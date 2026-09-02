@@ -1,9 +1,9 @@
 import std/[algorithm, hashes, os, sets, strutils, tables]
 
-import ./compiler_api
-import ./imports
-import ./lexer
-import ./stdlib
+import ../semantic/compiler_api
+import ../stdlib/map
+import ../syntax/imports
+import ../syntax/lexer
 
 type
   ImportEdit* = object

@@ -1,8 +1,8 @@
 import std/[algorithm, strutils, tables]
 import std/os except FileId
 
-import ./workspace_ids
-import ./workspace_index
+import ../index/source_index
+import ./ids
 
 type
   WorkspaceFileState* = enum

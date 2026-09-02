@@ -1,6 +1,6 @@
 import std/[algorithm, monotimes, os, times]
 
-import onim/organize
+import onim/features/organize
 
 const samplePrefix = "for k, v in walkDir(\"/tmp\"):\n  discard k\n"
 

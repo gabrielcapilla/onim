@@ -1,8 +1,8 @@
 import std/[osproc, strutils, unittest]
 import std/os except FileId
 
-import onim/workspace
-import onim/workspace_ids
+import onim/session/ids
+import onim/session/workspace
 
 proc uriFor(path: string): string =
   "file://" & path.replace('\\', '/')

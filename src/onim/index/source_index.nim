@@ -1,7 +1,7 @@
 import std/[algorithm, strutils]
 
-import ./imports
-import ./lexer
+import ../syntax/imports
+import ../syntax/lexer
 
 type SourceIndex* = ref object
   contentHash*: uint64

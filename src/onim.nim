@@ -1,8 +1,8 @@
 import std/[os, strutils]
 
-import onim/lsp
-import onim/organize
-import onim/semantic_worker
+import onim/features/organize
+import onim/protocol/lsp
+import onim/semantic/worker
 
 proc usage() =
   stderr.writeLine "usage: onim [--stdio] [--useStdPrefix:on|off] | onim file.nim"

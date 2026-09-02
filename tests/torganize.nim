@@ -1,7 +1,7 @@
 import std/[os, strutils, unittest]
 
-import onim/compiler_api
-import onim/organize
+import onim/features/organize
+import onim/semantic/compiler_api
 
 const cases = [
   "walkdir", "table", "parsejson", "split", "from", "except", "qualified", "alias",

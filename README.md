@@ -14,7 +14,25 @@ nimble test
 
 `onim` without a file argument starts the stdio LSP. `--stdio` and `--lsp` are explicit aliases. `--useStdPrefix:on` is the default; pass `--useStdPrefix:off` or `--no-std-prefix` to emit legacy spellings such as `import os`.
 
-The source adapter uses `nimsuggest/nimsuggest`, which exposes Nim's compiler module graph and semantic passes. Nim 2.0–2.2 installations do not provide a stable `compiler/api.nim` module, so that compiler API boundary is isolated in `src/onim/compiler_api.nim` rather than depending on a nonexistent module or using a lexical whitelist.
+The source adapter uses `nimsuggest/nimsuggest`, which exposes Nim's compiler module graph and semantic passes. Nim 2.0–2.2 installations do not provide a stable `compiler/api.nim` module, so that compiler API boundary is isolated in `src/onim/semantic/compiler_api.nim` rather than depending on a nonexistent module or using a lexical whitelist.
+
+## Source architecture
+
+The implementation is organized by responsibility under `src/onim`:
+
+- `syntax/` owns lexical tokens and structural import/source parsing.
+- `index/` owns per-file source indexes.
+- `session/` owns numeric identities, document overlays, snapshots, and the
+  workspace dependency graph.
+- `features/` owns user-facing language actions such as organize-imports.
+- `semantic/` owns the compiler adapter and its isolated semantic worker.
+- `protocol/` owns the LSP transport and request lifecycle.
+- `stdlib/` owns generated standard-library symbol data and lookup.
+
+Dependencies flow from protocol and features toward session, index, syntax,
+stdlib, and the isolated semantic adapter. The old flat module paths are not
+kept as forwarding facades; callers import the domain module they use, which
+keeps ownership and compile boundaries explicit.
 
 ## Standard-library map
 
