@@ -330,12 +330,12 @@ proc waitForSemantic(
           OrganizeOptions(useStdPrefix: key.useStdPrefix),
         ):
       return true
-    let result = receiveSemantic()
-    if result.failed:
+    let semanticResult = receiveSemantic()
+    if semanticResult.failed:
       pending.setLen(0)
       queued.setLen(0)
       return false
-    acceptSemantic(result, workspace, actionCache, pending, queued)
+    acceptSemantic(semanticResult, workspace, actionCache, pending, queued)
 
 proc codeActions(
     params: JsonNode,

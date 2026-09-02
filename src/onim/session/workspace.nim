@@ -1,6 +1,7 @@
 import std/[algorithm, strutils, tables]
 import std/os except FileId
 
+import ../index/cache
 import ../index/source_index
 import ./ids
 
@@ -68,6 +69,12 @@ proc bumpSnapshot(workspace: Workspace) =
 proc nextContent(workspace: Workspace): ContentGeneration =
   result = ContentGeneration(workspace.nextContentGeneration)
   inc workspace.nextContentGeneration
+
+proc indexDiskSource(workspace: Workspace, path, source: string): SourceIndex =
+  result = loadCachedSourceIndex(workspace.root, path, source)
+  if result == nil:
+    result = indexSource(source)
+    discard saveCachedSourceIndex(workspace.root, path, source, result)
 
 proc ensureRecord(
     workspace: Workspace, path: string
@@ -278,7 +285,11 @@ proc installText(
   if invalidate:
     discard invalidateDependents(workspace, id)
   workspace.files[index].text = text
-  workspace.files[index].index = indexSource(text)
+  workspace.files[index].index =
+    if state == workspaceOnDisk:
+      workspace.indexDiskSource(workspace.files[index].path, text)
+    else:
+      indexSource(text)
   workspace.files[index].contentGeneration = workspace.nextContent()
   replaceDependencies(workspace, id)
   true
@@ -313,7 +324,7 @@ proc indexWorkspace*(workspace: Workspace, root = "") =
       workspace.files[id.recordIndex].state = workspaceOnDisk
       workspace.files[id.recordIndex].version = -1
       workspace.files[id.recordIndex].index =
-        indexSource(workspace.files[id.recordIndex].text)
+        workspace.indexDiskSource(path, workspace.files[id.recordIndex].text)
       workspace.files[id.recordIndex].contentGeneration = workspace.nextContent()
     except CatchableError:
       workspace.files[id.recordIndex].state = workspaceMissing

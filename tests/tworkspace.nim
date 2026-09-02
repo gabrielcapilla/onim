@@ -1,6 +1,8 @@
-import std/[osproc, strutils, unittest]
+import std/[algorithm, osproc, strutils, unittest]
 import std/os except FileId
 
+import onim/index/cache
+import onim/index/source_index
 import onim/session/ids
 import onim/session/workspace
 
@@ -29,7 +31,73 @@ proc cleanRoot(root: string) =
       removeFile(path)
   removeDir(root)
 
+proc cleanTree(root: string) =
+  if not dirExists(root):
+    return
+  var directories: seq[string] = @[]
+  for path in walkDirRec(root):
+    if fileExists(path):
+      removeFile(path)
+    elif dirExists(path):
+      directories.add path
+  directories.sort(
+    proc(left, right: string): int =
+      cmp(right.len, left.len)
+  )
+  for path in directories:
+    if dirExists(path):
+      removeDir(path)
+  if dirExists(root):
+    removeDir(root)
+
 suite "workspace index":
+  test "persists and reloads source indexes":
+    let root = getTempDir() / ("onim-cache-project-" & $getCurrentProcessId())
+    let cacheRoot = getTempDir() / ("onim-cache-" & $getCurrentProcessId())
+    cleanTree(root)
+    cleanTree(cacheRoot)
+    createDir(root)
+    let filePath = root / "cached.nim"
+    let source = "import std/os\nfor kind, path in walkDir(\"/tmp\"):\n  discard kind\n"
+    writeFile(filePath, source)
+
+    let previousCacheRoot = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
+    defer:
+      if previousCacheRoot.len > 0:
+        putEnv("ONIM_CACHE_DIR", previousCacheRoot)
+      else:
+        delEnv("ONIM_CACHE_DIR")
+      cleanTree(root)
+      cleanTree(cacheRoot)
+
+    let firstWorkspace = initWorkspace(root)
+    firstWorkspace.indexWorkspace()
+    let firstId = firstWorkspace.fileIdForPath(filePath)
+    let firstSnapshot = firstWorkspace.snapshotForFile(firstId)
+    let path = cacheFilePath(root, filePath)
+    check fileExists(path)
+    check firstSnapshot.index != nil
+    check loadCachedSourceIndex(root, filePath, source) != nil
+    check loadCachedSourceIndex(root, filePath, source & "# changed\n") == nil
+
+    let secondWorkspace = initWorkspace(root)
+    secondWorkspace.indexWorkspace()
+    let secondSnapshot =
+      secondWorkspace.snapshotForFile(secondWorkspace.fileIdForPath(filePath))
+    check secondSnapshot.index != nil
+    check secondSnapshot.index.contentHash == firstSnapshot.index.contentHash
+    check secondSnapshot.index.tokenCount == firstSnapshot.index.tokenCount
+    check secondSnapshot.index.parsed.tokens == firstSnapshot.index.parsed.tokens
+    check secondSnapshot.index.parsed.imports.len ==
+      firstSnapshot.index.parsed.imports.len
+
+    let cacheBytes = readFile(path)
+    writeFile(path, cacheBytes & "trailing")
+    check loadCachedSourceIndex(root, filePath, source) == nil
+    writeFile(path, "corrupt")
+    check loadCachedSourceIndex(root, filePath, source) == nil
+
   test "indexes dependencies and invalidates reverse closure":
     let root = getTempDir() / ("onim-workspace-" & $getCurrentProcessId())
     cleanRoot(root)

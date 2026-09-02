@@ -21,7 +21,7 @@ The source adapter uses `nimsuggest/nimsuggest`, which exposes Nim's compiler mo
 The implementation is organized by responsibility under `src/onim`:
 
 - `syntax/` owns lexical tokens and structural import/source parsing.
-- `index/` owns per-file source indexes.
+- `index/` owns per-file source indexes and their validated disk cache.
 - `session/` owns numeric identities, document overlays, snapshots, and the
   workspace dependency graph.
 - `features/` owns user-facing language actions such as organize-imports.
@@ -48,13 +48,15 @@ The generated map is bundled into the executable and may also be overridden with
 
 ## Workspace index
 
-The LSP builds one in-memory workspace index when it receives `initialize`. Each Nim file gets a stable numeric `FileId`; its parsed import/include/export references are retained in a compact per-file index, while forward and reverse dependency edges use numeric IDs. A document overlay is authoritative while it is open, so organize-imports reads the same bytes that Zed is editing.
+The LSP builds one workspace index when it receives `initialize`. Each Nim file gets a stable numeric `FileId`; its parsed import/include/export references are retained in a compact per-file index, while forward and reverse dependency edges use numeric IDs. A document overlay is authoritative while it is open, so organize-imports reads the same bytes that Zed is editing.
+
+On-disk source indexes are cached under `ONIM_CACHE_DIR` when set, then `XDG_CACHE_HOME/onim`, or `~/.cache/onim`. The cache is keyed by canonical project/module paths and exact source fingerprints. It stores structured tokens and import metadata in versioned, checksummed records; a restart can reuse an unchanged module without lexing it again. Cache data is acceleration only: an identity, version, checksum, bounds, or source mismatch falls back to a fresh in-memory index.
 
 `didOpen` and full-text `didChange` update only the affected file. A changed file invalidates its reverse import/include/export closure, including transitive dependents and cycles exactly once. If a non-stdlib dependency cannot be resolved yet, onim conservatively invalidates the whole workspace until the graph becomes complete. Configuration changes invalidate the whole workspace. Code actions are cached by content, dependency, configuration, and stdlib-prefix generations, so repeated requests for an unchanged snapshot do not invoke the compiler again.
 
 The stdio server also keeps semantic organization in a persistent helper process. The helper owns the embedded compiler graph on one thread, while the LSP process remains free to receive edits. `didOpen` and `didChange` prefetch the current snapshot; at most one compiler request is in flight and intermediate edits are coalesced to the newest snapshot for each file. A code action returns from the generation cache when prefetch has completed, without placing compiler work on the LSP request path. The standalone CLI remains synchronous because its process lifetime ends after one file operation.
 
-The index is an orchestration layer, not a semantic replacement for Nim. An uncached organize-imports request still asks the embedded compiler/nimsuggest boundary for `undeclared identifier`; lexical indexing only determines what needs to be refreshed. Field-layout analysis and a future `onim --compact` opt-in remain separate from `source.organizeImports`.
+The index is an orchestration layer, not yet a semantic replacement for Nim. An uncached organize-imports request still asks the embedded compiler/nimsuggest boundary for `undeclared identifier`; the lexical index determines what needs to be refreshed. Field-layout analysis and a future `onim --compact` opt-in remain separate from `source.organizeImports`.
 
 ## Zed
 
