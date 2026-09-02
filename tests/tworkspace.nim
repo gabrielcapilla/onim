@@ -84,6 +84,9 @@ suite "workspace index":
     check firstWorkspace.manifest.entries[0].path == absolutePath(filePath)
     check firstSnapshot.index != nil
     check loadCachedSourceIndex(root, filePath, source) != nil
+    check loadCachedSourceIndexFingerprint(
+      root, filePath, contentFingerprint(source), source.len
+    ) != nil
     check loadCachedSourceIndex(root, filePath, source & "# changed\n") == nil
 
     let secondWorkspace = initWorkspace(root)

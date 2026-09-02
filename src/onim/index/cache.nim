@@ -469,7 +469,10 @@ proc writeEnvelope(
     stream.write(payload)
 
 proc readEnvelope(
-    stream: Stream, projectRoot, modulePath, source: string
+    stream: Stream,
+    projectRoot, modulePath: string,
+    expectedHash: uint64,
+    expectedLength: int,
 ): SourceIndex =
   if stream.readStr(cacheMagic.len) != cacheMagic:
     invalidCache("cache magic does not match")
@@ -484,7 +487,8 @@ proc readEnvelope(
 
   let sourceHash = stream.readUint64()
   let sourceLength = stream.readUint64()
-  if sourceHash != contentFingerprint(source) or sourceLength != uint64(source.len):
+  if expectedLength < 0 or sourceHash != expectedHash or
+      sourceLength != uint64(expectedLength):
     invalidCache("cache source does not match")
 
   let payloadLength = stream.readUint64()
@@ -497,11 +501,22 @@ proc readEnvelope(
   if not stream.atEnd:
     invalidCache("cache contains trailing data")
   let payloadStream = newStringStream(payload)
-  result = readSourceIndex(payloadStream, contentFingerprint(source), source.len)
+  result = readSourceIndex(payloadStream, expectedHash, expectedLength)
   if not payloadStream.atEnd:
     invalidCache("cache payload contains trailing data")
 
+proc loadCachedSourceIndexFingerprint*(
+  projectRoot, modulePath: string, sourceHash: uint64, byteLength: int
+): SourceIndex
+
 proc loadCachedSourceIndex*(projectRoot, modulePath, source: string): SourceIndex =
+  result = loadCachedSourceIndexFingerprint(
+    projectRoot, modulePath, contentFingerprint(source), source.len
+  )
+
+proc loadCachedSourceIndexFingerprint*(
+    projectRoot, modulePath: string, sourceHash: uint64, byteLength: int
+): SourceIndex =
   let path = cacheFilePath(projectRoot, modulePath)
   if path.len == 0 or not fileExists(path):
     return
@@ -510,7 +525,7 @@ proc loadCachedSourceIndex*(projectRoot, modulePath, source: string): SourceInde
     stream = newFileStream(path, fmRead)
     if stream == nil:
       return
-    result = readEnvelope(stream, projectRoot, modulePath, source)
+    result = readEnvelope(stream, projectRoot, modulePath, sourceHash, byteLength)
   except CatchableError:
     result = nil
   finally:
