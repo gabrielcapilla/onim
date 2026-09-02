@@ -71,6 +71,13 @@ proc extractUnusedDeclarationName(message: string): string =
       return message[quoteStart + 1 ..< quoteEnd]
   message[0 ..< markerPosition].strip
 
+proc diagnosticNames(
+    message: string
+): tuple[unused, unusedDeclaration, undeclared: string] =
+  result.unused = extractUnusedImportName(message)
+  result.unusedDeclaration = extractUnusedDeclarationName(message)
+  result.undeclared = extractUndeclaredName(message)
+
 proc diagnosticKind(level: string): CompilerDiagnosticKind =
   case level.toLowerAscii
   of "hint": diagnosticHint
@@ -89,49 +96,50 @@ proc lineDiagnosticKind(line: string): CompilerDiagnosticKind =
 proc parseLocation(message: string): tuple[file: string, line: int, column: int] =
   result.line = 0
   result.column = 0
-  let open = message.rfind('(')
-  let comma =
-    if open >= 0:
-      message.find(',', open + 1)
-    else:
-      -1
-  let close =
-    if comma >= 0:
-      message.find(')', comma + 1)
-    else:
-      -1
-  if open < 0 or comma < 0 or close < 0:
-    return
-  try:
-    result.line = parseInt(message[open + 1 ..< comma]) - 1
-    result.column = parseInt(message[comma + 1 ..< close]) - 1
-    result.file = message[0 ..< open]
-  except ValueError:
-    discard
+  var close = message.len - 1
+  while close >= 0:
+    if message[close] == ')':
+      var comma = close - 1
+      while comma >= 0 and message[comma] != ',':
+        dec comma
+      if comma >= 0:
+        var opening = comma - 1
+        while opening >= 0 and message[opening] != '(':
+          dec opening
+        if opening >= 0:
+          try:
+            let line = parseInt(message[opening + 1 ..< comma].strip) - 1
+            let column = parseInt(message[comma + 1 ..< close].strip) - 1
+            if line >= 0 and column >= 0:
+              result.line = line
+              result.column = column
+              result.file = message[0 ..< opening]
+              return
+          except ValueError:
+            discard
+    dec close
 
 proc parseCompilerOutput(output: string): seq[CompilerDiagnostic] =
   for line in output.splitLines:
-    let unusedName = extractUnusedImportName(line)
-    let unusedDeclarationName = extractUnusedDeclarationName(line)
-    let undeclaredName = extractUndeclaredName(line)
+    let names = diagnosticNames(line)
     let name =
-      if unusedName.len > 0:
-        unusedName
-      elif unusedDeclarationName.len > 0:
-        unusedDeclarationName
+      if names.unused.len > 0:
+        names.unused
+      elif names.unusedDeclaration.len > 0:
+        names.unusedDeclaration
       else:
-        undeclaredName
+        names.undeclared
     if name.len == 0:
       continue
     let location = parseLocation(line)
     result.add CompilerDiagnostic(
       kind:
-        if unusedName.len > 0:
+        if names.unused.len > 0:
           lineDiagnosticKind(line)
         else:
           diagnosticError,
-      isUnusedImport: unusedName.len > 0,
-      isUnusedDeclaration: unusedDeclarationName.len > 0,
+      isUnusedImport: names.unused.len > 0,
+      isUnusedDeclaration: names.unusedDeclaration.len > 0,
       name: name,
       file: location.file,
       line: location.line,
@@ -141,16 +149,14 @@ proc parseCompilerOutput(output: string): seq[CompilerDiagnostic] =
 
 proc parseSuggestOutput(output: string): seq[CompilerDiagnostic] =
   for line in output.splitLines:
-    let unusedName = extractUnusedImportName(line)
-    let unusedDeclarationName = extractUnusedDeclarationName(line)
-    let undeclaredName = extractUndeclaredName(line)
+    let names = diagnosticNames(line)
     let name =
-      if unusedName.len > 0:
-        unusedName
-      elif unusedDeclarationName.len > 0:
-        unusedDeclarationName
+      if names.unused.len > 0:
+        names.unused
+      elif names.unusedDeclaration.len > 0:
+        names.unusedDeclaration
       else:
-        undeclaredName
+        names.undeclared
     if name.len == 0:
       continue
     let fields = line.split('\t')
@@ -168,12 +174,12 @@ proc parseSuggestOutput(output: string): seq[CompilerDiagnostic] =
         discard
     result.add CompilerDiagnostic(
       kind:
-        if unusedName.len > 0:
+        if names.unused.len > 0:
           diagnosticKind(level)
         else:
           diagnosticError,
-      isUnusedImport: unusedName.len > 0,
-      isUnusedDeclaration: unusedDeclarationName.len > 0,
+      isUnusedImport: names.unused.len > 0,
+      isUnusedDeclaration: names.unusedDeclaration.len > 0,
       name: name,
       file: file,
       line: lineNumber,

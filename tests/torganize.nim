@@ -88,3 +88,20 @@ suite "organize imports":
     let index = indexSource(source)
     check index.occurrences.isComplete
     check organizeSourceWithIndex("/no/such/file.nim", source, index).len == 0
+
+  test "keeps diagnostic locations when paths contain parentheses":
+    let root = getTempDir() / ("onim-(diagnostic)-" & $getCurrentProcessId())
+    createDir(root)
+    let path = root / "location.nim"
+    writeFile(path, "echo missingLocationName\n")
+    defer:
+      if fileExists(path):
+        removeFile(path)
+      if dirExists(root):
+        removeDir(root)
+    var found = false
+    for diagnostic in compilerDiagnostics(path):
+      if diagnostic.name == "missingLocationName":
+        found = true
+        check absolutePath(diagnostic.file) == absolutePath(path)
+    check found
