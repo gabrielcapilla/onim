@@ -1,12 +1,10 @@
 import std/[json, streams, strutils, tables, uri]
 
+import ../features/definition
 import ../features/organize
-import ../index/source_index
-import ../index/symbols
 import ../semantic/worker
 import ../session/ids
 import ../session/workspace
-import ../syntax/imports
 import ../syntax/lexer
 
 type
@@ -173,35 +171,78 @@ proc offsetAt(source: string, position: JsonNode): int =
     index = advance.nextIndex
   if character == wantedCharacter: index else: -1
 
-proc tokenAtOffset(tokens: openArray[Token], offset: int): int =
-  if offset < 0:
-    return -1
-  for index, token in tokens:
-    if token.kind == tkIdentifier and token.startOffset <= offset and
-        offset < token.endOffset:
-      return index
+proc utf16Length(value: string): int =
+  var index = 0
+  while index < value.len:
+    let advance = utf16Width(value, index, value.len)
+    result += advance.units
+    index = advance.nextIndex
+
+proc uriPathByte(character: char): bool =
+  (character >= 'a' and character <= 'z') or (character >= 'A' and character <= 'Z') or
+    (character >= '0' and character <= '9') or
+    character in {'-', '.', '_', '~', '/', ':'}
+
+proc hexDigit(value: int): char =
+  if value < 10:
+    char(ord('0') + value)
+  else:
+    char(ord('A') + value - 10)
+
+proc fileUri(path: string): string =
+  result = "file://"
+  for character in path:
+    let normalized =
+      when defined(windows):
+        if character == '\\': '/' else: character
+      else:
+        character
+    if normalized.uriPathByte:
+      result.add normalized
+    else:
+      let value = ord(normalized)
+      result.add '%'
+      result.add hexDigit((value shr 4) and 0x0F)
+      result.add hexDigit(value and 0x0F)
+
+proc targetTokenLength(token: Token): int =
+  let byteLength = token.endOffset - token.startOffset
+  if byteLength == token.text.len:
+    return utf16Length(token.text)
+  if byteLength == token.text.len + 2:
+    return utf16Length(token.text) + 2
   -1
 
-proc tokenIsQualified(tokens: openArray[Token], tokenIndex: int): bool =
-  (tokenIndex > 0 and tokens[tokenIndex - 1].text == ".") or
-    (tokenIndex + 1 < tokens.len and tokens[tokenIndex + 1].text == ".")
-
-proc tokenIsImported(imports: openArray[ImportInfo], token: Token): bool =
-  for item in imports:
-    if item.startOffset <= token.startOffset and token.endOffset <= item.endOffset:
-      return true
-  false
-
 proc definitionLocation(
-    source, uri: string, symbol: SourceSymbol, tokens: openArray[Token]
+    source: WorkspaceSnapshot,
+    sourceUri: string,
+    view: WorkspaceIndexView,
+    target: DefinitionTarget,
 ): JsonNode =
-  let token = tokens[int(symbol.nameToken)]
+  if not view.valid or view.index == nil or view.id.value != target.snapshotId.value or
+      view.contentGeneration.value != target.contentGeneration.value or
+      int(target.nameToken) >= view.index.parsed.tokens.len:
+    return
+  let token = view.index.parsed.tokens[int(target.nameToken)]
+  let uri =
+    if view.uri.len > 0:
+      view.uri
+    else:
+      fileUri(view.path)
+  var start: JsonNode
+  var finish: JsonNode
+  if view.fileId.value == source.fileId.value:
+    start = positionAt(source.text, token.startOffset)
+    finish = positionAt(source.text, token.endOffset)
+  else:
+    let length = targetTokenLength(token)
+    if token.line < 0 or token.column < 0 or length < 0:
+      return
+    start = %*{"line": token.line, "character": token.column}
+    finish = %*{"line": token.line, "character": token.column + length}
   %*{
-    "uri": uri,
-    "range": {
-      "start": positionAt(source, token.startOffset),
-      "end": positionAt(source, token.endOffset),
-    },
+    "uri": if view.fileId.value == source.fileId.value: sourceUri else: uri,
+    "range": {"start": start, "end": finish},
   }
 
 proc definition(params: JsonNode, workspace: Workspace): JsonNode =
@@ -216,45 +257,16 @@ proc definition(params: JsonNode, workspace: Workspace): JsonNode =
       path.toLowerAscii.endsWith(".cfg"):
     return
   let snapshot = workspace.snapshotForDocument(uriText, path)
-  if not snapshot.valid or snapshot.index == nil or
-      snapshot.index.contentHash != contentFingerprint(snapshot.text) or
-      snapshot.index.byteLength != snapshot.text.len:
+  if not snapshot.valid:
     return
   let offset = offsetAt(snapshot.text, valueOrEmpty(params, "position"))
-  let tokenIndex = tokenAtOffset(snapshot.index.parsed.tokens, offset)
-  if tokenIndex < 0:
+  let resolution = resolveDefinition(workspace, snapshot, offset)
+  if resolution.kind != definitionResolved:
     return
-  let token = snapshot.index.parsed.tokens[tokenIndex]
-  if tokenIsImported(snapshot.index.parsed.imports, token) or
-      tokenIsQualified(snapshot.index.parsed.tokens, tokenIndex):
-    return
-  let declaration = snapshot.index.symbols.symbolToken(uint32(tokenIndex))
-  if declaration >= 0:
-    return definitionLocation(
-      snapshot.text,
-      uriText,
-      snapshot.index.symbols[declaration],
-      snapshot.index.parsed.tokens,
-    )
-  if tokenIndex > 0 and snapshot.index.parsed.tokens[tokenIndex - 1].line == token.line and
-      snapshot.index.parsed.tokens[tokenIndex - 1].text in [
-        "proc", "func", "iterator", "method", "macro", "template", "converter", "type",
-        "var", "let", "const",
-      ]:
-    return
-  if token.column != 0:
-    return
-  let found =
-    snapshot.index.symbols.lookupSymbol(snapshot.index.parsed.tokens, token.text)
-  if found < 0:
-    return
-  let declarationToken =
-    snapshot.index.parsed.tokens[int(snapshot.index.symbols[found].nameToken)]
-  if token.startOffset < declarationToken.startOffset:
-    return
-  result = definitionLocation(
-    snapshot.text, uriText, snapshot.index.symbols[found], snapshot.index.parsed.tokens
-  )
+  let view = workspace.indexViewForFile(resolution.target.fileId)
+  result = definitionLocation(snapshot, uriText, view, resolution.target)
+  if result == nil:
+    result = newJNull()
 
 proc editJson(source: string, edit: ImportEdit): JsonNode =
   %*{

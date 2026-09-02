@@ -24,6 +24,15 @@ type
     configGeneration*: ConfigGeneration
     index*: SourceIndex
 
+  WorkspaceIndexView* = object
+    valid*: bool
+    id*: SnapshotId
+    fileId*: FileId
+    path*: string
+    uri*: string
+    contentGeneration*: ContentGeneration
+    index*: SourceIndex
+
   FileRecord = object
     id: FileId
     path: string
@@ -224,6 +233,13 @@ proc resolveReference(workspace: Workspace, ownerPath, reference: string): FileI
           workspace.files[index].state != workspaceMissing:
         return id
   InvalidFileId
+
+proc resolveModule*(workspace: Workspace, owner: FileId, reference: string): FileId =
+  let index = owner.recordIndex
+  if index < 0 or index >= workspace.files.len or
+      workspace.files[index].state == workspaceMissing:
+    return InvalidFileId
+  workspace.resolveReference(workspace.files[index].path, reference)
 
 proc replaceDependencies(workspace: Workspace, id: FileId) =
   let index = id.recordIndex
@@ -749,4 +765,16 @@ proc snapshotForFile*(workspace: Workspace, id: FileId): WorkspaceSnapshot =
   result.contentGeneration = workspace.files[index].contentGeneration
   result.dependencyGeneration = workspace.files[index].dependencyGeneration
   result.configGeneration = workspace.configGeneration
+  result.index = workspace.files[index].index
+
+proc indexViewForFile*(workspace: Workspace, id: FileId): WorkspaceIndexView =
+  let index = id.recordIndex
+  if index < 0 or index >= workspace.files.len:
+    return
+  result.valid = workspace.files[index].state != workspaceMissing
+  result.id = workspace.snapshotId
+  result.fileId = id
+  result.path = workspace.files[index].path
+  result.uri = workspace.files[index].uri
+  result.contentGeneration = workspace.files[index].contentGeneration
   result.index = workspace.files[index].index

@@ -25,7 +25,8 @@ The implementation is organized by responsibility under `src/onim`:
   index, and their validated disk cache.
 - `session/` owns numeric identities, document overlays, snapshots, and the
   workspace dependency graph.
-- `features/` owns user-facing language actions such as organize-imports.
+- `features/` owns user-facing language actions such as organize-imports and
+  the conservative native definition resolver.
 - `semantic/` owns the compiler adapter and its isolated semantic worker.
 - `protocol/` owns the LSP transport and request lifecycle.
 - `stdlib/` owns generated standard-library symbol data and lookup.
@@ -66,6 +67,13 @@ references, so cache reloads do not duplicate names or offsets. The first native
 definition request resolves one unambiguous same-file module symbol; qualified,
 imported, nested, overloaded, and otherwise uncertain references return `null`
 until the parser and resolver milestones add scope facts.
+
+Project-module definition lookup uses only published numeric workspace views.
+It resolves an unambiguous exported declaration through a direct module
+qualifier, import alias, or plain `from` binding without calling the compiler,
+loading the target source, or walking the filesystem. Conditional, excluded,
+private, overloaded, forward, nested, aliased-symbol, and external-module
+cases intentionally return no location.
 
 ## Zed
 

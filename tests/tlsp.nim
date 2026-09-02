@@ -154,6 +154,55 @@ suite "stdio LSP":
     check declarationDefinition["result"]["range"]["start"]["line"].getInt == 1
     check declarationDefinition["result"]["range"]["start"]["character"].getInt == 5
 
+    let providerUri = "file:///tmp/onim-provider/provider.nim"
+    let consumerUri = "file:///tmp/onim-provider/consumer.nim"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": providerUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": "proc answer*() = discard\n",
+          }
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": consumerUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": "import provider\nprovider.answer()\n",
+          }
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "textDocument/definition",
+        "params": {
+          "textDocument": {"uri": consumerUri}, "position": {"line": 1, "character": 9}
+        },
+      },
+    )
+    let crossFileDefinition = readMessage(process.outputStream)
+    check crossFileDefinition != nil
+    check crossFileDefinition["result"]["uri"].getStr == providerUri
+    check crossFileDefinition["result"]["range"]["start"]["line"].getInt == 0
+    check crossFileDefinition["result"]["range"]["start"]["character"].getInt == 5
+
     sendMessage(
       process.inputStream,
       %*{
