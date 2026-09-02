@@ -52,7 +52,7 @@ The LSP builds one workspace index when it receives `initialize`. Each Nim file 
 
 On-disk source indexes are cached under `ONIM_CACHE_DIR` when set, then `XDG_CACHE_HOME/onim`, or `~/.cache/onim`. A project manifest records the canonical module inventory and file stamps; per-module records are keyed by canonical project/module paths and exact source fingerprints. At restart, an unchanged record can be loaded from the manifest without reading or retaining its source text; the exact bytes are hydrated when a feature requests that module. Cache data is acceleration only: an identity, version, checksum, bounds, stamp, or source mismatch falls back to a fresh in-memory index.
 
-`didOpen` and full-text `didChange` update only the affected file. A changed file invalidates its reverse import/include/export closure, including transitive dependents and cycles exactly once. If a non-stdlib dependency cannot be resolved yet, onim conservatively invalidates the whole workspace until the graph becomes complete. Configuration changes invalidate the whole workspace. Code actions are cached by content, dependency, configuration, and stdlib-prefix generations, so repeated requests for an unchanged snapshot do not invoke the compiler again.
+`didOpen` and full-text `didChange` update only the affected file. A changed file invalidates its reverse import/include/export closure, including transitive dependents and cycles exactly once. Filesystem add/delete/recreate transitions reconcile the numeric graph and preserve tombstone IDs without resolving deleted modules. Disk indexes are published only after a stable `stat -> read -> stat` pair. If a non-stdlib dependency cannot be resolved yet, onim conservatively invalidates the whole workspace until the graph becomes complete. Configuration changes invalidate the whole workspace. Code actions are cached by content, dependency, configuration, and stdlib-prefix generations, so repeated requests for an unchanged snapshot do not invoke the compiler again.
 
 The stdio server also keeps semantic organization in a persistent helper process. The helper owns the embedded compiler graph on one thread, while the LSP process remains free to receive edits. `didOpen` and `didChange` prefetch the current snapshot; at most one compiler request is in flight and intermediate edits are coalesced to the newest snapshot for each file. A code action returns from the generation cache when prefetch has completed, without placing compiler work on the LSP request path. The standalone CLI remains synchronous because its process lifetime ends after one file operation.
 
@@ -103,5 +103,16 @@ bench/bench_organize
 ```
 
 It reports median and p95 wall-clock latency after compiler/map warm-up; compiler diagnostics remain the correctness gate for every uncached source.
+
+The workspace benchmark builds a 256-module dependency chain and reports cold
+indexing versus a fresh workspace loading the manifest-backed module records:
+
+```sh
+nim c -r --path:src --hints:off --warnings:off bench/bench_workspace.nim
+```
+
+The warm measurement still reconstructs the current numeric graph. Persisting
+graph rows is intentionally deferred until resolver reconciliation and graph
+equivalence checks are complete.
 
 For LSP latency, measure both the first semantic prefetch and a cache-ready request. The first request can include Nim's initial module-graph build; subsequent requests for an unchanged or already-prefetched snapshot are served from the in-memory workspace/action cache.

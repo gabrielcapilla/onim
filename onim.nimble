@@ -23,6 +23,8 @@ task test, "run the organize-imports regression suite":
 task generateStdlibMap, "regenerate the compiler-derived stdlib symbol map":
   exec "nim c -r --hints:off --warnings:off gen_stdlib_map.nim"
 
-task bench, "measure warm organize-imports latency":
+task bench, "measure organize-imports and workspace-index latency":
   exec "nim c --path:src --hints:off --warnings:off bench/bench_organize.nim"
   exec "bench/bench_organize"
+  exec "nim c --path:src --hints:off --warnings:off bench/bench_workspace.nim"
+  exec "bench/bench_workspace"

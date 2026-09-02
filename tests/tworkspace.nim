@@ -113,6 +113,39 @@ suite "workspace index":
     writeFile(manifestPath, manifestBytes & "trailing")
     check loadProjectManifest(root).entries.len == 0
 
+  test "reconciles deleted and recreated modules":
+    let root = getTempDir() / ("onim-reconcile-" & $getCurrentProcessId())
+    cleanRoot(root)
+    createDir(root)
+    defer:
+      cleanRoot(root)
+
+    let providerPath = root / "provider.nim"
+    let consumerPath = root / "consumer.nim"
+    writeFile(providerPath, "proc provided() = discard\n")
+    writeFile(consumerPath, "import provider\nprovided()\n")
+
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    let providerId = workspace.fileIdForPath(providerPath)
+    let consumerId = workspace.fileIdForPath(consumerPath)
+    check workspace.dependencies(consumerId).hasId(providerId)
+    check workspace.graphComplete
+    discard workspace.drainInvalidated()
+
+    removeFile(providerPath)
+    workspace.indexWorkspace()
+    check workspace.snapshotForFile(providerId).state == workspaceMissing
+    check workspace.dependencies(consumerId).len == 0
+    check not workspace.graphComplete
+    discard workspace.drainInvalidated()
+
+    writeFile(providerPath, "proc provided() = discard\n")
+    workspace.fileChanged(providerPath)
+    check workspace.snapshotForFile(providerId).state == workspaceOnDisk
+    check workspace.dependencies(consumerId).hasId(providerId)
+    check workspace.graphComplete
+
   test "indexes dependencies and invalidates reverse closure":
     let root = getTempDir() / ("onim-workspace-" & $getCurrentProcessId())
     cleanRoot(root)

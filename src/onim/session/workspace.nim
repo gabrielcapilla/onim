@@ -58,6 +58,9 @@ proc canonicalPath(path: string): string =
     return ""
   absolutePath(path)
 
+proc unknownStamp(): FileStamp =
+  FileStamp(size: -1, modifiedSeconds: -1, modifiedNanoseconds: -1)
+
 proc adoptManifest(workspace: Workspace, manifest: ProjectManifest) =
   workspace.manifest = manifest
   workspace.manifestByPath.clear()
@@ -95,9 +98,8 @@ proc persistManifest(workspace: Workspace) =
     if file.state != workspaceOnDisk or file.index == nil:
       continue
     let stamp = fileStamp(file.path)
-    if stamp.size < 0:
+    if stamp.size < 0 or file.stamp.size < 0 or not sameFileStamp(stamp, file.stamp):
       continue
-    workspace.files[index].stamp = stamp
     entries.add ManifestEntry(
       path: file.path,
       sourceHash: file.index.contentHash,
@@ -130,7 +132,7 @@ proc ensureRecord(
     contentGeneration: InvalidContentGeneration,
     dependencyGeneration: InvalidDependencyGeneration,
     textLoaded: false,
-    stamp: FileStamp(size: -1, modifiedSeconds: -1, modifiedNanoseconds: -1),
+    stamp: unknownStamp(),
     forward: @[],
     reverse: @[],
   )
@@ -189,7 +191,11 @@ proc resolveReference(workspace: Workspace, ownerPath, reference: string): FileI
       modulePath.add ".nim"
     let key = canonicalPath(modulePath)
     if workspace.paths.hasKey(key):
-      return workspace.paths[key]
+      let id = workspace.paths[key]
+      let index = id.recordIndex
+      if index >= 0 and index < workspace.files.len and
+          workspace.files[index].state != workspaceMissing:
+        return id
   InvalidFileId
 
 proc replaceDependencies(workspace: Workspace, id: FileId) =
@@ -326,7 +332,7 @@ proc installText(
     if state == workspaceOnDisk:
       fileStamp(workspace.files[index].path)
     else:
-      FileStamp(size: -1, modifiedSeconds: -1, modifiedNanoseconds: -1)
+      unknownStamp()
   if not changed:
     return true
 
@@ -340,6 +346,28 @@ proc installText(
   workspace.files[index].contentGeneration = workspace.nextContent()
   replaceDependencies(workspace, id)
   true
+
+proc installDiskText(
+    workspace: Workspace, id: FileId, source: string, stamp: FileStamp, invalidate: bool
+): bool =
+  result = installText(workspace, id, source, workspaceOnDisk, -1, invalidate)
+  if result:
+    workspace.files[id.recordIndex].stamp = stamp
+
+proc stableDiskSource(
+    path: string
+): tuple[valid: bool, source: string, stamp: FileStamp] =
+  for _ in 0 .. 1:
+    let before = fileStamp(path)
+    if before.size < 0:
+      return
+    try:
+      let source = readFile(path)
+      let after = fileStamp(path)
+      if sameFileStamp(before, after) and after.size == int64(source.len):
+        return (true, source, after)
+    except CatchableError:
+      return
 
 proc ensureText(workspace: Workspace, id: FileId, invalidate = true): bool =
   let index = id.recordIndex
@@ -360,34 +388,39 @@ proc ensureText(workspace: Workspace, id: FileId, invalidate = true): bool =
       sameFileStamp(currentStamp, workspace.files[index].stamp):
     return true
 
-  try:
-    let source = readFile(path)
-    let sourceHash = contentFingerprint(source)
-    if workspace.files[index].state == workspaceOnDisk and
-        workspace.files[index].index != nil and
-        workspace.files[index].index.contentHash == sourceHash and
-        workspace.files[index].index.byteLength == source.len:
-      workspace.files[index].text = source
-      workspace.files[index].textLoaded = true
-      workspace.files[index].stamp = fileStamp(path)
-      return true
-    discard installText(workspace, id, source, workspaceOnDisk, -1, invalidate)
-    workspace.persistManifest()
-    true
-  except CatchableError:
+  let stable = stableDiskSource(path)
+  if not stable.valid:
     discard installText(workspace, id, "", workspaceMissing, -1, invalidate)
     workspace.persistManifest()
-    false
+    return false
+  let sourceHash = contentFingerprint(stable.source)
+  if workspace.files[index].state == workspaceOnDisk and
+      workspace.files[index].index != nil and
+      workspace.files[index].index.contentHash == sourceHash and
+      workspace.files[index].index.byteLength == stable.source.len:
+    workspace.files[index].text = stable.source
+    workspace.files[index].textLoaded = true
+    workspace.files[index].stamp = stable.stamp
+    return true
+  let wasMissing = workspace.files[index].state == workspaceMissing
+  discard workspace.installDiskText(id, stable.source, stable.stamp, invalidate)
+  if wasMissing:
+    workspace.rebuildDependencies()
+  workspace.persistManifest()
+  true
 
 proc indexWorkspace*(workspace: Workspace, root = "") =
   if root.len > 0:
     let canonicalRoot = canonicalPath(root)
     if canonicalRoot != workspace.root:
+      if workspace.files.len > 0:
+        return
       workspace.root = canonicalRoot
-      workspace.manifest = loadProjectManifest(workspace.root)
+      workspace.adoptManifest(loadProjectManifest(workspace.root))
   if workspace.root.len == 0 or not dirExists(workspace.root):
     return
 
+  let hadRecords = workspace.files.len > 0
   var paths: seq[string] = @[]
   try:
     for path in walkDirRec(workspace.root):
@@ -401,12 +434,32 @@ proc indexWorkspace*(workspace: Workspace, root = "") =
     return
   paths.sort
 
+  var present = initTable[string, bool]()
+  var topologyChanged = false
   for path in paths:
-    discard ensureRecord(workspace, path)
+    present[path] = true
+    let ensured = ensureRecord(workspace, path)
+    if hadRecords and ensured.created:
+      topologyChanged = true
+
+  for index in 0 ..< workspace.files.len:
+    if workspace.files[index].state != workspaceOpen and
+        not present.hasKey(workspace.files[index].path) and
+        workspace.files[index].state != workspaceMissing:
+      workspace.files[index].state = workspaceMissing
+      workspace.files[index].text = ""
+      workspace.files[index].textLoaded = true
+      workspace.files[index].stamp = unknownStamp()
+      workspace.files[index].index = indexSource("")
+      workspace.files[index].contentGeneration = workspace.nextContent()
+      if hadRecords:
+        topologyChanged = true
+
   for path in paths:
     let id = workspace.paths[path]
     if workspace.files[id.recordIndex].state == workspaceOpen:
       continue
+    let wasMissing = workspace.files[id.recordIndex].state == workspaceMissing
     let stamp = fileStamp(path)
     if workspace.manifestByPath.hasKey(path):
       let entry = workspace.manifestByPath[path]
@@ -424,26 +477,33 @@ proc indexWorkspace*(workspace: Workspace, root = "") =
           workspace.files[id.recordIndex].index = cached
           workspace.files[id.recordIndex].contentGeneration = workspace.nextContent()
           continue
-    try:
-      let source = readFile(path)
-      workspace.files[id.recordIndex].text = source
+    let stable = stableDiskSource(path)
+    if stable.valid:
+      workspace.files[id.recordIndex].text = stable.source
       workspace.files[id.recordIndex].textLoaded = true
       workspace.files[id.recordIndex].state = workspaceOnDisk
       workspace.files[id.recordIndex].version = -1
-      workspace.files[id.recordIndex].stamp = fileStamp(path)
-      workspace.files[id.recordIndex].index = workspace.indexDiskSource(path, source)
+      workspace.files[id.recordIndex].stamp = stable.stamp
+      workspace.files[id.recordIndex].index =
+        workspace.indexDiskSource(path, stable.source)
       workspace.files[id.recordIndex].contentGeneration = workspace.nextContent()
       workspace.files[id.recordIndex].text = ""
       workspace.files[id.recordIndex].textLoaded = false
-    except CatchableError:
+      if hadRecords and wasMissing:
+        topologyChanged = true
+    else:
       workspace.files[id.recordIndex].state = workspaceMissing
       workspace.files[id.recordIndex].text = ""
       workspace.files[id.recordIndex].textLoaded = true
-      workspace.files[id.recordIndex].stamp =
-        FileStamp(size: -1, modifiedSeconds: -1, modifiedNanoseconds: -1)
+      workspace.files[id.recordIndex].stamp = unknownStamp()
       workspace.files[id.recordIndex].index = indexSource("")
+      if hadRecords and not wasMissing:
+        topologyChanged = true
   rebuildDependencies(workspace)
-  workspace.bumpSnapshot()
+  if topologyChanged:
+    workspace.invalidateAll()
+  else:
+    workspace.bumpSnapshot()
   workspace.persistManifest()
 
 proc fileIdForPath*(workspace: Workspace, path: string): FileId =
@@ -512,21 +572,19 @@ proc refreshDiskFile*(workspace: Workspace, path: string, deleted = false) =
   let index = ensured.id.recordIndex
   if workspace.files[index].state == workspaceOpen:
     return
+  let wasMissing = workspace.files[index].state == workspaceMissing
+  var topologyChanged = ensured.created or wasMissing
   if deleted or not fileExists(workspace.files[index].path):
     discard installText(workspace, ensured.id, "", workspaceMissing, -1, true)
+    topologyChanged = not wasMissing
   else:
-    try:
-      discard installText(
-        workspace,
-        ensured.id,
-        readFile(workspace.files[index].path),
-        workspaceOnDisk,
-        -1,
-        true,
-      )
-    except CatchableError:
+    let stable = stableDiskSource(workspace.files[index].path)
+    if stable.valid:
+      discard workspace.installDiskText(ensured.id, stable.source, stable.stamp, true)
+    else:
       discard installText(workspace, ensured.id, "", workspaceMissing, -1, true)
-  if ensured.created:
+      topologyChanged = not wasMissing
+  if topologyChanged:
     rebuildDependencies(workspace)
   workspace.persistManifest()
 
@@ -536,15 +594,12 @@ proc closeDocument*(workspace: Workspace, uri, path: string) =
     return
   let index = id.recordIndex
   workspace.files[index].uri = uri
-  if fileExists(workspace.files[index].path):
-    try:
-      discard installText(
-        workspace, id, readFile(workspace.files[index].path), workspaceOnDisk, -1, true
-      )
-    except CatchableError:
-      discard installText(workspace, id, "", workspaceMissing, -1, true)
+  let stable = stableDiskSource(workspace.files[index].path)
+  if stable.valid:
+    discard workspace.installDiskText(id, stable.source, stable.stamp, true)
   else:
     discard installText(workspace, id, "", workspaceMissing, -1, true)
+    rebuildDependencies(workspace)
   workspace.persistManifest()
 
 proc configurationChanged*(workspace: Workspace) =
