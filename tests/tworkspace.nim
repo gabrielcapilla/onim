@@ -88,6 +88,9 @@ suite "workspace index":
       root, filePath, contentFingerprint(source), source.len
     ) != nil
     check loadCachedSourceIndex(root, filePath, source & "# changed\n") == nil
+    var invalidGraphEntry = firstWorkspace.manifest.entries[0]
+    invalidGraphEntry.forwardOrdinals = @[1'u32]
+    check not saveProjectManifest(root, @[invalidGraphEntry], graphValid = true)
 
     let secondWorkspace = initWorkspace(root)
     secondWorkspace.indexWorkspace()
@@ -115,10 +118,19 @@ suite "workspace index":
 
   test "reconciles deleted and recreated modules":
     let root = getTempDir() / ("onim-reconcile-" & $getCurrentProcessId())
+    let cacheRoot = getTempDir() / ("onim-reconcile-cache-" & $getCurrentProcessId())
     cleanRoot(root)
+    cleanTree(cacheRoot)
     createDir(root)
+    let previousCacheRoot = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
     defer:
+      if previousCacheRoot.len > 0:
+        putEnv("ONIM_CACHE_DIR", previousCacheRoot)
+      else:
+        delEnv("ONIM_CACHE_DIR")
       cleanRoot(root)
+      cleanTree(cacheRoot)
 
     let providerPath = root / "provider.nim"
     let consumerPath = root / "consumer.nim"
@@ -131,7 +143,16 @@ suite "workspace index":
     let consumerId = workspace.fileIdForPath(consumerPath)
     check workspace.dependencies(consumerId).hasId(providerId)
     check workspace.graphComplete
+    check workspace.manifest.graphValid
     discard workspace.drainInvalidated()
+
+    let warmWorkspace = initWorkspace(root)
+    warmWorkspace.indexWorkspace()
+    let warmProviderId = warmWorkspace.fileIdForPath(providerPath)
+    let warmConsumerId = warmWorkspace.fileIdForPath(consumerPath)
+    check warmWorkspace.manifest.graphValid
+    check warmWorkspace.dependencies(warmConsumerId).hasId(warmProviderId)
+    check warmWorkspace.graphComplete
 
     removeFile(providerPath)
     workspace.indexWorkspace()

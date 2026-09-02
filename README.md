@@ -111,8 +111,8 @@ indexing versus a fresh workspace loading the manifest-backed module records:
 nim c -r --path:src --hints:off --warnings:off bench/bench_workspace.nim
 ```
 
-The warm measurement still reconstructs the current numeric graph. Persisting
-graph rows is intentionally deferred until resolver reconciliation and graph
-equivalence checks are complete.
+The warm measurement restores the validated numeric graph rows from the
+manifest and reconstructs reverse edges in memory. Any inventory, stamp, cache,
+or graph-format mismatch falls back to the normal graph rebuild.
 
 For LSP latency, measure both the first semantic prefetch and a cache-ready request. The first request can include Nim's initial module-graph build; subsequent requests for an unchanged or already-prefetched snapshot are served from the in-memory workspace/action cache.

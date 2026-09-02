@@ -8,6 +8,8 @@ const
   cacheMagic = "ONIMIDX1"
   manifestMagic = "ONIMMAN1"
   cacheVersion = 1'u32
+  manifestVersion = 2'u32
+  manifestGraphVersion = 2'u32
   cacheEndian = 1'u8
   maxCacheBytes = 64 * 1024 * 1024
   maxStringBytes = 4 * 1024 * 1024
@@ -24,10 +26,13 @@ type
     sourceHash*: uint64
     byteLength*: int64
     stamp*: FileStamp
+    forwardOrdinals*: seq[uint32]
+    unresolved*: bool
 
   ProjectManifest* = object
     root*: string
     entries*: seq[ManifestEntry]
+    graphValid*: bool
 
 proc invalidCache(message: string) {.noreturn.} =
   raise newException(IOError, message)
@@ -294,6 +299,9 @@ proc projectManifestPath*(projectRoot: string): string =
     return ""
   splitFile(modules).dir / "manifest"
 
+proc temporaryCachePath(path: string): string =
+  path & ".tmp." & $getCurrentProcessId() & "." & $epochTime()
+
 proc fileStamp*(path: string): FileStamp =
   try:
     let info = getFileInfo(path)
@@ -309,7 +317,11 @@ proc sameFileStamp*(left, right: FileStamp): bool =
   left.size == right.size and left.modifiedSeconds == right.modifiedSeconds and
     left.modifiedNanoseconds == right.modifiedNanoseconds
 
-proc writeManifestPayload(stream: Stream, entries: openArray[ManifestEntry]) =
+proc writeManifestPayload(
+    stream: Stream, entries: openArray[ManifestEntry], graphValid: bool
+) =
+  stream.write(manifestGraphVersion)
+  writeFlag(stream, graphValid)
   writeCount(stream, entries.len, maxRecordCount)
   for entry in entries:
     writeString(stream, canonicalPath(entry.path))
@@ -318,17 +330,27 @@ proc writeManifestPayload(stream: Stream, entries: openArray[ManifestEntry]) =
     stream.write(entry.stamp.size)
     stream.write(entry.stamp.modifiedSeconds)
     stream.write(entry.stamp.modifiedNanoseconds)
+    writeCount(stream, entry.forwardOrdinals.len, maxRecordCount)
+    for ordinal in entry.forwardOrdinals:
+      stream.write(ordinal)
+    writeFlag(stream, entry.unresolved)
 
 proc readManifestPayload(stream: Stream, root: string): ProjectManifest =
   result.root = root
+  if stream.readUint32() != manifestGraphVersion:
+    invalidCache("manifest graph version does not match")
+  result.graphValid = readFlag(stream)
   let count = readCount(stream, maxRecordCount)
   result.entries = newSeqOfCap[ManifestEntry](count)
   var paths = initHashSet[string]()
+  var previousEntryPath = ""
   for _ in 0 ..< count:
     let path = canonicalPath(readString(stream))
-    if path.len == 0 or path in paths:
+    if path.len == 0 or path in paths or
+        (previousEntryPath.len > 0 and path <= previousEntryPath):
       invalidCache("manifest path is invalid or duplicated")
     paths.incl path
+    previousEntryPath = path
     var entry = ManifestEntry(path: path)
     entry.sourceHash = stream.readUint64()
     entry.byteLength = stream.readInt64()
@@ -339,12 +361,23 @@ proc readManifestPayload(stream: Stream, root: string): ProjectManifest =
         entry.stamp.modifiedNanoseconds < -1 or
         entry.stamp.modifiedNanoseconds >= 1_000_000_000:
       invalidCache("manifest file stamp is invalid")
+    let forwardCount = readCount(stream, maxRecordCount)
+    entry.forwardOrdinals = newSeqOfCap[uint32](forwardCount)
+    var previousOrdinal = uint32(0)
+    for _ in 0 ..< forwardCount:
+      let ordinal = stream.readUint32()
+      if ordinal >= uint32(count) or
+          (entry.forwardOrdinals.len > 0 and ordinal <= previousOrdinal):
+        invalidCache("manifest graph row is invalid")
+      previousOrdinal = ordinal
+      entry.forwardOrdinals.add ordinal
+    entry.unresolved = readFlag(stream)
     result.entries.add entry
 
 proc readManifestEnvelope(stream: Stream, projectRoot: string): ProjectManifest =
   if stream.readStr(manifestMagic.len) != manifestMagic:
     invalidCache("manifest magic does not match")
-  if stream.readUint32() != cacheVersion or stream.readUint8() != cacheEndian:
+  if stream.readUint32() != manifestVersion or stream.readUint8() != cacheEndian:
     invalidCache("manifest version does not match")
   let storedRoot = readString(stream)
   let root = canonicalPath(projectRoot)
@@ -385,7 +418,7 @@ proc loadProjectManifest*(projectRoot: string): ProjectManifest =
         discard
 
 proc saveProjectManifest*(
-    projectRoot: string, entries: openArray[ManifestEntry]
+    projectRoot: string, entries: openArray[ManifestEntry], graphValid = false
 ): bool =
   let root = canonicalPath(projectRoot)
   if root.len == 0:
@@ -396,6 +429,13 @@ proc saveProjectManifest*(
       return false
     var copied = entry
     copied.path = canonicalPath(entry.path)
+    for index, ordinal in copied.forwardOrdinals:
+      if ordinal >= uint32(entries.len) or
+          (index > 0 and ordinal <= copied.forwardOrdinals[index - 1]):
+        return false
+    if not graphValid:
+      copied.forwardOrdinals.setLen(0)
+      copied.unresolved = false
     ordered.add copied
   ordered.sort(
     proc(left, right: ManifestEntry): int =
@@ -407,11 +447,11 @@ proc saveProjectManifest*(
 
   let path = projectManifestPath(root)
   let directory = splitFile(path).dir
-  let temporary = path & ".tmp"
+  let temporary = temporaryCachePath(path)
   var payloadStream = newStringStream()
   var stream: FileStream
   try:
-    writeManifestPayload(payloadStream, ordered)
+    writeManifestPayload(payloadStream, ordered, graphValid)
     payloadStream.flush()
     let payload = payloadStream.data
     if payload.len > maxCacheBytes:
@@ -421,7 +461,7 @@ proc saveProjectManifest*(
     if stream == nil:
       return false
     stream.write(manifestMagic)
-    stream.write(cacheVersion)
+    stream.write(manifestVersion)
     stream.write(cacheEndian)
     writeString(stream, root)
     stream.write(uint64(payload.len))
@@ -545,7 +585,7 @@ proc saveCachedSourceIndex*(
   if path.len == 0:
     return false
   let directory = splitFile(path).dir
-  let temporary = path & ".tmp"
+  let temporary = temporaryCachePath(path)
   var stream: FileStream
   try:
     createDir(directory)

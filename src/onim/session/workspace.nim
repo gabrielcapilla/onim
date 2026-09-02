@@ -93,24 +93,51 @@ proc indexDiskSource(workspace: Workspace, path, source: string): SourceIndex =
 
 proc persistManifest(workspace: Workspace) =
   var entries: seq[ManifestEntry] = @[]
+  var graphValid = true
   for index in 0 ..< workspace.files.len:
     let file = workspace.files[index]
     if file.state != workspaceOnDisk or file.index == nil:
+      graphValid = false
       continue
     let stamp = fileStamp(file.path)
     if stamp.size < 0 or file.stamp.size < 0 or not sameFileStamp(stamp, file.stamp):
+      graphValid = false
       continue
     entries.add ManifestEntry(
       path: file.path,
       sourceHash: file.index.contentHash,
       byteLength: int64(file.index.byteLength),
       stamp: stamp,
+      unresolved: file.unresolved,
     )
-  workspace.manifest = ProjectManifest(root: workspace.root, entries: entries)
-  workspace.manifestByPath.clear()
-  for entry in entries:
-    workspace.manifestByPath[entry.path] = entry
-  discard saveProjectManifest(workspace.root, entries)
+  graphValid = graphValid and entries.len == workspace.files.len
+  entries.sort(
+    proc(left, right: ManifestEntry): int =
+      cmp(left.path, right.path)
+  )
+  if graphValid:
+    var ordinals = initTable[string, uint32]()
+    for ordinal, entry in entries:
+      ordinals[entry.path] = uint32(ordinal)
+    for ordinal, entry in entries:
+      let id = workspace.paths[entry.path]
+      for dependency in workspace.files[id.slot].forward:
+        let dependencyIndex = dependency.slot
+        if dependencyIndex < 0 or dependencyIndex >= workspace.files.len or
+            workspace.files[dependencyIndex].state != workspaceOnDisk or
+            not ordinals.hasKey(workspace.files[dependencyIndex].path):
+          graphValid = false
+          break
+        entries[ordinal].forwardOrdinals.add(
+          ordinals[workspace.files[dependencyIndex].path]
+        )
+      if not graphValid:
+        break
+      entries[ordinal].forwardOrdinals.sort
+  workspace.adoptManifest(
+    ProjectManifest(root: workspace.root, entries: entries, graphValid: graphValid)
+  )
+  discard saveProjectManifest(workspace.root, entries, graphValid)
 
 proc ensureRecord(
     workspace: Workspace, path: string
@@ -256,6 +283,67 @@ proc rebuildDependencies(workspace: Workspace) =
     file.unresolved = false
   for index in 0 ..< workspace.files.len:
     replaceDependencies(workspace, workspace.files[index].id)
+
+proc restoreDependencies(workspace: Workspace): bool =
+  if not workspace.manifest.graphValid or
+      workspace.manifest.entries.len != workspace.files.len:
+    return false
+
+  var seen = newSeq[bool](workspace.files.len)
+  var idsByOrdinal = newSeq[FileId](workspace.manifest.entries.len)
+  var unresolvedFiles = 0
+  for ordinal, entry in workspace.manifest.entries:
+    if not workspace.paths.hasKey(entry.path):
+      return false
+    let id = workspace.paths[entry.path]
+    let index = id.recordIndex
+    if index < 0 or index >= workspace.files.len or seen[index] or entry.byteLength < 0 or
+        entry.byteLength > int64(high(int)) or
+        workspace.files[index].state != workspaceOnDisk or
+        workspace.files[index].index == nil or
+        not sameFileStamp(workspace.files[index].stamp, entry.stamp) or
+        workspace.files[index].index.contentHash != entry.sourceHash or
+        workspace.files[index].index.byteLength != int(entry.byteLength):
+      return false
+    seen[index] = true
+    idsByOrdinal[ordinal] = id
+    workspace.files[index].unresolved = entry.unresolved
+    if entry.unresolved:
+      inc unresolvedFiles
+
+  for index in 0 ..< workspace.files.len:
+    if not seen[index]:
+      return false
+    workspace.files[index].forward = @[]
+  for ordinal, entry in workspace.manifest.entries:
+    let index = idsByOrdinal[ordinal].recordIndex
+    var previousOrdinal = uint32(0)
+    for dependencyOrdinal in entry.forwardOrdinals:
+      if dependencyOrdinal >= uint32(idsByOrdinal.len) or (
+        workspace.files[index].forward.len > 0 and dependencyOrdinal <= previousOrdinal
+      ):
+        return false
+      let dependency = idsByOrdinal[int(dependencyOrdinal)]
+      let dependencyIndex = dependency.recordIndex
+      if dependencyIndex < 0 or dependencyIndex >= workspace.files.len or
+          workspace.files[dependencyIndex].state == workspaceMissing:
+        return false
+      workspace.files[index].forward.add dependency
+      previousOrdinal = dependencyOrdinal
+
+  for index in 0 ..< workspace.files.len:
+    workspace.files[index].reverse.setLen(0)
+  for index in 0 ..< workspace.files.len:
+    for dependency in workspace.files[index].forward:
+      let dependencyIndex = dependency.recordIndex
+      if dependencyIndex < 0 or dependencyIndex >= workspace.files.len:
+        return false
+      addUniqueId(workspace.files[dependencyIndex].reverse, workspace.files[index].id)
+  for file in workspace.files.mitems:
+    file.forward.sortIds
+    file.reverse.sortIds
+  workspace.unresolvedFiles = unresolvedFiles
+  true
 
 proc allFileIds(workspace: Workspace): seq[FileId] =
   result = newSeqOfCap[FileId](workspace.files.len)
@@ -499,7 +587,9 @@ proc indexWorkspace*(workspace: Workspace, root = "") =
       workspace.files[id.recordIndex].index = indexSource("")
       if hadRecords and not wasMissing:
         topologyChanged = true
-  rebuildDependencies(workspace)
+  let restored = not topologyChanged and workspace.restoreDependencies()
+  if not restored:
+    rebuildDependencies(workspace)
   if topologyChanged:
     workspace.invalidateAll()
   else:
