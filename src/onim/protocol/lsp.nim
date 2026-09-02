@@ -510,9 +510,8 @@ proc codeActions(
         edits = actionCache[cacheKey].edits
     else:
       if snapshot.index != nil:
-        edits = organizeSourceWithImports(
-          snapshot.path, snapshot.text, snapshot.index.parsed, options
-        )
+        edits =
+          organizeSourceWithIndex(snapshot.path, snapshot.text, snapshot.index, options)
       else:
         edits = organizeSource(snapshot.path, snapshot.text, options)
       actionCache[cacheKey] = CachedAction(

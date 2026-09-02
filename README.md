@@ -22,7 +22,7 @@ The implementation is organized by responsibility under `src/onim`:
 
 - `syntax/` owns lexical tokens and structural import/source parsing.
 - `index/` owns per-file source indexes, the conservative module-surface symbol
-  index, and their validated disk cache.
+  and numeric occurrence indexes, and their validated disk cache.
 - `session/` owns numeric identities, document overlays, snapshots, and the
   workspace dependency graph.
 - `features/` owns user-facing language actions such as organize-imports and
@@ -53,6 +53,13 @@ The generated map is bundled into the executable and may also be overridden with
 The LSP builds one workspace index when it receives `initialize`. Each Nim file gets a stable numeric `FileId`; its parsed import/include/export references are retained in a compact per-file index, while forward and reverse dependency edges use numeric IDs. A document overlay is authoritative while it is open, so organize-imports reads the same bytes that Zed is editing.
 
 On-disk source indexes are cached under `ONIM_CACHE_DIR` when set, then `XDG_CACHE_HOME/onim`, or `~/.cache/onim`. A project manifest records the canonical module inventory and file stamps; per-module records are keyed by canonical project/module paths and exact source fingerprints. At restart, an unchanged record can be loaded from the manifest without reading or retaining its source text; the exact bytes are hydrated when a feature requests that module. Cache data is acceleration only: an identity, version, checksum, bounds, stamp, or source mismatch falls back to a fresh in-memory index.
+
+Each source index also contains immutable numeric identifier postings, qualified
+member pairs, style-aware usage summaries, and explicit uncertainty reasons.
+They are reconstructed from the already-cached tokens, imports, and symbols, so
+the cache format stays compatible while a warm LSP request can inspect the
+preflight data without reparsing. Only a proven comment/string-only no-op skips
+the compiler today; uncertain semantic cases remain compiler-authoritative.
 
 `didOpen` and full-text `didChange` update only the affected file. A changed file invalidates its reverse import/include/export closure, including transitive dependents and cycles exactly once. Filesystem add/delete/recreate transitions reconcile the numeric graph and preserve tombstone IDs without resolving deleted modules. Disk indexes are published only after a stable `stat -> read -> stat` pair. If a non-stdlib dependency cannot be resolved yet, onim conservatively invalidates the whole workspace until the graph becomes complete. Configuration changes invalidate the whole workspace. Code actions are cached by content, dependency, configuration, and stdlib-prefix generations, so repeated requests for an unchanged snapshot do not invoke the compiler again.
 

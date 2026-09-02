@@ -1,6 +1,8 @@
 import std/[os, strutils, unittest]
 
 import onim/features/organize
+import onim/index/occurrences
+import onim/index/source_index
 import onim/semantic/compiler_api
 
 const cases = [
@@ -80,3 +82,9 @@ suite "organize imports":
       foundUnusedDeclaration = foundUnusedDeclaration or diagnostic.isUnusedDeclaration
     check foundUnusedImport
     check foundUnusedDeclaration
+
+  test "uses the source index for a compiler-free no-op":
+    let source = "# comments and strings contain no source uses\n\"walkDir\"\n"
+    let index = indexSource(source)
+    check index.occurrences.isComplete
+    check organizeSourceWithIndex("/no/such/file.nim", source, index).len == 0

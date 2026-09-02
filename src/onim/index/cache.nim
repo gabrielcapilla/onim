@@ -3,6 +3,7 @@ import std/[algorithm, os, sets, streams, strutils, times]
 import ../syntax/imports
 import ../syntax/lexer
 import ./source_index
+import ./occurrences
 import ./symbols
 
 const
@@ -295,6 +296,9 @@ proc readSourceIndex(
     validateSourceSymbol(symbol, result.parsed.tokens, previousToken)
     result.symbols.add symbol
     previousToken = symbol.nameToken
+  result.occurrences = indexOccurrences(result.parsed, result.symbols)
+  if not validateOccurrences(result.occurrences, result.parsed.tokens):
+    invalidCache("cache occurrence index is invalid")
 
 proc canonicalPath(path: string): string =
   if path.len == 0:

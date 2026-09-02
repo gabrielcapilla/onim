@@ -2,6 +2,7 @@ import std/[algorithm, strutils]
 
 import ../syntax/imports
 import ../syntax/lexer
+import ./occurrences
 import ./symbols
 
 type SourceIndex* = ref object
@@ -9,6 +10,7 @@ type SourceIndex* = ref object
   byteLength*: int
   tokenCount*: int
   parsed*: SourceImports
+  occurrences*: OccurrenceIndex
   symbols*: seq[SourceSymbol]
   imports*: seq[string]
   exports*: seq[string]
@@ -74,6 +76,7 @@ proc indexSource*(source: string): SourceIndex =
   result.parsed = parseSourceImports(source)
   result.tokenCount = result.parsed.tokens.len
   result.symbols = indexSymbols(source, result.parsed.tokens)
+  result.occurrences = indexOccurrences(result.parsed, result.symbols)
 
   for item in result.parsed.imports:
     addUnique(result.imports, canonicalReference(item.module))

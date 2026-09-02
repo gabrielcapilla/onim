@@ -2,6 +2,7 @@ import std/[algorithm, osproc, strutils, unittest]
 import std/os except FileId
 
 import onim/index/cache
+import onim/index/occurrences
 import onim/index/source_index
 import onim/session/ids
 import onim/session/workspace
@@ -106,6 +107,10 @@ suite "workspace index":
     check secondSnapshot.index.parsed.imports.len ==
       firstSnapshot.index.parsed.imports.len
     check secondSnapshot.index.symbols == firstSnapshot.index.symbols
+    check secondSnapshot.index.occurrences == firstSnapshot.index.occurrences
+    check secondSnapshot.index.occurrences.validateOccurrences(
+      secondSnapshot.index.parsed.tokens
+    )
 
     let cacheBytes = readFile(path)
     writeFile(path, cacheBytes & "trailing")

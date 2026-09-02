@@ -1,5 +1,7 @@
 import std/[algorithm, hashes, os, sets, strutils, tables]
 
+import ../index/occurrences
+import ../index/source_index
 import ../semantic/compiler_api
 import ../stdlib/map
 import ../syntax/imports
@@ -1096,6 +1098,20 @@ proc organizeSource*(
   var info = parseSourceImports(source)
   result = organizeSourceImpl(filePath, source, info, options)
 
+proc organizeSourceWithIndex*(
+    filePath, source: string, index: SourceIndex, options = defaultOrganizeOptions()
+): seq[ImportEdit] =
+  ## Use the immutable index for a safe compiler-free no-op. All other
+  ## decisions continue through the compiler-backed organizer until native
+  ## scopes and module surfaces are complete.
+  if index == nil or index.contentHash != contentFingerprint(source) or
+      index.byteLength != source.len:
+    return organizeSource(filePath, source, options)
+  if index.parsed.imports.len == 0 and index.symbols.len == 0 and index.includes.len == 0 and
+      index.occurrences.identifiers.len == 0 and index.occurrences.isComplete:
+    return
+  organizeSourceWithImports(filePath, source, index.parsed, options)
+
 proc applyEdits*(source: string, edits: seq[ImportEdit]): string =
   var ordered = edits
   ordered.sort(
@@ -1120,7 +1136,7 @@ proc organizeFile*(filePath: string, options = defaultOrganizeOptions()): bool =
   if not fileExists(filePath):
     return false
   let source = readFile(filePath)
-  let edits = organizeSource(filePath, source, options)
+  let edits = organizeSourceWithIndex(filePath, source, indexSource(source), options)
   if edits.len == 0:
     return false
   let organized = applyEdits(source, edits)
