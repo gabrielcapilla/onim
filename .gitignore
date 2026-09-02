@@ -1,4 +1,8 @@
 nimcache/
 bin/
+/onim
+bench/bench_organize
 tests/torganize
+tests/tlsp
+tests/tworkspace
 gen_stdlib_map

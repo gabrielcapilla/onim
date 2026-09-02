@@ -33,7 +33,10 @@ suite "stdio LSP":
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
-        "params": {"initializationOptions": {"useStdPrefix": true}},
+        "params": {
+          "rootUri": "file://" & root.replace('\\', '/'),
+          "initializationOptions": {"useStdPrefix": true},
+        },
       },
     )
     let initialized = readMessage(process.outputStream)
@@ -73,6 +76,27 @@ suite "stdio LSP":
     check actions["result"].kind == JArray
     check actions["result"].len == 1
     check actions["result"][0]["edit"]["changes"][uri][0]["newText"].getStr.contains(
+      "import std/os"
+    )
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "textDocument/codeAction",
+        "params": {
+          "textDocument": {"uri": uri},
+          "range":
+            {"start": {"line": 0, "character": 0}, "end": {"line": 4, "character": 0}},
+          "context": {"only": ["source.organizeImports"]},
+        },
+      },
+    )
+    let cachedActions = readMessage(process.outputStream)
+    check cachedActions != nil
+    check cachedActions["result"].len == 1
+    check cachedActions["result"][0]["edit"]["changes"][uri][0]["newText"].getStr.contains(
       "import std/os"
     )
 

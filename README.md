@@ -28,6 +28,14 @@ nimble generateStdlibMap
 
 The generated map is bundled into the executable and may also be overridden with `ONIM_STDLIB_MAP=/path/to/stdlib_map.json`.
 
+## Workspace index
+
+The LSP builds one in-memory workspace index when it receives `initialize`. Each Nim file gets a stable numeric `FileId`; its parsed import/include/export references are retained in a compact per-file index, while forward and reverse dependency edges use numeric IDs. A document overlay is authoritative while it is open, so organize-imports reads the same bytes that Zed is editing.
+
+`didOpen` and full-text `didChange` update only the affected file. A changed file invalidates its reverse import/include/export closure, including transitive dependents and cycles exactly once. If a non-stdlib dependency cannot be resolved yet, onim conservatively invalidates the whole workspace until the graph becomes complete. Configuration changes invalidate the whole workspace. Code actions are cached by content, dependency, configuration, and stdlib-prefix generations, so repeated requests for an unchanged snapshot do not invoke the compiler again.
+
+The index is an orchestration layer, not a semantic replacement for Nim. An uncached organize-imports request still asks the embedded compiler/nimsuggest boundary for `undeclared identifier`; lexical indexing only determines what needs to be refreshed. Field-layout analysis and a future `onim --compact` opt-in remain separate from `source.organizeImports`.
+
 ## Zed
 
 Put `onim` on `PATH`, or expose the executable as an `onim` language-server entry in the Nim language extension. Keep the existing Nim server if desired; onim only contributes the organize-imports action. Add the following to the corresponding parts of `~/.config/zed/settings.json`:

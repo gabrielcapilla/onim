@@ -1,0 +1,172 @@
+import std/[osproc, strutils, unittest]
+import std/os except FileId
+
+import onim/workspace
+import onim/workspace_ids
+
+proc uriFor(path: string): string =
+  "file://" & path.replace('\\', '/')
+
+proc sameId(left, right: FileId): bool =
+  left.value == right.value
+
+proc hasId(values: openArray[FileId], wanted: FileId): bool =
+  for value in values:
+    if value.sameId(wanted):
+      return true
+
+proc sortedUnique(values: openArray[FileId]): bool =
+  for index in 1 ..< values.len:
+    if values[index - 1].value >= values[index].value:
+      return false
+  true
+
+proc cleanRoot(root: string) =
+  if not dirExists(root):
+    return
+  for path in walkDirRec(root):
+    if fileExists(path):
+      removeFile(path)
+  removeDir(root)
+
+suite "workspace index":
+  test "indexes dependencies and invalidates reverse closure":
+    let root = getTempDir() / ("onim-workspace-" & $getCurrentProcessId())
+    cleanRoot(root)
+    createDir(root)
+    defer:
+      cleanRoot(root)
+
+    let aPath = root / "a.nim"
+    let bPath = root / "b.nim"
+    let cPath = root / "c.nim"
+    let dPath = root / "d.nim"
+    let ePath = root / "e.nim"
+    let exporterPath = root / "exporter.nim"
+    let includeParentPath = root / "include_parent.nim"
+    let includedPath = root / "included.nim"
+    let cycleOnePath = root / "cycle1.nim"
+    let cycleTwoPath = root / "cycle2.nim"
+
+    let cText = "proc c() = discard\n"
+    writeFile(aPath, "import b\nimport c\n")
+    writeFile(bPath, "import c\n")
+    writeFile(cPath, cText)
+    writeFile(dPath, "import c\n")
+    writeFile(ePath, "import b\nimport d\n")
+    writeFile(exporterPath, "import c\nexport c\n")
+    writeFile(includeParentPath, "include included\n")
+    writeFile(includedPath, "const includedValue = 1\n")
+    writeFile(cycleOnePath, "import cycle2\n")
+    writeFile(cycleTwoPath, "import cycle1\n")
+
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    check workspace.fileCount == 10
+    check workspace.graphComplete
+    check workspace.drainInvalidated().len == 0
+
+    let aId = workspace.fileIdForPath(aPath)
+    let bId = workspace.fileIdForPath(bPath)
+    let cId = workspace.fileIdForPath(cPath)
+    let dId = workspace.fileIdForPath(dPath)
+    let eId = workspace.fileIdForPath(ePath)
+    let exporterId = workspace.fileIdForPath(exporterPath)
+    let includeParentId = workspace.fileIdForPath(includeParentPath)
+    let includedId = workspace.fileIdForPath(includedPath)
+    let cycleOneId = workspace.fileIdForPath(cycleOnePath)
+    let cycleTwoId = workspace.fileIdForPath(cycleTwoPath)
+
+    check aId.valid
+    check workspace.dependencies(aId).len == 2
+    check workspace.dependencies(aId).hasId(bId)
+    check workspace.dependencies(aId).hasId(cId)
+    check workspace.dependencies(exporterId).len == 1
+    check workspace.dependencies(exporterId).hasId(cId)
+    check workspace.dependencies(includeParentId).len == 1
+    check workspace.dependencies(includeParentId).hasId(includedId)
+
+    let cDependents = workspace.dependents(cId)
+    check cDependents.len == 4
+    check cDependents.hasId(aId)
+    check cDependents.hasId(bId)
+    check cDependents.hasId(dId)
+    check cDependents.hasId(exporterId)
+    check sortedUnique(cDependents)
+
+    let includedDependents = workspace.dependents(includedId)
+    check includedDependents.len == 1
+    check includedDependents.hasId(includeParentId)
+
+    let opened = workspace.openDocument(uriFor(cPath), cPath, cText, 1)
+    check opened.sameId(cId)
+    check workspace.drainInvalidated().len == 0
+    check workspace.changeDocument(uriFor(cPath), cPath, cText, 2)
+    check workspace.drainInvalidated().len == 0
+
+    let beforeChange = workspace.snapshotForFile(cId)
+    check not workspace.changeDocument(
+      uriFor(cPath), cPath, "proc changed() = discard\n", 1
+    )
+    check workspace.drainInvalidated().len == 0
+    check workspace.changeDocument(
+      uriFor(cPath), cPath, "proc changed() = discard\n", 3
+    )
+    let changed = workspace.drainInvalidated()
+    check changed.len == 6
+    check sortedUnique(changed)
+    check changed.hasId(cId)
+    check changed.hasId(aId)
+    check changed.hasId(bId)
+    check changed.hasId(dId)
+    check changed.hasId(eId)
+    check changed.hasId(exporterId)
+    check workspace.snapshotForFile(cId).contentGeneration.value !=
+      beforeChange.contentGeneration.value
+
+    workspace.indexWorkspace()
+    let overlay = workspace.snapshotForFile(cId)
+    check overlay.state == workspaceOpen
+    check overlay.text == "proc changed() = discard\n"
+
+    workspace.closeDocument(uriFor(cPath), cPath)
+    let closed = workspace.snapshotForFile(cId)
+    check closed.valid
+    check closed.state == workspaceOnDisk
+    check closed.text == cText
+    check workspace.drainInvalidated().len == 6
+
+    check workspace.changeDocument(
+      uriFor(cycleOnePath), cycleOnePath, "import cycle2\n# changed\n", 1
+    )
+    let cycleAffected = workspace.drainInvalidated()
+    check cycleAffected.len == 2
+    check cycleAffected.sortedUnique
+    check cycleAffected.hasId(cycleOneId)
+    check cycleAffected.hasId(cycleTwoId)
+
+    let unresolvedPath = root / "unresolved.nim"
+    writeFile(unresolvedPath, "import missing/submodule\n")
+    workspace.fileChanged(unresolvedPath)
+    let unresolvedId = workspace.fileIdForPath(unresolvedPath)
+    check unresolvedId.valid
+    check not workspace.graphComplete
+    discard workspace.drainInvalidated()
+
+    check workspace.changeDocument(
+      uriFor(aPath), aPath, "import b\nimport c\n# changed\n", 1
+    )
+    let conservative = workspace.drainInvalidated()
+    check conservative.len == workspace.fileCount
+    check conservative.sortedUnique
+
+    removeFile(unresolvedPath)
+    workspace.fileChanged(unresolvedPath, deleted = true)
+    check unresolvedId.sameId(workspace.fileIdForPath(unresolvedPath))
+    check workspace.graphComplete
+    discard workspace.drainInvalidated()
+
+    workspace.configurationChanged()
+    let configAffected = workspace.drainInvalidated()
+    check configAffected.len == workspace.fileCount
+    check configAffected.sortedUnique

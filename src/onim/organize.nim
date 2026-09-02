@@ -364,7 +364,12 @@ proc validatesEdits(
   # Validate the edited bytes as their own project. A dirty path deliberately
   # has a different basename, and passing it alongside the original project
   # makes nimsuggest reuse the original module graph for some import shapes.
-  let after = checkFileCached(absolutePath(materialized.path))
+  let projectPath =
+    if filePath.len > 0:
+      absolutePath(filePath)
+    else:
+      absolutePath(materialized.path)
+  let after = checkFileCached(projectPath, absolutePath(materialized.path))
   var beforeNames = initHashSet[string]()
   for diagnostic in baseline:
     beforeNames.incl diagnostic.name
@@ -373,8 +378,10 @@ proc validatesEdits(
       return false
   true
 
-proc organizeSource*(
-    filePath, source: string, options = defaultOrganizeOptions()
+proc organizeSourceImpl(
+    filePath, source: string,
+    info: var SourceImports,
+    options = defaultOrganizeOptions(),
 ): seq[ImportEdit] =
   let materialized = pathForSource(filePath, source)
   if materialized.path.len == 0 or not fileExists(materialized.path):
@@ -386,7 +393,6 @@ proc organizeSource*(
       except CatchableError:
         discard
 
-  var info = parseSourceImports(source)
   var visited = initHashSet[string]()
   visited.incl absolutePath(materialized.path)
   importsAvailableFromIncluded(materialized.path, info, visited, 0)
@@ -526,6 +532,18 @@ proc organizeSource*(
   if result.len > 0 and
       not validatesEdits(filePath, source, result, diagnostics, targetNames):
     result.setLen(0)
+
+proc organizeSourceWithImports*(
+    filePath, source: string, parsed: SourceImports, options = defaultOrganizeOptions()
+): seq[ImportEdit] =
+  var info = cloneSourceImports(parsed)
+  result = organizeSourceImpl(filePath, source, info, options)
+
+proc organizeSource*(
+    filePath, source: string, options = defaultOrganizeOptions()
+): seq[ImportEdit] =
+  var info = parseSourceImports(source)
+  result = organizeSourceImpl(filePath, source, info, options)
 
 proc applyEdits*(source: string, edits: seq[ImportEdit]): string =
   var ordered = edits

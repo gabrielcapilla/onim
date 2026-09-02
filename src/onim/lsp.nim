@@ -1,8 +1,15 @@
 import std/[json, os, streams, strutils, tables, uri]
 
 import ./organize
+import ./workspace
+import ./workspace_ids
 
-type DocumentStore = Table[string, string]
+type CachedAction = object
+  contentGeneration: ContentGeneration
+  dependencyGeneration: DependencyGeneration
+  configGeneration: ConfigGeneration
+  useStdPrefix: bool
+  edits: seq[ImportEdit]
 
 proc sendMessage(message: JsonNode) =
   let body = $message
@@ -123,15 +130,27 @@ proc editJson(source: string, edit: ImportEdit): JsonNode =
     "newText": edit.newText,
   }
 
-proc documentText(documents: DocumentStore, uriText: string): string =
-  if documents.hasKey(uriText):
-    return documents[uriText]
-  let path = uriToPath(uriText)
-  if path.len > 0 and fileExists(path):
-    try:
-      return readFile(path)
-    except CatchableError:
-      discard
+proc intOption(node: JsonNode, key: string, fallback: int64): int64 =
+  if node != nil and node.kind == JObject and node.hasKey(key) and node[key].kind == JInt:
+    int64(node[key].getInt)
+  else:
+    fallback
+
+proc initializeRoot(params: JsonNode): string =
+  if params != nil and params.kind == JObject:
+    if params.hasKey("rootUri") and params["rootUri"].kind == JString:
+      let uriText = params["rootUri"].getStr
+      if uriText.len > 0:
+        return uriToPath(uriText)
+    if params.hasKey("rootPath") and params["rootPath"].kind == JString:
+      let rootPath = params["rootPath"].getStr
+      if rootPath.len > 0:
+        return rootPath
+    if params.hasKey("workspaceFolders") and params["workspaceFolders"].kind == JArray:
+      for folder in params["workspaceFolders"].items:
+        if folder.kind == JObject and folder.hasKey("uri") and
+            folder["uri"].kind == JString:
+          return uriToPath(folder["uri"].getStr)
   ""
 
 proc supportsOrganize(params: JsonNode): bool =
@@ -150,7 +169,10 @@ proc supportsOrganize(params: JsonNode): bool =
   false
 
 proc codeActions(
-    params: JsonNode, documents: DocumentStore, options: OrganizeOptions
+    params: JsonNode,
+    workspace: Workspace,
+    actionCache: var Table[uint32, CachedAction],
+    options: OrganizeOptions,
 ): JsonNode =
   if not supportsOrganize(params):
     return newJArray()
@@ -163,16 +185,40 @@ proc codeActions(
   let path = uriToPath(uriText)
   if path.toLowerAscii.endsWith(".nimble") or path.toLowerAscii.endsWith(".cfg"):
     return newJArray()
-  let source = documentText(documents, uriText)
-  if source.len == 0 and (path.len == 0 or not fileExists(path)):
+  let snapshot = workspace.snapshotForDocument(uriText, path)
+  if not snapshot.valid:
     return newJArray()
-  let edits = organizeSource(path, source, options)
+  let cacheKey = uint32(snapshot.fileId)
+  var edits: seq[ImportEdit] = @[]
+  var cacheHit = false
+  if actionCache.hasKey(cacheKey):
+    let cached = actionCache[cacheKey]
+    if cached.contentGeneration.value == snapshot.contentGeneration.value and
+        cached.dependencyGeneration.value == snapshot.dependencyGeneration.value and
+        cached.configGeneration.value == snapshot.configGeneration.value and
+        cached.useStdPrefix == options.useStdPrefix:
+      edits = cached.edits
+      cacheHit = true
+  if not cacheHit:
+    if snapshot.index != nil:
+      edits = organizeSourceWithImports(
+        snapshot.path, snapshot.text, snapshot.index.parsed, options
+      )
+    else:
+      edits = organizeSource(snapshot.path, snapshot.text, options)
+    actionCache[cacheKey] = CachedAction(
+      contentGeneration: snapshot.contentGeneration,
+      dependencyGeneration: snapshot.dependencyGeneration,
+      configGeneration: snapshot.configGeneration,
+      useStdPrefix: options.useStdPrefix,
+      edits: edits,
+    )
   if edits.len == 0:
     return newJArray()
   var workspaceEdit = newJObject()
   var uriEdits = newJArray()
   for edit in edits:
-    uriEdits.add editJson(source, edit)
+    uriEdits.add editJson(snapshot.text, edit)
   workspaceEdit["changes"] = newJObject()
   workspaceEdit["changes"][uriText] = uriEdits
   var action = newJObject()
@@ -183,7 +229,8 @@ proc codeActions(
   result.add action
 
 proc runLsp*() =
-  var documents = initTable[string, string]()
+  let workspace = initWorkspace()
+  var actionCache = initTable[uint32, CachedAction]()
   var options = defaultOrganizeOptions()
   var shutdownRequested = false
   while not endOfFile(stdin):
@@ -208,6 +255,9 @@ proc runLsp*() =
         newJObject()
     case methodName
     of "initialize":
+      let root = initializeRoot(params)
+      if root.len > 0:
+        workspace.indexWorkspace(root)
       options.useStdPrefix = boolOption(params, "useStdPrefix", true)
       var provider = newJObject()
       provider["codeActionKinds"] = %*["source.organizeImports"]
@@ -236,7 +286,13 @@ proc runLsp*() =
     of "textDocument/didOpen":
       let textDocument = valueOrEmpty(params, "textDocument")
       if textDocument.hasKey("uri") and textDocument.hasKey("text"):
-        documents[textDocument["uri"].getStr] = textDocument["text"].getStr
+        let uriText = textDocument["uri"].getStr
+        discard workspace.openDocument(
+          uriText,
+          uriToPath(uriText),
+          textDocument["text"].getStr,
+          intOption(textDocument, "version", -1),
+        )
     of "textDocument/didChange":
       let textDocument = valueOrEmpty(params, "textDocument")
       let uriText =
@@ -244,20 +300,40 @@ proc runLsp*() =
           textDocument["uri"].getStr
         else:
           ""
+      var changedText = ""
+      var hasChangedText = false
       if uriText.len > 0 and params.hasKey("contentChanges") and
           params["contentChanges"].kind == JArray:
         for change in params["contentChanges"].items:
           if change.kind == JObject and change.hasKey("text"):
-            documents[uriText] = change["text"].getStr
+            changedText = change["text"].getStr
+            hasChangedText = true
+      if uriText.len > 0 and hasChangedText:
+        discard workspace.changeDocument(
+          uriText,
+          uriToPath(uriText),
+          changedText,
+          intOption(textDocument, "version", -1),
+        )
     of "textDocument/didClose":
       let textDocument = valueOrEmpty(params, "textDocument")
       if textDocument.hasKey("uri"):
-        documents.del textDocument["uri"].getStr
+        let uriText = textDocument["uri"].getStr
+        workspace.closeDocument(uriText, uriToPath(uriText))
+    of "workspace/didChangeWatchedFiles":
+      let changes = valueOrEmpty(params, "changes")
+      if changes.kind == JArray:
+        for change in changes.items:
+          if change.kind != JObject or not change.hasKey("uri"):
+            continue
+          let path = uriToPath(change["uri"].getStr)
+          let changeType = intOption(change, "type", 2)
+          workspace.fileChanged(path, changeType == 3)
     of "$/cancelRequest":
       discard
     of "textDocument/codeAction":
       if hasId:
-        sendResponse(id, codeActions(params, documents, options))
+        sendResponse(id, codeActions(params, workspace, actionCache, options))
     else:
       if hasId:
         sendError(id, -32601, "method not supported: " & methodName)

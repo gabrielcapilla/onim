@@ -284,6 +284,27 @@ proc parseSourceImports*(source: string): SourceImports =
   for name in result.localDefinitions:
     result.availableNames.incl name
 
+proc cloneSourceImports*(source: SourceImports): SourceImports =
+  result.tokens = source.tokens
+  result.localDefinitions = initHashSet[string]()
+  result.availableNames = initHashSet[string]()
+  result.qualifiedNames = initHashSet[string]()
+  for name in source.localDefinitions:
+    result.localDefinitions.incl name
+  for name in source.availableNames:
+    result.availableNames.incl name
+  for name in source.qualifiedNames:
+    result.qualifiedNames.incl name
+  for item in source.imports:
+    var copied = item
+    copied.imported = initHashSet[string]()
+    copied.excluded = initHashSet[string]()
+    for name in item.imported:
+      copied.imported.incl name
+    for name in item.excluded:
+      copied.excluded.incl name
+    result.imports.add copied
+
 proc hasModuleImport*(imports: SourceImports, module: string): bool =
   for item in imports.imports:
     if item.form == importModule and not item.conditional and item.alias.len == 0 and
