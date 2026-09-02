@@ -3,6 +3,7 @@ import std/os except FileId
 
 import onim/index/cache
 import onim/index/occurrences
+import onim/index/scopes
 import onim/index/source_index
 import onim/session/ids
 import onim/session/workspace
@@ -59,7 +60,8 @@ suite "workspace index":
     cleanTree(cacheRoot)
     createDir(root)
     let filePath = root / "cached.nim"
-    let source = "import std/os\nfor kind, path in walkDir(\"/tmp\"):\n  discard kind\n"
+    let source =
+      "import std/os\nproc listFiles(dir: string) =\n  discard walkDir(dir)\n"
     writeFile(filePath, source)
 
     let previousCacheRoot = getEnv("ONIM_CACHE_DIR")
@@ -107,6 +109,11 @@ suite "workspace index":
     check secondSnapshot.index.parsed.imports.len ==
       firstSnapshot.index.parsed.imports.len
     check secondSnapshot.index.symbols == firstSnapshot.index.symbols
+    check secondSnapshot.index.scopes == firstSnapshot.index.scopes
+    check secondSnapshot.index.scopes.validateScopes(
+      secondSnapshot.index.parsed.tokens, secondSnapshot.index.symbols,
+      secondSnapshot.index.byteLength,
+    )
     check secondSnapshot.index.occurrences == firstSnapshot.index.occurrences
     check secondSnapshot.index.occurrences.validateOccurrences(
       secondSnapshot.index.parsed.tokens

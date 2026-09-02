@@ -4,6 +4,7 @@ import ../syntax/imports
 import ../syntax/lexer
 import ./source_index
 import ./occurrences
+import ./scopes
 import ./symbols
 
 const
@@ -296,6 +297,11 @@ proc readSourceIndex(
     validateSourceSymbol(symbol, result.parsed.tokens, previousToken)
     result.symbols.add symbol
     previousToken = symbol.nameToken
+  result.scopes = indexScopes(result.parsed.tokens, result.symbols, result.byteLength)
+  if not validateScopes(
+    result.scopes, result.parsed.tokens, result.symbols, result.byteLength
+  ):
+    invalidCache("cache scope index is invalid")
   result.occurrences = indexOccurrences(result.parsed, result.symbols)
   if not validateOccurrences(result.occurrences, result.parsed.tokens):
     invalidCache("cache occurrence index is invalid")

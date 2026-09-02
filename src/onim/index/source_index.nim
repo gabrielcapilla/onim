@@ -3,6 +3,7 @@ import std/[algorithm, strutils]
 import ../syntax/imports
 import ../syntax/lexer
 import ./occurrences
+import ./scopes
 import ./symbols
 
 type SourceIndex* = ref object
@@ -10,8 +11,9 @@ type SourceIndex* = ref object
   byteLength*: int
   tokenCount*: int
   parsed*: SourceImports
-  occurrences*: OccurrenceIndex
   symbols*: seq[SourceSymbol]
+  scopes*: ScopeIndex
+  occurrences*: OccurrenceIndex
   imports*: seq[string]
   exports*: seq[string]
   includes*: seq[string]
@@ -76,6 +78,7 @@ proc indexSource*(source: string): SourceIndex =
   result.parsed = parseSourceImports(source)
   result.tokenCount = result.parsed.tokens.len
   result.symbols = indexSymbols(source, result.parsed.tokens)
+  result.scopes = indexScopes(result.parsed.tokens, result.symbols, result.byteLength)
   result.occurrences = indexOccurrences(result.parsed, result.symbols)
 
   for item in result.parsed.imports:
