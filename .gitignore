@@ -5,4 +5,5 @@ bench/bench_organize
 tests/torganize
 tests/tlsp
 tests/tworkspace
+*.onim-*.nim
 gen_stdlib_map

@@ -8,7 +8,7 @@ type
     arity*: int
     signature*: string
 
-  StdlibMap* = object
+  StdlibMap* = ref object
     symbols*: Table[string, seq[SymbolCandidate]]
     modules*: Table[string, bool]
 
@@ -52,6 +52,7 @@ proc addFallback(
   result.modules[canonicalModule(module)] = true
 
 proc emptyStdlibMap*(): StdlibMap =
+  new(result)
   result.symbols = initTable[string, seq[SymbolCandidate]]()
   result.modules = initTable[string, bool]()
 

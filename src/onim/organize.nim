@@ -222,7 +222,12 @@ proc pathForSource(filePath, source: string): tuple[path: string, temporary: boo
   if directory.len == 0:
     directory = getCurrentDir()
   let base = splitFile(filePath).name
-  let suffix = $abs(hash(source))
+  let identity =
+    if filePath.len > 0:
+      absolutePath(filePath)
+    else:
+      base
+  let suffix = $abs(hash(identity))
   let temporary = directory / ("." & base & ".onim-" & suffix & ".nim")
   try:
     writeFile(temporary, source)
@@ -871,7 +876,7 @@ proc combineImportEdits(additions, removals: seq[ImportEdit]): seq[ImportEdit] =
       result.add addition
 
 proc validatesEdits(
-    filePath, source: string,
+    filePath, projectPath, source: string,
     edits: seq[ImportEdit],
     baseline: seq[CompilerDiagnostic],
     targets: HashSet[string],
@@ -889,20 +894,10 @@ proc validatesEdits(
         removeFile(materialized.path)
       except CatchableError:
         discard
-  # Validate the edited bytes as their own project. A dirty path deliberately
-  # has a different basename, and embedded nimsuggest may otherwise reuse the
-  # original module graph instead of checking the edited bytes.
-  let projectPath =
-    if filePath.len > 0:
-      absolutePath(filePath)
-    else:
-      absolutePath(materialized.path)
-  let validationProject =
-    if materialized.temporary:
-      absolutePath(materialized.path)
-    else:
-      projectPath
-  let after = checkFileCached(validationProject, absolutePath(materialized.path))
+  # Keep the original project graph while checking the edited bytes as the
+  # dirty target. This avoids rebuilding a second graph for the validation
+  # pass while still making the compiler inspect the proposed source.
+  let after = checkFileCached(projectPath, absolutePath(materialized.path))
   var beforeNames = initHashSet[string]()
   for diagnostic in baseline:
     beforeNames.incl diagnostic.name
@@ -1085,7 +1080,7 @@ proc organizeSourceImpl(
   result = combineImportEdits(result, removals)
   if result.len > 0 and
       not validatesEdits(
-        filePath, source, result, diagnostics, targetNames, unused.targets
+        filePath, projectPath, source, result, diagnostics, targetNames, unused.targets
       ):
     result.setLen(0)
 

@@ -2,11 +2,15 @@ import std/[os, strutils]
 
 import onim/lsp
 import onim/organize
+import onim/semantic_worker
 
 proc usage() =
   stderr.writeLine "usage: onim [--stdio] [--useStdPrefix:on|off] | onim file.nim"
 
 when isMainModule:
+  if commandLineParams().len > 0 and commandLineParams()[0] == "--semantic-worker":
+    runSemanticWorkerProcess()
+    quit(0)
   var filePath = ""
   var options = defaultOrganizeOptions()
   var runServer = true

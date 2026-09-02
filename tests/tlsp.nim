@@ -100,6 +100,36 @@ suite "stdio LSP":
       "import std/os"
     )
 
+    for version in 2 .. 4:
+      sendMessage(
+        process.inputStream,
+        %*{
+          "jsonrpc": "2.0",
+          "method": "textDocument/didChange",
+          "params": {
+            "textDocument": {"uri": uri, "version": version},
+            "contentChanges": [{"text": readFile(filePath) & "\n# edit " & $version}],
+          },
+        },
+      )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "textDocument/codeAction",
+        "params": {
+          "textDocument": {"uri": uri}, "context": {"only": ["source.organizeImports"]}
+        },
+      },
+    )
+    let changedActions = readMessage(process.outputStream)
+    check changedActions != nil
+    check changedActions["result"].len == 1
+    check changedActions["result"][0]["edit"]["changes"][uri][0]["newText"].getStr.contains(
+      "import std/os"
+    )
+
     sendMessage(
       process.inputStream,
       %*{"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": nil},

@@ -1,15 +1,24 @@
-import std/[json, os, streams, strutils, tables, uri]
+import std/[json, streams, strutils, tables, uri]
 
 import ./organize
+import ./semantic_worker
 import ./workspace
 import ./workspace_ids
 
-type CachedAction = object
-  contentGeneration: ContentGeneration
-  dependencyGeneration: DependencyGeneration
-  configGeneration: ConfigGeneration
-  useStdPrefix: bool
-  edits: seq[ImportEdit]
+type
+  CachedAction = object
+    contentGeneration: ContentGeneration
+    dependencyGeneration: DependencyGeneration
+    configGeneration: ConfigGeneration
+    useStdPrefix: bool
+    edits: seq[ImportEdit]
+
+  SemanticKey = object
+    fileId: FileId
+    contentGeneration: ContentGeneration
+    dependencyGeneration: DependencyGeneration
+    configGeneration: ConfigGeneration
+    useStdPrefix: bool
 
 proc sendMessage(message: JsonNode) =
   let body = $message
@@ -168,12 +177,175 @@ proc supportsOrganize(params: JsonNode): bool =
       return true
   false
 
+proc semanticKey(snapshot: WorkspaceSnapshot, options: OrganizeOptions): SemanticKey =
+  SemanticKey(
+    fileId: snapshot.fileId,
+    contentGeneration: snapshot.contentGeneration,
+    dependencyGeneration: snapshot.dependencyGeneration,
+    configGeneration: snapshot.configGeneration,
+    useStdPrefix: options.useStdPrefix,
+  )
+
+proc semanticKey(value: SemanticResult): SemanticKey =
+  SemanticKey(
+    fileId: value.fileId,
+    contentGeneration: value.contentGeneration,
+    dependencyGeneration: value.dependencyGeneration,
+    configGeneration: value.configGeneration,
+    useStdPrefix: value.useStdPrefix,
+  )
+
+proc semanticKey(value: SemanticRequest): SemanticKey =
+  SemanticKey(
+    fileId: value.fileId,
+    contentGeneration: value.contentGeneration,
+    dependencyGeneration: value.dependencyGeneration,
+    configGeneration: value.configGeneration,
+    useStdPrefix: value.useStdPrefix,
+  )
+
+proc sameSemanticKey(left, right: SemanticKey): bool =
+  left.fileId.value == right.fileId.value and
+    left.contentGeneration.value == right.contentGeneration.value and
+    left.dependencyGeneration.value == right.dependencyGeneration.value and
+    left.configGeneration.value == right.configGeneration.value and
+    left.useStdPrefix == right.useStdPrefix
+
+proc removePending(pending: var seq[SemanticKey], key: SemanticKey) =
+  for index, existing in pending:
+    if sameSemanticKey(existing, key):
+      pending.delete(index)
+      return
+
+proc removeQueued(queued: var seq[SemanticRequest], fileId: FileId) =
+  var writeIndex = 0
+  for request in queued:
+    if request.fileId.value != fileId.value:
+      queued[writeIndex] = request
+      inc writeIndex
+  queued.setLen(writeIndex)
+
+proc queueSemantic(queued: var seq[SemanticRequest], request: SemanticRequest) =
+  removeQueued(queued, request.fileId)
+  queued.add request
+
+proc dispatchSemantic(
+    queued: var seq[SemanticRequest], pending: var seq[SemanticKey]
+): bool =
+  if pending.len > 0 or queued.len == 0:
+    return false
+  let request = queued[0]
+  queued.delete(0)
+  if not submitSemantic(request):
+    return false
+  pending.add semanticKey(request)
+  true
+
+proc actionIsCurrent(
+    action: CachedAction, snapshot: WorkspaceSnapshot, options: OrganizeOptions
+): bool =
+  action.contentGeneration.value == snapshot.contentGeneration.value and
+    action.dependencyGeneration.value == snapshot.dependencyGeneration.value and
+    action.configGeneration.value == snapshot.configGeneration.value and
+    action.useStdPrefix == options.useStdPrefix
+
+proc enqueueSemantic(
+    snapshot: WorkspaceSnapshot,
+    options: OrganizeOptions,
+    pending: var seq[SemanticKey],
+    queued: var seq[SemanticRequest],
+): bool =
+  if not snapshot.valid:
+    return false
+  let request = SemanticRequest(
+    kind: semanticOrganize,
+    fileId: snapshot.fileId,
+    path: snapshot.path,
+    source: snapshot.text,
+    contentGeneration: snapshot.contentGeneration,
+    dependencyGeneration: snapshot.dependencyGeneration,
+    configGeneration: snapshot.configGeneration,
+    useStdPrefix: options.useStdPrefix,
+  )
+  let key = semanticKey(request)
+  for existing in pending:
+    if sameSemanticKey(existing, key):
+      return true
+  queueSemantic(queued, request)
+  if pending.len == 0 and not dispatchSemantic(queued, pending):
+    removeQueued(queued, request.fileId)
+    return false
+  true
+
+proc acceptSemantic(
+    value: SemanticResult,
+    workspace: Workspace,
+    actionCache: var Table[uint32, CachedAction],
+    pending: var seq[SemanticKey],
+    queued: var seq[SemanticRequest],
+) =
+  if value.failed or not value.fileId.valid:
+    pending.setLen(0)
+    queued.setLen(0)
+    return
+  let key = semanticKey(value)
+  removePending(pending, key)
+  let snapshot = workspace.snapshotForFile(value.fileId)
+  if snapshot.valid and
+      sameSemanticKey(
+        semanticKey(snapshot, OrganizeOptions(useStdPrefix: value.useStdPrefix)), key
+      ):
+    actionCache[uint32(value.fileId)] = CachedAction(
+      contentGeneration: value.contentGeneration,
+      dependencyGeneration: value.dependencyGeneration,
+      configGeneration: value.configGeneration,
+      useStdPrefix: value.useStdPrefix,
+      edits: value.edits,
+    )
+  discard dispatchSemantic(queued, pending)
+
+proc drainSemantic(
+    workspace: Workspace,
+    actionCache: var Table[uint32, CachedAction],
+    pending: var seq[SemanticKey],
+    queued: var seq[SemanticRequest],
+) =
+  var result: SemanticResult
+  while tryReceiveSemantic(result):
+    acceptSemantic(result, workspace, actionCache, pending, queued)
+
+proc waitForSemantic(
+    key: SemanticKey,
+    workspace: Workspace,
+    actionCache: var Table[uint32, CachedAction],
+    pending: var seq[SemanticKey],
+    queued: var seq[SemanticRequest],
+): bool =
+  while true:
+    let snapshot = workspace.snapshotForFile(key.fileId)
+    if snapshot.valid and actionCache.hasKey(uint32(key.fileId)) and
+        actionIsCurrent(
+          actionCache[uint32(key.fileId)],
+          snapshot,
+          OrganizeOptions(useStdPrefix: key.useStdPrefix),
+        ):
+      return true
+    let result = receiveSemantic()
+    if result.failed:
+      pending.setLen(0)
+      queued.setLen(0)
+      return false
+    acceptSemantic(result, workspace, actionCache, pending, queued)
+
 proc codeActions(
     params: JsonNode,
     workspace: Workspace,
     actionCache: var Table[uint32, CachedAction],
+    pending: var seq[SemanticKey],
+    queued: var seq[SemanticRequest],
     options: OrganizeOptions,
 ): JsonNode =
+  drainSemantic(workspace, actionCache, pending, queued)
   if not supportsOrganize(params):
     return newJArray()
   let textDocument = valueOrEmpty(params, "textDocument")
@@ -193,26 +365,31 @@ proc codeActions(
   var cacheHit = false
   if actionCache.hasKey(cacheKey):
     let cached = actionCache[cacheKey]
-    if cached.contentGeneration.value == snapshot.contentGeneration.value and
-        cached.dependencyGeneration.value == snapshot.dependencyGeneration.value and
-        cached.configGeneration.value == snapshot.configGeneration.value and
-        cached.useStdPrefix == options.useStdPrefix:
+    if actionIsCurrent(cached, snapshot, options):
       edits = cached.edits
       cacheHit = true
   if not cacheHit:
-    if snapshot.index != nil:
-      edits = organizeSourceWithImports(
-        snapshot.path, snapshot.text, snapshot.index.parsed, options
-      )
+    let key = semanticKey(snapshot, options)
+    if enqueueSemantic(snapshot, options, pending, queued):
+      discard waitForSemantic(key, workspace, actionCache, pending, queued)
+      drainSemantic(workspace, actionCache, pending, queued)
+      if actionCache.hasKey(cacheKey) and
+          actionIsCurrent(actionCache[cacheKey], snapshot, options):
+        edits = actionCache[cacheKey].edits
     else:
-      edits = organizeSource(snapshot.path, snapshot.text, options)
-    actionCache[cacheKey] = CachedAction(
-      contentGeneration: snapshot.contentGeneration,
-      dependencyGeneration: snapshot.dependencyGeneration,
-      configGeneration: snapshot.configGeneration,
-      useStdPrefix: options.useStdPrefix,
-      edits: edits,
-    )
+      if snapshot.index != nil:
+        edits = organizeSourceWithImports(
+          snapshot.path, snapshot.text, snapshot.index.parsed, options
+        )
+      else:
+        edits = organizeSource(snapshot.path, snapshot.text, options)
+      actionCache[cacheKey] = CachedAction(
+        contentGeneration: snapshot.contentGeneration,
+        dependencyGeneration: snapshot.dependencyGeneration,
+        configGeneration: snapshot.configGeneration,
+        useStdPrefix: options.useStdPrefix,
+        edits: edits,
+      )
   if edits.len == 0:
     return newJArray()
   var workspaceEdit = newJObject()
@@ -231,8 +408,11 @@ proc codeActions(
 proc runLsp*() =
   let workspace = initWorkspace()
   var actionCache = initTable[uint32, CachedAction]()
+  var pending: seq[SemanticKey] = @[]
+  var queued: seq[SemanticRequest] = @[]
   var options = defaultOrganizeOptions()
   var shutdownRequested = false
+  discard startSemanticWorker()
   while not endOfFile(stdin):
     let message = readMessage()
     if message == nil:
@@ -282,16 +462,21 @@ proc runLsp*() =
       if hasId:
         sendResponse(id, newJNull())
     of "exit":
+      stopSemanticWorker()
       quit(if shutdownRequested: 0 else: 1)
     of "textDocument/didOpen":
       let textDocument = valueOrEmpty(params, "textDocument")
       if textDocument.hasKey("uri") and textDocument.hasKey("text"):
         let uriText = textDocument["uri"].getStr
+        let path = uriToPath(uriText)
         discard workspace.openDocument(
           uriText,
-          uriToPath(uriText),
+          path,
           textDocument["text"].getStr,
           intOption(textDocument, "version", -1),
+        )
+        discard enqueueSemantic(
+          workspace.snapshotForDocument(uriText, path), options, pending, queued
         )
     of "textDocument/didChange":
       let textDocument = valueOrEmpty(params, "textDocument")
@@ -309,17 +494,28 @@ proc runLsp*() =
             changedText = change["text"].getStr
             hasChangedText = true
       if uriText.len > 0 and hasChangedText:
+        let path = uriToPath(uriText)
         discard workspace.changeDocument(
-          uriText,
-          uriToPath(uriText),
-          changedText,
-          intOption(textDocument, "version", -1),
+          uriText, path, changedText, intOption(textDocument, "version", -1)
+        )
+        discard enqueueSemantic(
+          workspace.snapshotForDocument(uriText, path), options, pending, queued
         )
     of "textDocument/didClose":
       let textDocument = valueOrEmpty(params, "textDocument")
       if textDocument.hasKey("uri"):
         let uriText = textDocument["uri"].getStr
         workspace.closeDocument(uriText, uriToPath(uriText))
+    of "textDocument/didSave":
+      let textDocument = valueOrEmpty(params, "textDocument")
+      if textDocument.hasKey("uri"):
+        let uriText = textDocument["uri"].getStr
+        let path = uriToPath(uriText)
+        if params.hasKey("text") and params["text"].kind == JString:
+          discard workspace.changeDocument(uriText, path, params["text"].getStr, -1)
+        discard enqueueSemantic(
+          workspace.snapshotForDocument(uriText, path), options, pending, queued
+        )
     of "workspace/didChangeWatchedFiles":
       let changes = valueOrEmpty(params, "changes")
       if changes.kind == JArray:
@@ -333,7 +529,10 @@ proc runLsp*() =
       discard
     of "textDocument/codeAction":
       if hasId:
-        sendResponse(id, codeActions(params, workspace, actionCache, options))
+        sendResponse(
+          id, codeActions(params, workspace, actionCache, pending, queued, options)
+        )
     else:
       if hasId:
         sendError(id, -32601, "method not supported: " & methodName)
+  stopSemanticWorker()
