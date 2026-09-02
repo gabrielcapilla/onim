@@ -3,11 +3,12 @@ import std/[algorithm, os, sets, streams, strutils, times]
 import ../syntax/imports
 import ../syntax/lexer
 import ./source_index
+import ./symbols
 
 const
   cacheMagic = "ONIMIDX1"
   manifestMagic = "ONIMMAN1"
-  cacheVersion = 1'u32
+  cacheVersion = 2'u32
   manifestVersion = 2'u32
   manifestGraphVersion = 2'u32
   cacheEndian = 1'u8
@@ -135,6 +136,19 @@ proc readImportSymbol(stream: Stream): ImportSymbol =
   result.startOffset = readInt(stream)
   result.endOffset = readInt(stream)
 
+proc writeSourceSymbol(stream: Stream, symbol: SourceSymbol) =
+  stream.write(uint8(ord(symbol.kind)))
+  stream.write(symbol.nameToken)
+  writeFlag(stream, symbol.exported)
+
+proc readSourceSymbol(stream: Stream): SourceSymbol =
+  let kind = stream.readUint8()
+  if kind > uint8(ord(high(SourceSymbolKind))):
+    invalidCache("cache source symbol kind is invalid")
+  result.kind = SourceSymbolKind(kind)
+  result.nameToken = stream.readUint32()
+  result.exported = readFlag(stream)
+
 proc writeImport(stream: Stream, item: ImportInfo) =
   stream.write(uint8(ord(item.form)))
   writeString(stream, item.module)
@@ -208,6 +222,14 @@ proc validateImport(item: ImportInfo, sourceLength: int) =
     if not validSpan(symbol.startOffset, symbol.endOffset, sourceLength):
       invalidCache("cache imported-symbol range is invalid")
 
+proc validateSourceSymbol(
+    symbol: SourceSymbol, tokens: seq[Token], previousToken: uint32
+) =
+  if symbol.nameToken >= uint32(tokens.len) or
+      (previousToken != high(uint32) and symbol.nameToken <= previousToken) or
+      tokens[int(symbol.nameToken)].kind != tkIdentifier:
+    invalidCache("cache source symbol is invalid")
+
 proc writeSourceIndex(stream: Stream, index: SourceIndex) =
   if index == nil:
     invalidCache("cannot serialize an empty source index")
@@ -229,6 +251,9 @@ proc writeSourceIndex(stream: Stream, index: SourceIndex) =
   writeStrings(stream, index.imports)
   writeStrings(stream, index.exports)
   writeStrings(stream, index.includes)
+  writeCount(stream, index.symbols.len, min(maxRecordCount, index.parsed.tokens.len))
+  for symbol in index.symbols:
+    writeSourceSymbol(stream, symbol)
 
 proc readSourceIndex(
     stream: Stream, expectedHash: uint64, expectedLength: int
@@ -262,6 +287,14 @@ proc readSourceIndex(
   result.imports = readStrings(stream)
   result.exports = readStrings(stream)
   result.includes = readStrings(stream)
+  let symbolCount = readCount(stream, min(maxRecordCount, tokenCount))
+  result.symbols = newSeqOfCap[SourceSymbol](symbolCount)
+  var previousToken = high(uint32)
+  for _ in 0 ..< symbolCount:
+    let symbol = readSourceSymbol(stream)
+    validateSourceSymbol(symbol, result.parsed.tokens, previousToken)
+    result.symbols.add symbol
+    previousToken = symbol.nameToken
 
 proc canonicalPath(path: string): string =
   if path.len == 0:

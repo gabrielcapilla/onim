@@ -42,6 +42,7 @@ suite "stdio LSP":
     let initialized = readMessage(process.outputStream)
     check initialized != nil
     check initialized["result"]["capabilities"]["codeActionProvider"] != nil
+    check initialized["result"]["capabilities"]["definitionProvider"].getBool
 
     sendMessage(
       process.inputStream, %*{"jsonrpc": "2.0", "method": "initialized", "params": {}}
@@ -99,6 +100,75 @@ suite "stdio LSP":
     check cachedActions["result"][0]["edit"]["changes"][uri][0]["newText"].getStr.contains(
       "import std/os"
     )
+
+    let definitionUri = "file:///tmp/onim-definition.nim"
+    let definitionText = "let smile = \"😀\"\nproc helper*() = discard\nhelper()\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": definitionUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": definitionText,
+          }
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "textDocument/definition",
+        "params": {
+          "textDocument": {"uri": definitionUri},
+          "position": {"line": 2, "character": 0},
+        },
+      },
+    )
+    let definitionResult = readMessage(process.outputStream)
+    check definitionResult != nil
+    check definitionResult["result"]["uri"].getStr == definitionUri
+    check definitionResult["result"]["range"]["start"]["line"].getInt == 1
+    check definitionResult["result"]["range"]["start"]["character"].getInt == 5
+    check definitionResult["result"]["range"]["end"]["character"].getInt == 11
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "textDocument/definition",
+        "params": {
+          "textDocument": {"uri": definitionUri},
+          "position": {"line": 1, "character": 5},
+        },
+      },
+    )
+    let declarationDefinition = readMessage(process.outputStream)
+    check declarationDefinition != nil
+    check declarationDefinition["result"]["range"]["start"]["line"].getInt == 1
+    check declarationDefinition["result"]["range"]["start"]["character"].getInt == 5
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "textDocument/definition",
+        "params": {
+          "textDocument": {"uri": definitionUri},
+          "position": {"line": 99, "character": 0},
+        },
+      },
+    )
+    let invalidDefinition = readMessage(process.outputStream)
+    check invalidDefinition != nil
+    check invalidDefinition["result"].kind == JNull
 
     for version in 2 .. 4:
       sendMessage(

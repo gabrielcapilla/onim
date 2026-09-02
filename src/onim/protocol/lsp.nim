@@ -1,9 +1,13 @@
 import std/[json, streams, strutils, tables, uri]
 
 import ../features/organize
+import ../index/source_index
+import ../index/symbols
 import ../semantic/worker
 import ../session/ids
 import ../session/workspace
+import ../syntax/imports
+import ../syntax/lexer
 
 type
   CachedAction = object
@@ -89,6 +93,12 @@ proc boolOption(params: JsonNode, key: string, fallback: bool): bool =
   else:
     fallback
 
+proc intOption(node: JsonNode, key: string, fallback: int64): int64 =
+  if node != nil and node.kind == JObject and node.hasKey(key) and node[key].kind == JInt:
+    int64(node[key].getInt)
+  else:
+    fallback
+
 proc utf16Width(source: string, index, limit: int): tuple[nextIndex, units: int] =
   let first = ord(source[index])
   var codepoint = first
@@ -130,6 +140,122 @@ proc positionAt(source: string, offset: int): JsonNode =
       column += advance.units
   %*{"line": line, "character": column}
 
+proc offsetAt(source: string, position: JsonNode): int =
+  if position == nil or position.kind != JObject:
+    return -1
+  let lineValue = intOption(position, "line", -1)
+  let characterValue = intOption(position, "character", -1)
+  if lineValue < 0 or characterValue < 0 or lineValue > int64(high(int)) or
+      characterValue > int64(high(int)):
+    return -1
+  let wantedLine = int(lineValue)
+  let wantedCharacter = int(characterValue)
+  var line = 0
+  var index = 0
+  while index < source.len and line < wantedLine:
+    if source[index] == '\n':
+      inc line
+    inc index
+  if line != wantedLine:
+    return -1
+
+  var lineEnd = index
+  while lineEnd < source.len and source[lineEnd] != '\n':
+    inc lineEnd
+  var character = 0
+  while index < lineEnd:
+    if character == wantedCharacter:
+      return index
+    let advance = utf16Width(source, index, lineEnd)
+    if character + advance.units > wantedCharacter:
+      return -1
+    character += advance.units
+    index = advance.nextIndex
+  if character == wantedCharacter: index else: -1
+
+proc tokenAtOffset(tokens: openArray[Token], offset: int): int =
+  if offset < 0:
+    return -1
+  for index, token in tokens:
+    if token.kind == tkIdentifier and token.startOffset <= offset and
+        offset < token.endOffset:
+      return index
+  -1
+
+proc tokenIsQualified(tokens: openArray[Token], tokenIndex: int): bool =
+  (tokenIndex > 0 and tokens[tokenIndex - 1].text == ".") or
+    (tokenIndex + 1 < tokens.len and tokens[tokenIndex + 1].text == ".")
+
+proc tokenIsImported(imports: openArray[ImportInfo], token: Token): bool =
+  for item in imports:
+    if item.startOffset <= token.startOffset and token.endOffset <= item.endOffset:
+      return true
+  false
+
+proc definitionLocation(
+    source, uri: string, symbol: SourceSymbol, tokens: openArray[Token]
+): JsonNode =
+  let token = tokens[int(symbol.nameToken)]
+  %*{
+    "uri": uri,
+    "range": {
+      "start": positionAt(source, token.startOffset),
+      "end": positionAt(source, token.endOffset),
+    },
+  }
+
+proc definition(params: JsonNode, workspace: Workspace): JsonNode =
+  result = newJNull()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let snapshot = workspace.snapshotForDocument(uriText, path)
+  if not snapshot.valid or snapshot.index == nil or
+      snapshot.index.contentHash != contentFingerprint(snapshot.text) or
+      snapshot.index.byteLength != snapshot.text.len:
+    return
+  let offset = offsetAt(snapshot.text, valueOrEmpty(params, "position"))
+  let tokenIndex = tokenAtOffset(snapshot.index.parsed.tokens, offset)
+  if tokenIndex < 0:
+    return
+  let token = snapshot.index.parsed.tokens[tokenIndex]
+  if tokenIsImported(snapshot.index.parsed.imports, token) or
+      tokenIsQualified(snapshot.index.parsed.tokens, tokenIndex):
+    return
+  let declaration = snapshot.index.symbols.symbolToken(uint32(tokenIndex))
+  if declaration >= 0:
+    return definitionLocation(
+      snapshot.text,
+      uriText,
+      snapshot.index.symbols[declaration],
+      snapshot.index.parsed.tokens,
+    )
+  if tokenIndex > 0 and snapshot.index.parsed.tokens[tokenIndex - 1].line == token.line and
+      snapshot.index.parsed.tokens[tokenIndex - 1].text in [
+        "proc", "func", "iterator", "method", "macro", "template", "converter", "type",
+        "var", "let", "const",
+      ]:
+    return
+  if token.column != 0:
+    return
+  let found =
+    snapshot.index.symbols.lookupSymbol(snapshot.index.parsed.tokens, token.text)
+  if found < 0:
+    return
+  let declarationToken =
+    snapshot.index.parsed.tokens[int(snapshot.index.symbols[found].nameToken)]
+  if token.startOffset < declarationToken.startOffset:
+    return
+  result = definitionLocation(
+    snapshot.text, uriText, snapshot.index.symbols[found], snapshot.index.parsed.tokens
+  )
+
 proc editJson(source: string, edit: ImportEdit): JsonNode =
   %*{
     "range": {
@@ -138,12 +264,6 @@ proc editJson(source: string, edit: ImportEdit): JsonNode =
     },
     "newText": edit.newText,
   }
-
-proc intOption(node: JsonNode, key: string, fallback: int64): int64 =
-  if node != nil and node.kind == JObject and node.hasKey(key) and node[key].kind == JInt:
-    int64(node[key].getInt)
-  else:
-    fallback
 
 proc initializeRoot(params: JsonNode): string =
   if params != nil and params.kind == JObject:
@@ -449,6 +569,7 @@ proc runLsp*() =
       var capabilities = newJObject()
       capabilities["textDocumentSync"] = sync
       capabilities["codeActionProvider"] = provider
+      capabilities["definitionProvider"] = %true
       capabilities["positionEncoding"] = %"utf-16"
       var result = newJObject()
       result["capabilities"] = capabilities
@@ -525,6 +646,9 @@ proc runLsp*() =
           let path = uriToPath(change["uri"].getStr)
           let changeType = intOption(change, "type", 2)
           workspace.fileChanged(path, changeType == 3)
+    of "textDocument/definition":
+      if hasId:
+        sendResponse(id, definition(params, workspace))
     of "$/cancelRequest":
       discard
     of "textDocument/codeAction":

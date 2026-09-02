@@ -21,7 +21,8 @@ The source adapter uses `nimsuggest/nimsuggest`, which exposes Nim's compiler mo
 The implementation is organized by responsibility under `src/onim`:
 
 - `syntax/` owns lexical tokens and structural import/source parsing.
-- `index/` owns per-file source indexes and their validated disk cache.
+- `index/` owns per-file source indexes, the conservative module-surface symbol
+  index, and their validated disk cache.
 - `session/` owns numeric identities, document overlays, snapshots, and the
   workspace dependency graph.
 - `features/` owns user-facing language actions such as organize-imports.
@@ -57,6 +58,14 @@ On-disk source indexes are cached under `ONIM_CACHE_DIR` when set, then `XDG_CAC
 The stdio server also keeps semantic organization in a persistent helper process. The helper owns the embedded compiler graph on one thread, while the LSP process remains free to receive edits. `didOpen` and `didChange` prefetch the current snapshot; at most one compiler request is in flight and intermediate edits are coalesced to the newest snapshot for each file. A code action returns from the generation cache when prefetch has completed, without placing compiler work on the LSP request path. The standalone CLI remains synchronous because its process lifetime ends after one file operation.
 
 The index is an orchestration layer, not yet a semantic replacement for Nim. An uncached organize-imports request still asks the embedded compiler/nimsuggest boundary for `undeclared identifier`; the lexical index determines what needs to be refreshed. Field-layout analysis and a future `onim --compact` opt-in remain separate from `source.organizeImports`.
+
+The native symbol index is deliberately narrower than a compiler symbol table:
+it stores declaration kinds and exact name-token spans for module-surface
+procedures, types, values, and templates. It is persisted as numeric token
+references, so cache reloads do not duplicate names or offsets. The first native
+definition request resolves one unambiguous same-file module symbol; qualified,
+imported, nested, overloaded, and otherwise uncertain references return `null`
+until the parser and resolver milestones add scope facts.
 
 ## Zed
 

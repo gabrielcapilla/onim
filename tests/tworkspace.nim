@@ -105,6 +105,7 @@ suite "workspace index":
     check secondSnapshot.index.parsed.tokens == firstSnapshot.index.parsed.tokens
     check secondSnapshot.index.parsed.imports.len ==
       firstSnapshot.index.parsed.imports.len
+    check secondSnapshot.index.symbols == firstSnapshot.index.symbols
 
     let cacheBytes = readFile(path)
     writeFile(path, cacheBytes & "trailing")
