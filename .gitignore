@@ -7,3 +7,4 @@ tests/tlsp
 tests/tworkspace
 *.onim-*.nim
 gen_stdlib_map
+PLAN.md
