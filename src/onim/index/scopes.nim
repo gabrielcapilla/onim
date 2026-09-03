@@ -51,31 +51,7 @@ const
   InvalidScopeId* = ScopeId(0)
   invalidScopeOwner = high(uint32)
 
-  scopeKeywords = [
-    "addr", "and", "as", "asm", "atomic", "bind", "block", "break", "case", "cast",
-    "concept", "const", "continue", "converter", "defer", "discard", "distinct", "div",
-    "do", "elif", "else", "end", "enum", "except", "export", "finally", "for", "from",
-    "func", "generic", "if", "import", "in", "include", "interface", "is", "isnot",
-    "iterator", "let", "macro", "method", "mixin", "mod", "nil", "not", "object", "of",
-    "or", "out", "proc", "ptr", "raise", "ref", "return", "shl", "shr", "static",
-    "template", "try", "tuple", "type", "using", "var", "when", "while", "with",
-    "without", "xor", "yield",
-  ]
-
 proc `==`*(left, right: ScopeId): bool {.borrow.}
-
-proc tokenSpan(token: Token): int {.inline.} =
-  token.endOffset - token.startOffset
-
-proc isStropped(token: Token): bool {.inline.} =
-  token.kind == tkIdentifier and token.text.len > 0 and
-    tokenSpan(token) >= token.text.len + 1
-
-proc validIdentifier(token: Token): bool {.inline.} =
-  if token.kind != tkIdentifier or token.text.len == 0:
-    return false
-  let span = tokenSpan(token)
-  span == token.text.len or span == token.text.len + 2
 
 proc malformedToken(token: Token): bool {.inline.} =
   if token.kind == tkIdentifier:
@@ -85,9 +61,6 @@ proc malformedToken(token: Token): bool {.inline.} =
   if token.text.startsWith("\"\"\""):
     return not token.text.endsWith("\"\"\"")
   token.text[0] notin {'\"', '\''} or token.text[^1] != token.text[0]
-
-proc isKeyword(token: Token): bool {.inline.} =
-  validIdentifier(token) and not isStropped(token) and token.text in scopeKeywords
 
 proc isRoutineKind(kind: SourceSymbolKind): bool {.inline.} =
   kind in {
@@ -263,7 +236,7 @@ proc declarationGroup(
     let token = tokens[index]
     if token.text == ",":
       expectedName = true
-    elif token.kind == tkIdentifier and not isKeyword(token):
+    elif token.kind == tkIdentifier and not isValidNimKeyword(token):
       if not expectedName:
         return false
       declarations.add LexicalDeclaration(
@@ -575,7 +548,7 @@ proc validateScopes*(
         declaration.nameToken >= declaration.pastToken or
         declaration.pastToken > uint32(tokens.len) or
         tokens[int(declaration.nameToken)].kind != tkIdentifier or
-        isKeyword(tokens[int(declaration.nameToken)]) or
+        isValidNimKeyword(tokens[int(declaration.nameToken)]) or
         (previousName != high(uint32) and declaration.nameToken <= previousName) or
         declarationTokens[int(declaration.nameToken)]:
       return false

@@ -14,6 +14,39 @@ type
     line*: int
     column*: int
 
+const nimKeywords = [
+  "addr", "and", "as", "asm", "atomic", "bind", "block", "break", "case", "cast",
+  "concept", "const", "continue", "converter", "defer", "discard", "distinct", "div",
+  "do", "elif", "else", "end", "enum", "except", "export", "finally", "for", "from",
+  "func", "generic", "if", "import", "in", "include", "interface", "is", "isnot",
+  "iterator", "let", "macro", "method", "mixin", "mod", "nil", "not", "object", "of",
+  "or", "out", "proc", "ptr", "raise", "ref", "return", "shl", "shr", "static",
+  "template", "try", "tuple", "type", "using", "var", "when", "while", "with",
+  "without", "xor", "yield",
+]
+
+proc isNimKeyword*(text: string): bool {.inline.} =
+  text in nimKeywords
+
+proc tokenSpan(token: Token): int {.inline.} =
+  token.endOffset - token.startOffset
+
+proc isStropped*(token: Token): bool {.inline.} =
+  token.kind == tkIdentifier and token.text.len > 0 and
+    tokenSpan(token) >= token.text.len + 1
+
+proc validIdentifier*(token: Token): bool {.inline.} =
+  if token.kind != tkIdentifier or token.text.len == 0:
+    return false
+  let span = tokenSpan(token)
+  span == token.text.len or span == token.text.len + 2
+
+proc isNimKeyword*(token: Token): bool {.inline.} =
+  token.kind == tkIdentifier and not isStropped(token) and isNimKeyword(token.text)
+
+proc isValidNimKeyword*(token: Token): bool {.inline.} =
+  validIdentifier(token) and isNimKeyword(token)
+
 proc isIdentifierStart(c: char): bool {.inline.} =
   c == '_' or c.isAlphaAscii or ord(c) >= 128
 

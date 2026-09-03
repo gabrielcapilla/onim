@@ -42,33 +42,9 @@ type
     usage*: seq[UsageSummary]
     uncertainty*: set[OccurrenceUncertainty]
 
-const nimKeywords = [
-  "addr", "and", "as", "asm", "atomic", "bind", "block", "break", "case", "cast",
-  "concept", "const", "continue", "converter", "defer", "discard", "distinct", "div",
-  "do", "elif", "else", "end", "enum", "except", "export", "finally", "for", "from",
-  "func", "generic", "if", "import", "in", "include", "interface", "is", "isnot",
-  "iterator", "let", "macro", "method", "mixin", "mod", "nil", "not", "object", "of",
-  "or", "out", "proc", "ptr", "raise", "ref", "return", "shl", "shr", "static",
-  "template", "try", "tuple", "type", "using", "var", "when", "while", "with",
-  "without", "xor", "yield",
-]
-
-proc tokenSpan(token: Token): int {.inline.} =
-  token.endOffset - token.startOffset
-
-proc isStropped(token: Token): bool {.inline.} =
-  token.kind == tkIdentifier and token.text.len > 0 and
-    tokenSpan(token) >= token.text.len + 1
-
-proc validIdentifierToken(token: Token): bool {.inline.} =
-  if token.kind != tkIdentifier or token.text.len == 0:
-    return false
-  let span = tokenSpan(token)
-  span == token.text.len or span == token.text.len + 2
-
 proc malformedIdentifierToken(token: Token): bool {.inline.} =
   token.kind == tkIdentifier and token.text.len == 0 or
-    (token.kind == tkIdentifier and not validIdentifierToken(token))
+    (token.kind == tkIdentifier and not validIdentifier(token))
 
 proc closedStringToken(token: Token): bool =
   if token.kind != tkString or token.text.len < 2:
@@ -76,9 +52,6 @@ proc closedStringToken(token: Token): bool =
   if token.text.startsWith("\"\"\""):
     return token.text.len >= 6 and token.text.endsWith("\"\"\"")
   token.text[0] in {'\"', '\''} and token.text[^1] == token.text[0]
-
-proc isKeyword(token: Token): bool {.inline.} =
-  not isStropped(token) and token.text in nimKeywords
 
 proc declarationKeyword(token: Token): bool {.inline.} =
   if token.kind != tkIdentifier or isStropped(token):
@@ -120,13 +93,13 @@ proc markDeclarationNames(tokens: openArray[Token], excluded: var seq[bool]) =
       while cursor < tokens.len and tokens[cursor].line == declarationLine:
         if tokens[cursor].text == ":" or tokens[cursor].text == "=":
           break
-        if tokens[cursor].kind == tkIdentifier and not isKeyword(tokens[cursor]):
+        if tokens[cursor].kind == tkIdentifier and not isNimKeyword(tokens[cursor]):
           excluded[cursor] = true
         inc cursor
     elif token.text == "for":
       while cursor < tokens.len and tokens[cursor].text != "in" and
           tokens[cursor].text != "=" and tokens[cursor].text != ":":
-        if tokens[cursor].kind == tkIdentifier and not isKeyword(tokens[cursor]):
+        if tokens[cursor].kind == tkIdentifier and not isNimKeyword(tokens[cursor]):
           excluded[cursor] = true
         inc cursor
     elif token.text == "bind":
@@ -235,7 +208,7 @@ proc indexOccurrences*(
   var roles = newSeq[set[OccurrenceRole]](tokenCount)
   var lookup = initTable[string, int]()
   for tokenIndex, token in parsed.tokens:
-    if excluded[tokenIndex] or not validIdentifierToken(token) or isKeyword(token):
+    if excluded[tokenIndex] or not validIdentifier(token) or isNimKeyword(token):
       continue
     included[tokenIndex] = true
     roles[tokenIndex] = {occurrenceReference}
@@ -243,8 +216,8 @@ proc indexOccurrences*(
         included[tokenIndex - 2]:
       roles[tokenIndex].incl occurrenceMember
     if tokenIndex + 2 < tokenCount and parsed.tokens[tokenIndex + 1].text == "." and
-        validIdentifierToken(parsed.tokens[tokenIndex + 2]) and
-        not excluded[tokenIndex + 2] and not isKeyword(parsed.tokens[tokenIndex + 2]):
+        validIdentifier(parsed.tokens[tokenIndex + 2]) and not excluded[tokenIndex + 2] and
+        not isNimKeyword(parsed.tokens[tokenIndex + 2]):
       roles[tokenIndex].incl occurrenceQualifier
     if exportUse(parsed.tokens, tokenIndex):
       roles[tokenIndex].incl occurrenceExport
@@ -293,7 +266,7 @@ proc validateOccurrences*(index: OccurrenceIndex, tokens: openArray[Token]): boo
     if occurrence.token >= uint32(tokens.len) or
         (previousToken != high(uint32) and occurrence.token <= previousToken) or
         not occurrence.roles.contains(occurrenceReference) or
-        not validIdentifierToken(tokens[int(occurrence.token)]):
+        not validIdentifier(tokens[int(occurrence.token)]):
       return false
     occurrenceByToken[int(occurrence.token)] = true
     previousToken = occurrence.token
