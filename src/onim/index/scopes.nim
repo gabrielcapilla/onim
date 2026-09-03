@@ -1,4 +1,4 @@
-import std/[algorithm, strutils, tables]
+import std/[algorithm, strutils]
 
 import ../syntax/lexer
 import ./symbols

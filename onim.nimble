@@ -23,6 +23,7 @@ task test, "run the organize-imports regression suite":
   exec "nim c -r --path:src --hints:off --warnings:off tests/toccurrences.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/tscopes.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/tdefinition.nim"
+  exec "nim c -r --path:src --hints:off --warnings:off tests/tsurfaces.nim"
 
 task generateStdlibMap, "regenerate the compiler-derived stdlib symbol map":
   exec "nim c -r --hints:off --warnings:off gen_stdlib_map.nim"

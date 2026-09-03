@@ -21,8 +21,9 @@ The source adapter uses `nimsuggest/nimsuggest`, which exposes Nim's compiler mo
 The implementation is organized by responsibility under `src/onim`:
 
 - `syntax/` owns lexical tokens and structural import/source parsing.
-- `index/` owns per-file source indexes, the conservative module-surface symbol
-  and numeric occurrence/scope indexes, and their validated disk cache.
+- `index/` owns per-file source indexes, the conservative module-surface symbol,
+  shared module-surface, and numeric occurrence/scope indexes, plus their
+  validated disk cache.
 - `session/` owns numeric identities, document overlays, snapshots, and the
   workspace dependency graph.
 - `features/` owns user-facing language actions such as organize-imports and
@@ -46,7 +47,7 @@ Regenerate after changing Nim versions with:
 nimble generateStdlibMap
 ```
 
-The generated map is bundled into the executable and may also be overridden with `ONIM_STDLIB_MAP=/path/to/stdlib_map.json`.
+The generated map is bundled into the executable and may also be overridden with `ONIM_STDLIB_MAP=/path/to/stdlib_map.json`. Onim normalizes valid map entries into the same deterministic module-surface index used by project declarations; malformed or fallback-only data is marked incomplete so native resolution cannot guess.
 
 ## Workspace index
 
@@ -71,13 +72,19 @@ The stdio server also keeps semantic organization in a persistent helper process
 
 The index is an orchestration layer, not yet a semantic replacement for Nim. An uncached organize-imports request still asks the embedded compiler/nimsuggest boundary for `undeclared identifier`; the lexical index determines what needs to be refreshed. Field-layout analysis and a future `onim --compact` opt-in remain separate from `source.organizeImports`.
 
-The native symbol index is deliberately narrower than a compiler symbol table:
+The native symbol and module-surface indexes are deliberately narrower than a
+compiler symbol table:
 it stores declaration kinds and exact name-token spans for module-surface
 procedures, types, values, and templates. It is persisted as numeric token
 references, so cache reloads do not duplicate names or offsets. The first native
 definition request resolves one unambiguous same-file module symbol; qualified,
 imported, nested, overloaded, and otherwise uncertain references return `null`
 until the parser and resolver milestones add scope facts.
+
+The shared surface index stores sorted module ranges, normalized identifier keys,
+overload records, and deterministic ambiguity results. Project surfaces are
+derived from a cached `SourceIndex`; the complete generated stdlib map is
+adapted at startup, while incomplete fallback data always returns `unknown`.
 
 Project-module definition lookup uses only published numeric workspace views.
 It resolves an unambiguous exported declaration through a direct module
