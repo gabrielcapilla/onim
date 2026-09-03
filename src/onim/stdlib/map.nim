@@ -1,19 +1,25 @@
-import std/[algorithm, json, os, strutils, tables]
+import std/[algorithm, json, os, sets, strutils, tables]
 
 import ../index/surfaces
 import ../index/symbols
+import ../syntax/imports
 
 type
+  CandidatePriority* = enum
+    candidateDefault
+    candidateCanonical
+
   SymbolCandidate* = object
     module*: string
     name*: string
     kind*: string
     arity*: int
     signature*: string
+    priority*: CandidatePriority
 
   StdlibMap* = ref object
     symbols*: Table[string, seq[SymbolCandidate]]
-    modules*: Table[string, bool]
+    modules*: HashSet[string]
     surface*: SurfaceIndex
 
 const bundledStdlibMap = staticRead("../../../stdlib_map.json")
@@ -22,12 +28,7 @@ proc canonicalModule*(module: string): string =
   canonicalSurfaceModule(module)
 
 proc moduleBase*(module: string): string =
-  let normalized = canonicalModule(module)
-  let slash = normalized.rfind('/')
-  if slash >= 0:
-    return normalized[slash + 1 .. ^1]
-  else:
-    return normalized
+  moduleLeaf(module)
 
 proc sameModule*(left, right: string): bool =
   let a = canonicalModule(left)
@@ -39,14 +40,6 @@ proc sameModule*(left, right: string): bool =
   if b.startsWith("std/") and a == b[4 .. ^1]:
     return true
   return false
-
-proc addFallback(
-    result: var StdlibMap, name, module, kind: string, arity: int, signature = ""
-) =
-  result.symbols.mgetOrPut(name, @[]).add SymbolCandidate(
-    module: module, name: name, kind: kind, arity: arity, signature: signature
-  )
-  result.modules[canonicalModule(module)] = true
 
 proc sourceSymbolKind(kind: string, kindKnown: var bool): SourceSymbolKind =
   kindKnown = true
@@ -81,7 +74,7 @@ proc surfaceForMap(stdlib: StdlibMap, origin: SurfaceOrigin): SurfaceIndex =
   var inputs: seq[SurfaceInput] = @[]
   var inputByModule = initTable[string, int]()
 
-  for module in stdlib.modules.keys:
+  for module in stdlib.modules:
     let normalized = canonicalModule(module)
     if normalized.len == 0 or inputByModule.hasKey(normalized):
       continue
@@ -120,21 +113,23 @@ proc surfaceForMap(stdlib: StdlibMap, origin: SurfaceOrigin): SurfaceIndex =
       input.uncertainty.incl surfaceUniverseIncomplete
   buildSurfaceIndex(inputs, complete)
 
+proc addUniqueCandidate(
+    candidates: var seq[SymbolCandidate], candidate: SymbolCandidate
+): bool =
+  for existing in candidates:
+    if sameModule(existing.module, candidate.module) and
+        existing.signature == candidate.signature:
+      return false
+  candidates.add candidate
+  true
+
 proc newStdlibMap(): StdlibMap =
   new(result)
   result.symbols = initTable[string, seq[SymbolCandidate]]()
-  result.modules = initTable[string, bool]()
+  result.modules = initHashSet[string]()
 
 proc emptyStdlibMap*(): StdlibMap =
   result = newStdlibMap()
-
-  result.addFallback("walkDir", "std/os", "iterator", 1)
-  result.addFallback("walkDirRec", "std/os", "iterator", 1)
-  result.addFallback("Table", "std/tables", "type", 2)
-  result.addFallback("initTable", "std/tables", "proc", 0)
-  result.addFallback("parseJson", "std/json", "proc", 1)
-  result.addFallback("split", "std/strutils", "proc", 2)
-  result.addFallback("split", "std/os", "proc", 1)
   result.surface = surfaceForMap(result, surfaceFallback)
 
 proc intField(node: JsonNode, name: string, fallback: int): int =
@@ -172,7 +167,7 @@ proc loadStdlibMap*(path: string): StdlibMap =
         let normalized = canonicalModule(module)
         if normalized.len == 0:
           return emptyStdlibMap()
-        result.modules[normalized] = true
+        result.modules.incl normalized
     if not root.hasKey("symbols") or root["symbols"].kind != JObject:
       return emptyStdlibMap()
     for name in root["symbols"].keys:
@@ -189,32 +184,22 @@ proc loadStdlibMap*(path: string): StdlibMap =
         if module.len == 0 or stringField(entry, "kind").len == 0:
           return emptyStdlibMap()
         let exportedName = stringField(entry, "name")
+        let priority = intField(entry, "priority", 0)
+        if priority < 0 or priority > ord(high(CandidatePriority)):
+          return emptyStdlibMap()
         let candidate = SymbolCandidate(
           module: module,
           name: if exportedName.len > 0: exportedName else: name,
           kind: stringField(entry, "kind"),
           arity: intField(entry, "arity", -1),
           signature: stringField(entry, "signature"),
+          priority: CandidatePriority(priority),
         )
-        var duplicate = false
-        for existing in candidates:
-          if sameModule(existing.module, candidate.module) and
-              existing.signature == candidate.signature:
-            duplicate = true
-            break
-        if not duplicate:
-          candidates.add candidate
-        result.modules[module] = true
+        discard addUniqueCandidate(candidates, candidate)
+        result.modules.incl module
       if candidates.len > 0:
         for candidate in candidates:
-          var duplicate = false
-          for existing in result.symbols.mgetOrPut(name, @[]):
-            if sameModule(existing.module, candidate.module) and
-                existing.signature == candidate.signature:
-              duplicate = true
-              break
-          if not duplicate:
-            result.symbols.mgetOrPut(name, @[]).add candidate
+          discard addUniqueCandidate(result.symbols.mgetOrPut(name, @[]), candidate)
     if result.symbols.len == 0:
       return emptyStdlibMap()
     result.surface = surfaceForMap(result, surfaceStdlib)
@@ -245,27 +230,13 @@ proc resolveCandidate*(
   if candidates.len == 0:
     return
 
-  let preferredModule =
-    case name
-    of "walkDir", "walkDirRec": "std/os"
-    of "Table", "initTable": "std/tables"
-    of "parseJson": "std/json"
-    of "split": "std/strutils"
-    else: ""
-  if preferredModule.len > 0:
-    for candidate in candidates:
-      if candidate.module == preferredModule:
-        return candidate
-    if qualifier.len == 0:
-      for candidate in stdlib.symbols[name]:
-        if candidate.module == preferredModule:
-          return candidate
-
-  # split is overloaded throughout the standard library. Prefer the documented
-  # canonical import when semantic type/arity information is unavailable.
   for candidate in candidates:
-    if candidate.module == "std/strutils":
+    if candidate.priority == candidateCanonical:
       return candidate
+  if qualifier.len == 0:
+    for candidate in stdlib.symbols[name]:
+      if candidate.priority == candidateCanonical:
+        return candidate
   if candidates.len == 1:
     return candidates[0]
   var ordered = candidates

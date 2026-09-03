@@ -35471,6 +35471,7 @@
       {
         "module": "std/tables",
         "name": "Table",
+        "priority": 1,
         "kind": "skType",
         "arity": -1,
         "signature": "Table[A; B] = object"
@@ -72602,6 +72603,7 @@
       {
         "module": "std/tables",
         "name": "initTable",
+        "priority": 1,
         "kind": "skProc",
         "arity": 1,
         "signature": "proc initTable[A, B](initialSize = defaultInitialSize): Table[A, B]"
@@ -85149,6 +85151,7 @@
       {
         "module": "std/json",
         "name": "parseJson",
+        "priority": 1,
         "kind": "skProc",
         "arity": 3,
         "signature": "proc parseJson(buffer: string; rawIntegers = false; rawFloats = false): JsonNode {.\n    raises: [IOError, OSError, JsonParsingError, ValueError],\n    tags: [ReadIOEffect, WriteIOEffect], forbids: [].}"
@@ -85156,6 +85159,7 @@
       {
         "module": "std/json",
         "name": "parseJson",
+        "priority": 1,
         "kind": "skProc",
         "arity": 4,
         "signature": "proc parseJson(p: var JsonParser; rawIntegers, rawFloats: bool; depth = 0): JsonNode {.\n    raises: [IOError, OSError, JsonParsingError, ValueError],\n    tags: [ReadIOEffect], forbids: [].}"
@@ -85163,6 +85167,7 @@
       {
         "module": "std/json",
         "name": "parseJson",
+        "priority": 1,
         "kind": "skProc",
         "arity": 4,
         "signature": "proc parseJson(s: Stream; filename: string = \"\"; rawIntegers = false;\n               rawFloats = false): JsonNode {.\n    raises: [IOError, OSError, IOError, OSError, JsonParsingError, ValueError],\n    tags: [ReadIOEffect, WriteIOEffect], forbids: [].}"
@@ -98139,6 +98144,7 @@
       {
         "module": "std/strutils",
         "name": "split",
+        "priority": 1,
         "kind": "skProc",
         "arity": 3,
         "signature": "func split(s: string; sep: char; maxsplit: int = -1): seq[string] {.gcsafe,\n    extern: \"nsuSplitChar\", raises: [], tags: [], forbids: [].}"
@@ -98146,6 +98152,7 @@
       {
         "module": "std/strutils",
         "name": "split",
+        "priority": 1,
         "kind": "skProc",
         "arity": 3,
         "signature": "func split(s: string; sep: string; maxsplit: int = -1): seq[string] {.gcsafe,\n    extern: \"nsuSplitString\", raises: [], tags: [], forbids: [].}"
@@ -98153,6 +98160,7 @@
       {
         "module": "std/strutils",
         "name": "split",
+        "priority": 1,
         "kind": "skProc",
         "arity": 3,
         "signature": "func split(s: string; seps: set[char] = Whitespace; maxsplit: int = -1): seq[\n    string] {.gcsafe, extern: \"nsuSplitCharSet\", raises: [], tags: [],\n              forbids: [].}"
@@ -98160,6 +98168,7 @@
       {
         "module": "std/strutils",
         "name": "split",
+        "priority": 1,
         "kind": "skIterator",
         "arity": 3,
         "signature": "iterator split(s: string; sep: char; maxsplit: int = -1): string {.raises: [],\n    tags: [], forbids: [].}"
@@ -98167,6 +98176,7 @@
       {
         "module": "std/strutils",
         "name": "split",
+        "priority": 1,
         "kind": "skIterator",
         "arity": 3,
         "signature": "iterator split(s: string; sep: string; maxsplit: int = -1): string {.raises: [],\n    tags: [], forbids: [].}"
@@ -98174,6 +98184,7 @@
       {
         "module": "std/strutils",
         "name": "split",
+        "priority": 1,
         "kind": "skIterator",
         "arity": 3,
         "signature": "iterator split(s: string; seps: set[char] = Whitespace; maxsplit: int = -1): string {.\n    raises: [], tags: [], forbids: [].}"
@@ -104503,14 +104514,16 @@
         "name": "walkDir",
         "kind": "skIterator",
         "arity": 4,
-        "signature": "iterator walkDir(dir: Path; relative = false; checkDir = false;\n                 skipSpecial = false): tuple[kind: PathComponent, path: Path] {.\n    tags: [ReadDirEffect], raises: [OSError], forbids: [].}"
+        "signature": "iterator walkDir(dir: Path; relative = false; checkDir = false;\n                 skipSpecial = false): tuple[kind: PathComponent, path: Path] {.\n    tags: [ReadDirEffect], raises: [OSError], forbids: [].}",
+        "priority": 1
       },
       {
         "module": "std/os",
         "name": "walkDir",
         "kind": "skIterator",
         "arity": 4,
-        "signature": "iterator walkDir(dir: string; relative = false; checkDir = false;\n                 skipSpecial = false): tuple[kind: PathComponent, path: string] {.\n    tags: [ReadDirEffect], raises: [OSError], forbids: [].}"
+        "signature": "iterator walkDir(dir: string; relative = false; checkDir = false;\n                 skipSpecial = false): tuple[kind: PathComponent, path: string] {.\n    tags: [ReadDirEffect], raises: [OSError], forbids: [].}",
+        "priority": 1
       },
       {
         "module": "std/private/osdirs",
@@ -104533,14 +104546,16 @@
         "name": "walkDirRec",
         "kind": "skIterator",
         "arity": 6,
-        "signature": "iterator walkDirRec(dir: Path; yieldFilter = {pcFile}; followFilter = {pcDir};\n                    relative = false; checkDir = false; skipSpecial = false): Path {.\n    tags: [ReadDirEffect], raises: [OSError], forbids: [].}"
+        "signature": "iterator walkDirRec(dir: Path; yieldFilter = {pcFile}; followFilter = {pcDir};\n                    relative = false; checkDir = false; skipSpecial = false): Path {.\n    tags: [ReadDirEffect], raises: [OSError], forbids: [].}",
+        "priority": 1
       },
       {
         "module": "std/os",
         "name": "walkDirRec",
         "kind": "skIterator",
         "arity": 6,
-        "signature": "iterator walkDirRec(dir: string; yieldFilter = {pcFile}; followFilter = {pcDir};\n                    relative = false; checkDir = false; skipSpecial = false): string {.\n    tags: [ReadDirEffect], raises: [OSError], forbids: [].}"
+        "signature": "iterator walkDirRec(dir: string; yieldFilter = {pcFile}; followFilter = {pcDir};\n                    relative = false; checkDir = false; skipSpecial = false): string {.\n    tags: [ReadDirEffect], raises: [OSError], forbids: [].}",
+        "priority": 1
       },
       {
         "module": "std/private/osdirs",

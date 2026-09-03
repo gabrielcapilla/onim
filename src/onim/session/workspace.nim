@@ -4,6 +4,7 @@ import std/os except FileId
 import ../index/cache
 import ../index/source_index
 import ./ids
+import ./paths
 
 type
   WorkspaceFileState* = enum
@@ -61,11 +62,6 @@ type
     manifestByPath: Table[string, ManifestEntry]
     invalidated: seq[FileId]
     unresolvedFiles: int
-
-proc canonicalPath(path: string): string =
-  if path.len == 0:
-    return ""
-  absolutePath(path)
 
 proc unknownStamp(): FileStamp =
   FileStamp(size: -1, modifiedSeconds: -1, modifiedNanoseconds: -1)

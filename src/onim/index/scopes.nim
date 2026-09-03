@@ -68,14 +68,11 @@ proc isRoutineKind(kind: SourceSymbolKind): bool {.inline.} =
     symbolConverter,
   }
 
-proc isRoutineKeyword(text: string): bool {.inline.} =
-  text == "proc" or text == "func" or text == "iterator" or text == "method" or
-    text == "macro" or text == "template" or text == "converter"
+proc isRoutineKeyword(token: Token): bool {.inline.} =
+  token.hasKeywordRole(roleRoutine)
 
-proc isBlockKeyword(text: string): bool {.inline.} =
-  text == "if" or text == "case" or text == "when" or text == "for" or text == "while" or
-    text == "block" or text == "try" or text == "except" or text == "finally" or
-    text == "else" or text == "elif" or text == "of" or text == "defer"
+proc isBlockKeyword(token: Token): bool {.inline.} =
+  token.hasKeywordRole(roleBlock)
 
 proc pushDelimiter(stack: var seq[char], text: string): bool {.inline.} =
   if text.len != 1 or text[0] notin {'(', '[', '{'}:
@@ -115,12 +112,11 @@ proc markGlobalUncertainty(tokens: openArray[Token], result: var ScopeIndex) =
   for token in tokens:
     if token.kind != tkIdentifier or not validIdentifier(token) or isStropped(token):
       continue
-    if token.text == "when" or token.text == "elif" or token.text == "else" or
-        token.text == "static":
+    if token.hasKeywordRole(roleConditional):
       result.uncertainty.incl scopeConditional
-    elif token.text == "include":
+    elif token.hasKeywordRole(roleInclude):
       result.uncertainty.incl scopeInclude
-    elif token.text == "macro" or token.text == "template" or token.text == "mixin":
+    elif token.hasKeywordRole(roleGenerated):
       result.uncertainty.incl scopeGenerated
 
 proc matchingParen(
@@ -146,9 +142,7 @@ proc routineHeader(
   result.closing = -1
   result.equals = -1
   if nameToken <= 0 or nameToken >= tokens.len or result.start < 0 or
-      tokens[result.start].column != 0 or not isRoutineKeyword(
-    tokens[result.start].text
-  ):
+      tokens[result.start].column != 0 or not isRoutineKeyword(tokens[result.start]):
     return
 
   var cursor = nameToken + 1
@@ -248,7 +242,7 @@ proc declarationGroup(
       )
       expectedName = false
       inc names
-    elif token.text == "var" or token.text == "out" or token.text == "sink" or
+    elif token.isKeyword(kwVar) or token.isKeyword(kwOut) or token.text == "sink" or
         token.text == "lent":
       discard
     else:
@@ -361,16 +355,16 @@ proc locals(
   while index < bounds.past:
     let token = tokens[index]
     if token.kind == tkIdentifier and not isStropped(token) and
-        (token.text == "let" or token.text == "var" or token.text == "const"):
+        token.hasKeywordRole(roleValueDeclaration):
       if not statementStart(tokens, index, bounds.first, bounds.baseColumn) or
           token.column != bounds.baseColumn:
         result.uncertainty.incl scopeNestedBlock
         inc index
         continue
       let kind =
-        case token.text
-        of "let": declarationLet
-        of "var": declarationVar
+        case token.keywordOf
+        of kwLet: declarationLet
+        of kwVar: declarationVar
         else: declarationConst
       let finish = localDeclarationEnd(tokens, index, bounds.past, bounds.baseColumn)
       let before = declarations.len
@@ -379,8 +373,7 @@ proc locals(
         result.uncertainty.incl scopeUnsupportedDeclaration
       index = max(index + 1, finish)
       continue
-    if token.kind == tkIdentifier and not isStropped(token) and
-        isBlockKeyword(token.text):
+    if token.kind == tkIdentifier and not isStropped(token) and isBlockKeyword(token):
       result.uncertainty.incl scopeNestedBlock
     if tokens[index].line > tokens[bounds.first].line and
         tokens[index].column > bounds.baseColumn:

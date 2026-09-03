@@ -44,8 +44,8 @@ proc normalToken(source: string, token: Token): bool =
   token.kind == tkIdentifier and token.startOffset >= 0 and
     token.startOffset < source.len and source[token.startOffset] != '`'
 
-proc keyword(source: string, token: Token, wanted: string): bool =
-  normalToken(source, token) and sameIdentifier(token.text, wanted)
+proc keyword(source: string, token: Token, wanted: NimKeyword): bool =
+  normalToken(source, token) and token.isKeyword(wanted)
 
 proc sectionEnd(tokens: openArray[Token], start: int): int =
   let startLine = tokens[start].line
@@ -206,27 +206,27 @@ proc indexSymbols*(source: string, tokens: openArray[Token]): seq[SourceSymbol] 
       inc index
       continue
 
-    if keyword(source, tokens[index], "proc"):
+    if keyword(source, tokens[index], kwProc):
       collectRoutineSymbol(tokens, index, symbolProc, result)
-    elif keyword(source, tokens[index], "func"):
+    elif keyword(source, tokens[index], kwFunc):
       collectRoutineSymbol(tokens, index, symbolFunc, result)
-    elif keyword(source, tokens[index], "iterator"):
+    elif keyword(source, tokens[index], kwIterator):
       collectRoutineSymbol(tokens, index, symbolIterator, result)
-    elif keyword(source, tokens[index], "method"):
+    elif keyword(source, tokens[index], kwMethod):
       collectRoutineSymbol(tokens, index, symbolMethod, result)
-    elif keyword(source, tokens[index], "macro"):
+    elif keyword(source, tokens[index], kwMacro):
       collectRoutineSymbol(tokens, index, symbolMacro, result)
-    elif keyword(source, tokens[index], "template"):
+    elif keyword(source, tokens[index], kwTemplate):
       collectRoutineSymbol(tokens, index, symbolTemplate, result)
-    elif keyword(source, tokens[index], "converter"):
+    elif keyword(source, tokens[index], kwConverter):
       collectRoutineSymbol(tokens, index, symbolConverter, result)
-    elif keyword(source, tokens[index], "type"):
+    elif keyword(source, tokens[index], kwType):
       collectTypeSymbols(tokens, index, result)
-    elif keyword(source, tokens[index], "var"):
+    elif keyword(source, tokens[index], kwVar):
       collectValueSymbols(tokens, index, symbolVar, result)
-    elif keyword(source, tokens[index], "let"):
+    elif keyword(source, tokens[index], kwLet):
       collectValueSymbols(tokens, index, symbolLet, result)
-    elif keyword(source, tokens[index], "const"):
+    elif keyword(source, tokens[index], kwConst):
       collectValueSymbols(tokens, index, symbolConst, result)
     inc index
 

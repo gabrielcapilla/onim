@@ -4,6 +4,25 @@ type GeneratorConfig = object
   libPath: string
   outputPath: string
 
+type CanonicalSymbol = object
+  name: string
+  module: string
+
+const canonicalSymbols = [
+  CanonicalSymbol(name: "walkDir", module: "std/os"),
+  CanonicalSymbol(name: "walkDirRec", module: "std/os"),
+  CanonicalSymbol(name: "Table", module: "std/tables"),
+  CanonicalSymbol(name: "initTable", module: "std/tables"),
+  CanonicalSymbol(name: "parseJson", module: "std/json"),
+  CanonicalSymbol(name: "split", module: "std/strutils"),
+]
+
+proc isCanonicalSymbol(name, module: string): bool =
+  for candidate in canonicalSymbols:
+    if candidate.name == name and candidate.module == module:
+      return true
+  false
+
 proc commandOutput(
     executable, workingDir: string, args: openArray[string]
 ): tuple[output: string, exitCode: int] =
@@ -128,6 +147,8 @@ proc addReexportAlias(
     for key in entry.keys:
       item[key] = entry[key]
     item["module"] = %targetModule
+    if isCanonicalSymbol(name, targetModule):
+      item["priority"] = %1
     var duplicate = false
     for existing in symbols[name]:
       if existing.hasKey("module") and existing["module"].getStr == targetModule and
@@ -168,6 +189,8 @@ proc generate(config: GeneratorConfig, nimVersion: string) =
       var item = newJObject()
       item["module"] = %module
       item["name"] = %name
+      if isCanonicalSymbol(name, module):
+        item["priority"] = %1
       item["kind"] =
         if entry.hasKey("type"):
           entry["type"]

@@ -54,13 +54,7 @@ proc closedStringToken(token: Token): bool =
   token.text[0] in {'\"', '\''} and token.text[^1] == token.text[0]
 
 proc declarationKeyword(token: Token): bool {.inline.} =
-  if token.kind != tkIdentifier or isStropped(token):
-    return false
-  token.text == "proc" or token.text == "func" or token.text == "iterator" or
-    token.text == "method" or token.text == "macro" or token.text == "template" or
-    token.text == "converter" or token.text == "type" or token.text == "var" or
-    token.text == "let" or token.text == "const" or token.text == "for" or
-    token.text == "bind"
+  token.hasKeywordRole(roleDeclaration)
 
 proc markImportSpans(parsed: SourceImports, excluded: var seq[bool]) =
   for item in parsed.imports:
@@ -81,14 +75,13 @@ proc markDeclarationNames(tokens: openArray[Token], excluded: var seq[bool]) =
       continue
 
     var cursor = index + 1
-    if token.text in
-        ["proc", "func", "iterator", "method", "macro", "template", "converter"]:
+    if token.hasKeywordRole(roleRoutine):
       if cursor < tokens.len and tokens[cursor].text == "*":
         inc cursor
       if cursor < tokens.len and tokens[cursor].kind == tkIdentifier:
         excluded[cursor] = true
-    elif token.text == "type" or token.text == "var" or token.text == "let" or
-        token.text == "const":
+    elif token.hasKeywordRole(roleTypeDeclaration) or
+        token.hasKeywordRole(roleValueDeclaration):
       let declarationLine = token.line
       while cursor < tokens.len and tokens[cursor].line == declarationLine:
         if tokens[cursor].text == ":" or tokens[cursor].text == "=":
@@ -96,13 +89,13 @@ proc markDeclarationNames(tokens: openArray[Token], excluded: var seq[bool]) =
         if tokens[cursor].kind == tkIdentifier and not isNimKeyword(tokens[cursor]):
           excluded[cursor] = true
         inc cursor
-    elif token.text == "for":
+    elif token.hasKeywordRole(roleForBinding):
       while cursor < tokens.len and tokens[cursor].text != "in" and
           tokens[cursor].text != "=" and tokens[cursor].text != ":":
         if tokens[cursor].kind == tkIdentifier and not isNimKeyword(tokens[cursor]):
           excluded[cursor] = true
         inc cursor
-    elif token.text == "bind":
+    elif token.hasKeywordRole(roleBindDeclaration):
       if cursor < tokens.len and tokens[cursor].kind == tkIdentifier:
         excluded[cursor] = true
     inc index
@@ -136,12 +129,11 @@ proc markUncertainty(
         result.uncertainty.incl uncertaintyNestedScope
       if isStropped(token):
         continue
-      if token.text == "when" or token.text == "elif" or token.text == "else" or
-          token.text == "static":
+      if token.hasKeywordRole(roleConditional):
         result.uncertainty.incl uncertaintyConditional
-      if token.text == "include":
+      if token.hasKeywordRole(roleInclude):
         result.uncertainty.incl uncertaintyInclude
-      if token.text == "macro" or token.text == "template" or token.text == "mixin":
+      if token.hasKeywordRole(roleGenerated):
         result.uncertainty.incl uncertaintyGenerated
       if declarationKeyword(token):
         result.uncertainty.incl uncertaintyDeclarationOrder
@@ -152,7 +144,7 @@ proc markUncertainty(
       result.uncertainty.incl uncertaintyUnsupportedSyntax
 
   for token in parsed.tokens:
-    if token.text == "include":
+    if token.isKeyword(kwInclude):
       result.uncertainty.incl uncertaintyInclude
       break
 
@@ -160,7 +152,7 @@ proc exportUse(tokens: openArray[Token], index: int): bool =
   var cursor = index - 1
   while cursor >= 0 and tokens[cursor].line == tokens[index].line and
       tokens[cursor].text != ";":
-    if tokens[cursor].text == "export":
+    if tokens[cursor].isKeyword(kwExport):
       return true
     dec cursor
 

@@ -9,6 +9,11 @@ type
     diagnosticHint
     diagnosticWarning
 
+  DiagnosticNames = object
+    unused: string
+    unusedDeclaration: string
+    undeclared: string
+
   CompilerDiagnostic* = object
     kind*: CompilerDiagnosticKind
     isUnusedImport*: bool
@@ -71,12 +76,35 @@ proc extractUnusedDeclarationName(message: string): string =
       return message[quoteStart + 1 ..< quoteEnd]
   message[0 ..< markerPosition].strip
 
-proc diagnosticNames(
-    message: string
-): tuple[unused, unusedDeclaration, undeclared: string] =
+proc diagnosticNames(message: string): DiagnosticNames =
   result.unused = extractUnusedImportName(message)
   result.unusedDeclaration = extractUnusedDeclarationName(message)
   result.undeclared = extractUndeclaredName(message)
+
+proc diagnosticName(names: DiagnosticNames): string {.inline.} =
+  if names.unused.len > 0:
+    return names.unused
+  if names.unusedDeclaration.len > 0:
+    return names.unusedDeclaration
+  names.undeclared
+
+proc buildDiagnostic(
+    message: string,
+    names: DiagnosticNames,
+    kind: CompilerDiagnosticKind,
+    file: string,
+    line, column: int,
+): CompilerDiagnostic =
+  result = CompilerDiagnostic(
+    kind: if names.unused.len > 0: kind else: diagnosticError,
+    isUnusedImport: names.unused.len > 0,
+    isUnusedDeclaration: names.unusedDeclaration.len > 0,
+    name: diagnosticName(names),
+    file: file,
+    line: line,
+    column: column,
+    message: message,
+  )
 
 proc diagnosticKind(level: string): CompilerDiagnosticKind =
   case level.toLowerAscii
@@ -122,41 +150,23 @@ proc parseLocation(message: string): tuple[file: string, line: int, column: int]
 proc parseCompilerOutput(output: string): seq[CompilerDiagnostic] =
   for line in output.splitLines:
     let names = diagnosticNames(line)
-    let name =
-      if names.unused.len > 0:
-        names.unused
-      elif names.unusedDeclaration.len > 0:
-        names.unusedDeclaration
-      else:
-        names.undeclared
+    let name = diagnosticName(names)
     if name.len == 0:
       continue
     let location = parseLocation(line)
-    result.add CompilerDiagnostic(
-      kind:
-        if names.unused.len > 0:
-          lineDiagnosticKind(line)
-        else:
-          diagnosticError,
-      isUnusedImport: names.unused.len > 0,
-      isUnusedDeclaration: names.unusedDeclaration.len > 0,
-      name: name,
-      file: location.file,
-      line: location.line,
-      column: location.column,
-      message: line,
+    result.add buildDiagnostic(
+      line,
+      names,
+      lineDiagnosticKind(line),
+      location.file,
+      location.line,
+      location.column,
     )
 
 proc parseSuggestOutput(output: string): seq[CompilerDiagnostic] =
   for line in output.splitLines:
     let names = diagnosticNames(line)
-    let name =
-      if names.unused.len > 0:
-        names.unused
-      elif names.unusedDeclaration.len > 0:
-        names.unusedDeclaration
-      else:
-        names.undeclared
+    let name = diagnosticName(names)
     if name.len == 0:
       continue
     let fields = line.split('\t')
@@ -172,19 +182,8 @@ proc parseSuggestOutput(output: string): seq[CompilerDiagnostic] =
         column = parseInt(fields[6])
       except ValueError:
         discard
-    result.add CompilerDiagnostic(
-      kind:
-        if names.unused.len > 0:
-          diagnosticKind(level)
-        else:
-          diagnosticError,
-      isUnusedImport: names.unused.len > 0,
-      isUnusedDeclaration: names.unusedDeclaration.len > 0,
-      name: name,
-      file: file,
-      line: lineNumber,
-      column: column,
-      message: line,
+    result.add buildDiagnostic(
+      line, names, diagnosticKind(level), file, lineNumber, column
     )
 
 proc commandWithArgs(

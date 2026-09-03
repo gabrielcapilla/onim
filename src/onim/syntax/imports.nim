@@ -48,6 +48,16 @@ proc moduleText(tokens: seq[Token], first, last: int): string =
     else:
       result.add tokens[index].text
 
+proc moduleLeaf*(module: string): string =
+  var normalized = module.strip(chars = {'"', '\'', '`'}).replace('\\', '/')
+  normalized = normalized.replace('.', '/')
+  let slash = normalized.rfind('/')
+  if slash >= 0 and slash + 1 < normalized.len:
+    normalized = normalized[slash + 1 .. ^1]
+  if normalized.toLowerAscii.endsWith(".nim"):
+    normalized.setLen(normalized.len - 4)
+  normalized
+
 proc lineIndent(source: string, offset: int): string =
   var start = offset
   while start > 0 and source[start - 1] != '\n':
@@ -128,15 +138,15 @@ proc addFromImportedName(
     info: var ImportInfo, tokens: seq[Token], cursor: var int, finish: int
 ) =
   while cursor < finish and
-      (tokens[cursor].kind != tkIdentifier or tokens[cursor].text == "as"):
+      (tokens[cursor].kind != tkIdentifier or tokens[cursor].isKeyword(kwAs)):
     inc cursor
-  if cursor >= finish or tokens[cursor].text == "except":
+  if cursor >= finish or tokens[cursor].isKeyword(kwExcept):
     return
   let start = tokens[cursor].startOffset
   var name = tokens[cursor].text
   var finishOffset = tokens[cursor].endOffset
   inc cursor
-  if cursor < finish and tokens[cursor].text == "as":
+  if cursor < finish and tokens[cursor].isKeyword(kwAs):
     inc cursor
     if cursor < finish and tokens[cursor].kind == tkIdentifier:
       name = tokens[cursor].text
@@ -154,8 +164,10 @@ proc parseImport(
   let keep = keepImport(source, tokens, index, endIndex)
   var cursor = index + 1
   var prefix = ""
-  while cursor < endIndex and tokens[cursor].text != "[" and tokens[cursor].text != "as" and
-      tokens[cursor].text != "except" and tokens[cursor].text != ",":
+  while cursor < endIndex and tokens[cursor].text != "[" and
+      not tokens[cursor].isKeyword(kwAs) and not tokens[cursor].isKeyword(kwExcept) and
+      tokens[cursor].text != ","
+  :
     prefix.add tokens[cursor].text
     inc cursor
   prefix = prefix.strip(chars = {' ', '\t'})
@@ -189,14 +201,14 @@ proc parseImport(
   else:
     cursor = index + 1
     while cursor < endIndex:
-      if tokens[cursor].text == "except":
+      if tokens[cursor].isKeyword(kwExcept):
         break
-      if tokens[cursor].text == "," or tokens[cursor].text == "as":
+      if tokens[cursor].text == "," or tokens[cursor].isKeyword(kwAs):
         inc cursor
         continue
       let moduleStart = cursor
       while cursor < endIndex and tokens[cursor].text != "," and
-          tokens[cursor].text != "as" and tokens[cursor].text != "except":
+          not tokens[cursor].isKeyword(kwAs) and not tokens[cursor].isKeyword(kwExcept):
         inc cursor
       let module = moduleText(tokens, moduleStart, cursor)
       if module.len == 0:
@@ -225,7 +237,7 @@ proc parseImport(
         indent: lineIndent(source, tokens[index].startOffset),
         keep: keep,
       )
-      if cursor < endIndex and tokens[cursor].text == "as":
+      if cursor < endIndex and tokens[cursor].isKeyword(kwAs):
         inc cursor
         if cursor < endIndex and tokens[cursor].kind == tkIdentifier:
           item.alias = tokens[cursor].text
@@ -238,7 +250,7 @@ proc parseImport(
   # `except` belongs to the module immediately before it, including bracketed
   # imports. It is intentionally kept separate from imported names.
   var exceptIndex = index + 1
-  while exceptIndex < endIndex and tokens[exceptIndex].text != "except":
+  while exceptIndex < endIndex and not tokens[exceptIndex].isKeyword(kwExcept):
     inc exceptIndex
   if exceptIndex < endIndex and result.items.len > 0:
     var cursorExcept = exceptIndex + 1
@@ -254,7 +266,7 @@ proc parseFrom(
 ): tuple[item: ImportInfo, next: int, valid: bool] =
   let endIndex = statementEnd(tokens, index)
   var importIndex = index + 1
-  while importIndex < endIndex and tokens[importIndex].text != "import":
+  while importIndex < endIndex and not tokens[importIndex].isKeyword(kwImport):
     inc importIndex
   if importIndex >= endIndex:
     result.next = endIndex
@@ -276,10 +288,10 @@ proc parseFrom(
     info.diagnosticNameStartOffset = info.moduleStartOffset
     info.diagnosticNameEndOffset = info.moduleEndOffset
   var cursor = importIndex + 1
-  while cursor < endIndex and tokens[cursor].text != "except":
+  while cursor < endIndex and not tokens[cursor].isKeyword(kwExcept):
     info.addFromImportedName(tokens, cursor, endIndex)
     while cursor < endIndex and tokens[cursor].text != "," and
-        tokens[cursor].text != "except":
+        not tokens[cursor].isKeyword(kwExcept):
       inc cursor
     if cursor < endIndex and tokens[cursor].text == ",":
       inc cursor
@@ -292,15 +304,13 @@ proc collectDefinitions(tokens: seq[Token]): HashSet[string] =
   for index, token in tokens:
     if token.kind != tkIdentifier:
       continue
-    if token.text == "proc" or token.text == "func" or token.text == "iterator" or
-        token.text == "method" or token.text == "macro" or token.text == "template" or
-        token.text == "converter":
+    if token.hasKeywordRole(roleRoutine):
       var cursor = index + 1
       if cursor < tokens.len and tokens[cursor].text == "*":
         inc cursor
       if cursor < tokens.len and tokens[cursor].kind == tkIdentifier:
         result.incl tokens[cursor].text
-    elif token.text == "type":
+    elif token.hasKeywordRole(roleTypeDeclaration):
       var cursor = index + 1
       let declarationLine =
         if cursor < tokens.len:
@@ -313,7 +323,7 @@ proc collectDefinitions(tokens: seq[Token]): HashSet[string] =
           result.incl tokens[cursor].text
           break
         inc cursor
-    elif token.text == "var" or token.text == "let" or token.text == "const":
+    elif token.hasKeywordRole(roleValueDeclaration):
       var cursor = index + 1
       let declarationLine =
         if cursor < tokens.len:
@@ -327,14 +337,14 @@ proc collectDefinitions(tokens: seq[Token]): HashSet[string] =
         if tokens[cursor].kind == tkIdentifier:
           result.incl tokens[cursor].text
         inc cursor
-    elif token.text == "for":
+    elif token.hasKeywordRole(roleForBinding):
       var cursor = index + 1
       while cursor < tokens.len and tokens[cursor].text != "in" and
           tokens[cursor].text != "=" and tokens[cursor].text != ":":
         if tokens[cursor].kind == tkIdentifier:
           result.incl tokens[cursor].text
         inc cursor
-    elif token.text == "bind":
+    elif token.hasKeywordRole(roleBindDeclaration):
       var cursor = index + 1
       if cursor < tokens.len and tokens[cursor].kind == tkIdentifier:
         result.incl tokens[cursor].text
@@ -346,7 +356,7 @@ proc parseSourceImports*(source: string): SourceImports =
   result.qualifiedNames = initHashSet[string]()
   var index = 0
   while index < result.tokens.len:
-    if result.tokens[index].text == "import":
+    if result.tokens[index].isKeyword(kwImport):
       let parsed = parseImport(result.tokens, source, index)
       for parsedItem in parsed.items:
         var item = parsedItem
@@ -361,7 +371,7 @@ proc parseSourceImports*(source: string): SourceImports =
           for excluded in item.excluded:
             discard excluded
       index = max(index + 1, parsed.next)
-    elif result.tokens[index].text == "from":
+    elif result.tokens[index].isKeyword(kwFrom):
       let parsed = parseFrom(result.tokens, source, index)
       if parsed.valid:
         var item = parsed.item
@@ -419,12 +429,6 @@ proc providesQualifier*(imports: SourceImports, qualifier: string): bool =
     return true
   for item in imports.imports:
     if item.form == importModule and not item.conditional and item.alias.len == 0:
-      let slash = item.module.rfind('/')
-      let base =
-        if slash >= 0:
-          item.module[slash + 1 .. ^1]
-        else:
-          item.module
-      if base == qualifier:
+      if moduleLeaf(item.module) == qualifier:
         return true
   false

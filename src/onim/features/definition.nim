@@ -138,21 +138,11 @@ proc finishTargets(
   result.kind = definitionResolved
   result.target = targets[0]
 
-proc moduleLeaf(module: string): string =
-  var normalized = module.strip(chars = {'"', '\'', '`'}).replace('\\', '/')
-  normalized = normalized.replace('.', '/')
-  let slash = normalized.rfind('/')
-  if slash >= 0 and slash + 1 < normalized.len:
-    normalized = normalized[slash + 1 .. ^1]
-  if normalized.toLowerAscii.endsWith(".nim"):
-    normalized.setLen(normalized.len - 4)
-  normalized
-
 proc hasExcept(imports: SourceImports, item: ImportInfo): bool =
   for token in imports.tokens:
     if token.startOffset < item.startOffset or token.endOffset > item.endOffset:
       continue
-    if token.kind == tkIdentifier and token.text == "except":
+    if token.isKeyword(kwExcept):
       return true
   false
 

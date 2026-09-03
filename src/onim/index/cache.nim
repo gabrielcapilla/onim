@@ -1,4 +1,4 @@
-import std/[algorithm, os, sets, streams, strutils, times]
+import std/[algorithm, os, sets, streams, times]
 
 import ../syntax/imports
 import ../syntax/lexer
@@ -6,6 +6,7 @@ import ./source_index
 import ./occurrences
 import ./scopes
 import ./symbols
+import ../session/paths
 
 const
   cacheMagic = "ONIMIDX1"
@@ -127,6 +128,8 @@ proc readToken(stream: Stream): Token =
   result.endOffset = readInt(stream)
   result.line = readInt(stream)
   result.column = readInt(stream)
+  if result.kind == tkIdentifier and not isStropped(result):
+    result.keyword = keywordId(result.text)
 
 proc writeImportSymbol(stream: Stream, symbol: ImportSymbol) =
   writeString(stream, symbol.name)
@@ -305,11 +308,6 @@ proc readSourceIndex(
   result.occurrences = indexOccurrences(result.parsed, result.symbols)
   if not validateOccurrences(result.occurrences, result.parsed.tokens):
     invalidCache("cache occurrence index is invalid")
-
-proc canonicalPath(path: string): string =
-  if path.len == 0:
-    return ""
-  result = absolutePath(path).replace('\\', '/')
 
 proc cacheBaseDirectory(): string =
   let configured = getEnv("ONIM_CACHE_DIR")

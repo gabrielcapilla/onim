@@ -1,4 +1,4 @@
-import std/[algorithm, hashes, os, sets, strutils, tables]
+import std/[algorithm, hashes, os, sets, strutils]
 
 import ../index/occurrences
 import ../index/source_index
@@ -39,16 +39,6 @@ proc hasImportRemovals(plan: ImportRemovalPlan): bool =
   for names in plan.symbols:
     if names.len > 0:
       return true
-
-proc moduleLeaf(module: string): string =
-  let normalized = canonicalModule(module)
-  if normalized.len == 0:
-    return
-  let slash = normalized.rfind('/')
-  if slash >= 0 and slash + 1 < normalized.len:
-    normalized[slash + 1 .. ^1]
-  else:
-    normalized
 
 proc diagnosticBelongsToSource(
     diagnostic: CompilerDiagnostic, filePath, materializedPath: string
@@ -132,7 +122,7 @@ proc tokenInPhysicalImport(imports: SourceImports, token: Token): bool =
 
 proc hasIncludedSource(imports: SourceImports): bool =
   for token in imports.tokens:
-    if token.text == "include":
+    if token.isKeyword(kwInclude):
       return true
 
 proc importedNameUsed(
@@ -243,15 +233,14 @@ proc candidatePath(candidate: SymbolCandidate, useStdPrefix: bool): string =
   else:
     candidate.module[4 .. ^1]
 
-proc moduleClass(module: string): int =
+proc moduleClass(module: string): uint8 =
   let normalized = canonicalModule(module)
-  if normalized.startsWith("std/") or normalized == "os" or normalized == "tables" or
-      normalized == "json" or normalized == "strutils":
-    return 0
+  if normalized.startsWith("std/"):
+    return 0'u8
   if normalized.startsWith("./") or normalized.startsWith("../") or
       normalized.startsWith("/"):
-    return 2
-  1
+    return 2'u8
+  1'u8
 
 proc plannedImportOrder(left, right: PlannedImport): int =
   let leftClass = moduleClass(left.candidate.module)
@@ -265,7 +254,7 @@ proc statementEndWithNewline(source: string, item: ImportInfo): int =
 
 proc isStdModule(module: string, stdlib: StdlibMap): bool =
   let normalized = canonicalModule(module)
-  normalized.startsWith("std/") or stdlib.modules.hasKey("std/" & normalized)
+  normalized.startsWith("std/") or ("std/" & normalized) in stdlib.modules
 
 proc canonicalStdModule(module: string): string =
   let normalized = canonicalModule(module)
@@ -489,6 +478,15 @@ proc qualifiedMember(
     return (info.tokens[tokenIndex].text, info.tokens[tokenIndex + 2].text)
   ("", "")
 
+proc mergeIncludedNames(target: var SourceImports, source: SourceImports) =
+  for name in source.localDefinitions:
+    target.localDefinitions.incl name
+    target.availableNames.incl name
+  for name in source.availableNames:
+    target.availableNames.incl name
+  for name in source.qualifiedNames:
+    target.qualifiedNames.incl name
+
 proc importsAvailableFromIncluded(
     sourcePath: string,
     info: var SourceImports,
@@ -498,7 +496,7 @@ proc importsAvailableFromIncluded(
   if depth > 8:
     return
   for tokenIndex, token in info.tokens:
-    if token.text != "include" or tokenIndex + 1 >= info.tokens.len:
+    if not token.isKeyword(kwInclude) or tokenIndex + 1 >= info.tokens.len:
       continue
     let includeToken = info.tokens[tokenIndex + 1]
     var includeName = includeToken.text.strip(chars = {'"', '\'', '`'})
@@ -517,22 +515,10 @@ proc importsAvailableFromIncluded(
     visited.incl absolute
     try:
       let included = parseSourceImports(readFile(absolute))
-      for name in included.localDefinitions:
-        info.localDefinitions.incl name
-        info.availableNames.incl name
-      for name in included.availableNames:
-        info.availableNames.incl name
-      for name in included.qualifiedNames:
-        info.qualifiedNames.incl name
+      mergeIncludedNames(info, included)
       var nested = included
       importsAvailableFromIncluded(absolute, nested, visited, depth + 1)
-      for name in nested.localDefinitions:
-        info.localDefinitions.incl name
-        info.availableNames.incl name
-      for name in nested.availableNames:
-        info.availableNames.incl name
-      for name in nested.qualifiedNames:
-        info.qualifiedNames.incl name
+      mergeIncludedNames(info, nested)
       for item in nested.imports:
         var importedItem = item
         importedItem.synthetic = true

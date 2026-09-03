@@ -3,6 +3,7 @@ import std/unittest
 import onim/index/occurrences
 import onim/index/source_index
 import onim/index/symbols
+import onim/syntax/lexer
 
 proc names(index: SourceIndex): seq[string] =
   for occurrence in index.occurrences.identifiers:
@@ -12,6 +13,17 @@ proc hasRole(roles: set[OccurrenceRole], role: OccurrenceRole): bool =
   role in roles
 
 suite "native identifier occurrences":
+  test "classifies keywords once at the lexer boundary":
+    check keywordId("proc") == kwProc
+    check roleRoutine in keywordRoles(kwProc)
+    check roleDeclaration in keywordRoles(kwProc)
+    check keywordId("notAKeyword") == kwNone
+
+    let tokens = lex("proc run() = discard\n`proc`()")
+    check tokens[0].keyword == kwProc
+    check tokens[6].keyword == kwNone
+    check not tokens[6].isNimKeyword
+
   test "uses numeric source order and Nim identifier style":
     let index = indexSource("let Foo_Bar = 1\nFooBar()\nfooBar()\n")
     check index.occurrences.validateOccurrences(index.parsed.tokens)

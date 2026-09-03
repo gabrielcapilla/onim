@@ -50,7 +50,7 @@ proc addUnique(values: var seq[string], value: string) =
 proc collectExportReferences(tokens: seq[Token], start: int): seq[string] =
   var cursor = start + 1
   while cursor < tokens.len:
-    if tokens[cursor].text == "except":
+    if tokens[cursor].isKeyword(kwExcept):
       break
     if tokens[cursor].text == ",":
       inc cursor
@@ -85,12 +85,12 @@ proc indexSource*(source: string): SourceIndex =
     addUnique(result.imports, canonicalReference(item.module))
 
   for tokenIndex, token in result.parsed.tokens:
-    if token.text == "export":
+    if token.isKeyword(kwExport):
       for reference in collectExportReferences(result.parsed.tokens, tokenIndex):
         addUnique(result.exports, reference)
 
   for tokenIndex, token in result.parsed.tokens:
-    if token.text != "include" or tokenIndex + 1 >= result.parsed.tokens.len:
+    if not token.isKeyword(kwInclude) or tokenIndex + 1 >= result.parsed.tokens.len:
       continue
     var includeName = canonicalReference(result.parsed.tokens[tokenIndex + 1].text)
     if includeName.len == 0:

@@ -6,27 +6,216 @@ type
     tkString
     tkPunctuation
 
+  NimKeyword* = enum
+    kwNone
+    kwAddr
+    kwAnd
+    kwAs
+    kwAsm
+    kwAtomic
+    kwBind
+    kwBlock
+    kwBreak
+    kwCase
+    kwCast
+    kwConcept
+    kwConst
+    kwContinue
+    kwConverter
+    kwDefer
+    kwDiscard
+    kwDistinct
+    kwDiv
+    kwDo
+    kwElif
+    kwElse
+    kwEnd
+    kwEnum
+    kwExcept
+    kwExport
+    kwFinally
+    kwFor
+    kwFrom
+    kwFunc
+    kwGeneric
+    kwIf
+    kwImport
+    kwIn
+    kwInclude
+    kwInterface
+    kwIs
+    kwIsnot
+    kwIterator
+    kwLet
+    kwMacro
+    kwMethod
+    kwMixin
+    kwMod
+    kwNil
+    kwNot
+    kwObject
+    kwOf
+    kwOr
+    kwOut
+    kwProc
+    kwPtr
+    kwRaise
+    kwRef
+    kwReturn
+    kwShl
+    kwShr
+    kwStatic
+    kwTemplate
+    kwTry
+    kwTuple
+    kwType
+    kwUsing
+    kwVar
+    kwWhen
+    kwWhile
+    kwWith
+    kwWithout
+    kwXor
+    kwYield
+
+  KeywordRole* = enum
+    roleRoutine
+    roleDeclaration
+    roleTypeDeclaration
+    roleValueDeclaration
+    roleForBinding
+    roleBindDeclaration
+    roleBlock
+    roleConditional
+    roleInclude
+    roleGenerated
+    roleImport
+    roleFrom
+    roleAlias
+    roleExcept
+    roleExport
+
   Token* = object
     kind*: TokenKind
+    keyword*: NimKeyword
     text*: string
     startOffset*: int
     endOffset*: int
     line*: int
     column*: int
 
-const nimKeywords = [
-  "addr", "and", "as", "asm", "atomic", "bind", "block", "break", "case", "cast",
-  "concept", "const", "continue", "converter", "defer", "discard", "distinct", "div",
-  "do", "elif", "else", "end", "enum", "except", "export", "finally", "for", "from",
-  "func", "generic", "if", "import", "in", "include", "interface", "is", "isnot",
-  "iterator", "let", "macro", "method", "mixin", "mod", "nil", "not", "object", "of",
-  "or", "out", "proc", "ptr", "raise", "ref", "return", "shl", "shr", "static",
-  "template", "try", "tuple", "type", "using", "var", "when", "while", "with",
-  "without", "xor", "yield",
-]
+proc keywordId*(text: string): NimKeyword {.inline.} =
+  case text
+  of "addr": kwAddr
+  of "and": kwAnd
+  of "as": kwAs
+  of "asm": kwAsm
+  of "atomic": kwAtomic
+  of "bind": kwBind
+  of "block": kwBlock
+  of "break": kwBreak
+  of "case": kwCase
+  of "cast": kwCast
+  of "concept": kwConcept
+  of "const": kwConst
+  of "continue": kwContinue
+  of "converter": kwConverter
+  of "defer": kwDefer
+  of "discard": kwDiscard
+  of "distinct": kwDistinct
+  of "div": kwDiv
+  of "do": kwDo
+  of "elif": kwElif
+  of "else": kwElse
+  of "end": kwEnd
+  of "enum": kwEnum
+  of "except": kwExcept
+  of "export": kwExport
+  of "finally": kwFinally
+  of "for": kwFor
+  of "from": kwFrom
+  of "func": kwFunc
+  of "generic": kwGeneric
+  of "if": kwIf
+  of "import": kwImport
+  of "in": kwIn
+  of "include": kwInclude
+  of "interface": kwInterface
+  of "is": kwIs
+  of "isnot": kwIsnot
+  of "iterator": kwIterator
+  of "let": kwLet
+  of "macro": kwMacro
+  of "method": kwMethod
+  of "mixin": kwMixin
+  of "mod": kwMod
+  of "nil": kwNil
+  of "not": kwNot
+  of "object": kwObject
+  of "of": kwOf
+  of "or": kwOr
+  of "out": kwOut
+  of "proc": kwProc
+  of "ptr": kwPtr
+  of "raise": kwRaise
+  of "ref": kwRef
+  of "return": kwReturn
+  of "shl": kwShl
+  of "shr": kwShr
+  of "static": kwStatic
+  of "template": kwTemplate
+  of "try": kwTry
+  of "tuple": kwTuple
+  of "type": kwType
+  of "using": kwUsing
+  of "var": kwVar
+  of "when": kwWhen
+  of "while": kwWhile
+  of "with": kwWith
+  of "without": kwWithout
+  of "xor": kwXor
+  of "yield": kwYield
+  else: kwNone
+
+proc keywordRoles*(keyword: NimKeyword): set[KeywordRole] {.inline.} =
+  case keyword
+  of kwProc, kwFunc, kwIterator, kwMethod, kwConverter:
+    {roleRoutine, roleDeclaration}
+  of kwMacro, kwTemplate:
+    {roleRoutine, roleDeclaration, roleGenerated}
+  of kwType:
+    {roleDeclaration, roleTypeDeclaration}
+  of kwVar, kwLet, kwConst:
+    {roleDeclaration, roleValueDeclaration}
+  of kwFor:
+    {roleDeclaration, roleForBinding, roleBlock}
+  of kwBind:
+    {roleDeclaration, roleBindDeclaration}
+  of kwWhen, kwElif, kwElse:
+    {roleBlock, roleConditional}
+  of kwIf, kwCase, kwWhile, kwBlock, kwTry, kwFinally, kwOf, kwDefer:
+    {roleBlock}
+  of kwExcept:
+    {roleBlock, roleExcept}
+  of kwStatic:
+    {roleConditional}
+  of kwInclude:
+    {roleInclude}
+  of kwMixin:
+    {roleGenerated}
+  of kwImport:
+    {roleImport}
+  of kwFrom:
+    {roleFrom}
+  of kwAs:
+    {roleAlias}
+  of kwExport:
+    {roleExport}
+  else:
+    {}
 
 proc isNimKeyword*(text: string): bool {.inline.} =
-  text in nimKeywords
+  keywordId(text) != kwNone
 
 proc tokenSpan(token: Token): int {.inline.} =
   token.endOffset - token.startOffset
@@ -35,6 +224,20 @@ proc isStropped*(token: Token): bool {.inline.} =
   token.kind == tkIdentifier and token.text.len > 0 and
     tokenSpan(token) >= token.text.len + 1
 
+proc keywordOf*(token: Token): NimKeyword {.inline.} =
+  if token.keyword != kwNone:
+    return token.keyword
+  if token.kind == tkIdentifier and not isStropped(token):
+    return keywordId(token.text)
+  kwNone
+
+proc isKeyword*(token: Token, wanted: NimKeyword): bool {.inline.} =
+  token.kind == tkIdentifier and not isStropped(token) and keywordOf(token) == wanted
+
+proc hasKeywordRole*(token: Token, role: KeywordRole): bool {.inline.} =
+  let keyword = keywordOf(token)
+  keyword != kwNone and role in keywordRoles(keyword)
+
 proc validIdentifier*(token: Token): bool {.inline.} =
   if token.kind != tkIdentifier or token.text.len == 0:
     return false
@@ -42,7 +245,7 @@ proc validIdentifier*(token: Token): bool {.inline.} =
   span == token.text.len or span == token.text.len + 2
 
 proc isNimKeyword*(token: Token): bool {.inline.} =
-  token.kind == tkIdentifier and not isStropped(token) and isNimKeyword(token.text)
+  keywordOf(token) != kwNone
 
 proc isValidNimKeyword*(token: Token): bool {.inline.} =
   validIdentifier(token) and isNimKeyword(token)
@@ -188,6 +391,7 @@ proc lex*(source: string): seq[Token] =
           advance(source, position, line, column)
         result.add Token(
           kind: tkIdentifier,
+          keyword: keywordId(source[start ..< position]),
           text: source[start ..< position],
           startOffset: start,
           endOffset: position,
