@@ -313,6 +313,8 @@ proc publishNativeDiagnostics(workspace: Workspace, snapshot: WorkspaceSnapshot)
       )
     else:
       @[]
+  if diagnostics.len == 0 and workspace.bootstrapState != workspaceBootstrapComplete:
+    return
   sendNativeDiagnostics(uri, snapshot.text, diagnostics)
 
 proc clearNativeDiagnostics(uri: string) =
