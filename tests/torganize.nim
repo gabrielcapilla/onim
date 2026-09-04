@@ -4,6 +4,7 @@ import onim/features/organize
 import onim/index/occurrences
 import onim/index/source_index
 import onim/semantic/compiler_api
+import onim/stdlib/map
 
 const cases = [
   "walkdir", "table", "parsejson", "split", "from", "except", "qualified", "alias",
@@ -88,6 +89,92 @@ suite "organize imports":
     let index = indexSource(source)
     check index.occurrences.isComplete
     check organizeSourceWithIndex("/no/such/file.nim", source, index).len == 0
+
+  test "uses the indexed stdlib surface for compiler-free additions":
+    let source =
+      "proc main() =\n" & "  echo fmt(\"hi\")\n" & "  for k, v in walkDir(\"/tmp\"):\n" &
+      "    discard k\n"
+    let index = indexSource(source)
+    let attempt =
+      tryOrganizeSourceWithIndex("/no/such/file.nim", source, index, loadStdlibMap(""))
+    check attempt.handled
+    check attempt.edits.len == 1
+    check applyEdits(source, attempt.edits) == "import std/[os, strformat]\n\n" & source
+
+  test "organizeSource uses the native index before compiler fallback":
+    let source = "for k, v in walkDir(\"/tmp\"):\n  discard k\n"
+    let edits = organizeSource("/no/such/file.nim", source)
+    check applyEdits(source, edits) == "import std/os\n\n" & source
+
+  test "resolves Nim identifier style in the indexed stdlib surface":
+    let source = "echo parse_json(\"{}\")\n"
+    let index = indexSource(source)
+    let attempt =
+      tryOrganizeSourceWithIndex("/no/such/file.nim", source, index, loadStdlibMap(""))
+    check attempt.handled
+    check applyEdits(source, attempt.edits) == "import std/json\n\n" & source
+
+  test "resolves a qualified indexed stdlib use":
+    let source = "for kind, path in os.walkDir(\"/tmp\"):\n  discard kind\n"
+    let index = indexSource(source)
+    let attempt =
+      tryOrganizeSourceWithIndex("/no/such/file.nim", source, index, loadStdlibMap(""))
+    check attempt.handled
+    check applyEdits(source, attempt.edits) == "import std/os\n\n" & source
+
+  test "does not duplicate a style-insensitive from binding":
+    let source = "from std/json import parse_json\n" & "\n" & "echo parseJson(\"{}\")\n"
+    let index = indexSource(source)
+    let attempt =
+      tryOrganizeSourceWithIndex("/no/such/file.nim", source, index, loadStdlibMap(""))
+    check attempt.handled
+    check attempt.edits.len == 0
+
+  test "falls back when a local declaration can shadow an indexed stdlib name":
+    let source = "proc walkDir() = discard\n" & "proc main() =\n" & "  walkDir()\n"
+    let index = indexSource(source)
+    let attempt =
+      tryOrganizeSourceWithIndex("/no/such/file.nim", source, index, loadStdlibMap(""))
+    check not attempt.handled
+    check attempt.edits.len == 0
+
+  test "keeps a used indexed stdlib import without compiler validation":
+    let source =
+      "import std/os\n" & "\n" & "proc main() =\n" & "  discard walkDir(\"/tmp\")\n"
+    let index = indexSource(source)
+    let attempt =
+      tryOrganizeSourceWithIndex("/no/such/file.nim", source, index, loadStdlibMap(""))
+    check attempt.handled
+    check attempt.edits.len == 0
+
+  test "removes unused indexed stdlib imports without compiler validation":
+    let root = currentSourcePath().parentDir.parentDir
+    for name in ["unused", "unused_grouped", "unused_from", "unused_separate"]:
+      let before = readFile(root / "tests" / "before" / (name & ".nim"))
+      let expected = readFile(root / "tests" / "after" / (name & ".nim"))
+      let index = indexSource(before)
+      let attempt = tryOrganizeSourceWithIndex(
+        "/no/such/file.nim", before, index, loadStdlibMap("")
+      )
+      check attempt.handled
+      check applyEdits(before, attempt.edits) == expected
+
+  test "combines native additions with removals":
+    let source = "import std/os\n\necho fmt(\"hi\")\n"
+    let index = indexSource(source)
+    let attempt =
+      tryOrganizeSourceWithIndex("/no/such/file.nim", source, index, loadStdlibMap(""))
+    check attempt.handled
+    check applyEdits(source, attempt.edits) ==
+      "import std/strformat\n\necho fmt(\"hi\")\n"
+
+  test "keeps a native module for unknown qualified members":
+    let source = "import std/os\n\ndiscard os.someFutureMember()\n"
+    let index = indexSource(source)
+    let attempt =
+      tryOrganizeSourceWithIndex("/no/such/file.nim", source, index, loadStdlibMap(""))
+    check attempt.handled
+    check attempt.edits.len == 0
 
   test "keeps diagnostic locations when paths contain parentheses":
     let root = getTempDir() / ("onim-(diagnostic)-" & $getCurrentProcessId())

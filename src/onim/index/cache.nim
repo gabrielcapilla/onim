@@ -227,9 +227,7 @@ proc validateImport(item: ImportInfo, sourceLength: int) =
     if not validSpan(symbol.startOffset, symbol.endOffset, sourceLength):
       invalidCache("cache imported-symbol range is invalid")
 
-proc validateSourceSymbol(
-    symbol: SourceSymbol, tokens: seq[Token], previousToken: uint32
-) =
+proc validateSourceSymbol[T](symbol: SourceSymbol, tokens: T, previousToken: uint32) =
   if symbol.nameToken >= uint32(tokens.len) or
       (previousToken != high(uint32) and symbol.nameToken <= previousToken) or
       tokens[int(symbol.nameToken)].kind != tkIdentifier:
@@ -271,11 +269,12 @@ proc readSourceIndex(
     invalidCache("cache source fingerprint does not match")
 
   let tokenCount = readCount(stream, maxRecordCount)
-  result.parsed.tokens = newSeqOfCap[Token](tokenCount)
+  var tokens = newSeqOfCap[Token](tokenCount)
   for _ in 0 ..< tokenCount:
     let token = readToken(stream)
     validateToken(token, expectedLength)
-    result.parsed.tokens.add token
+    tokens.add token
+  result.parsed.tokens = initTokenStore(tokens)
   if result.tokenCount != tokenCount:
     invalidCache("cache token count does not match")
 
@@ -343,7 +342,7 @@ proc projectManifestPath*(projectRoot: string): string =
 proc temporaryCachePath(path: string): string =
   path & ".tmp." & $getCurrentProcessId() & "." & $epochTime()
 
-proc fileStamp*(path: string): FileStamp =
+proc fileStamp*(path: string): FileStamp {.gcsafe.} =
   try:
     let info = getFileInfo(path)
     result.size = int64(info.size)
@@ -354,7 +353,7 @@ proc fileStamp*(path: string): FileStamp =
     result.modifiedSeconds = -1
     result.modifiedNanoseconds = -1
 
-proc sameFileStamp*(left, right: FileStamp): bool =
+proc sameFileStamp*(left, right: FileStamp): bool {.gcsafe.} =
   left.size == right.size and left.modifiedSeconds == right.modifiedSeconds and
     left.modifiedNanoseconds == right.modifiedNanoseconds
 
@@ -438,7 +437,7 @@ proc readManifestEnvelope(stream: Stream, projectRoot: string): ProjectManifest 
   if not payloadStream.atEnd:
     invalidCache("manifest payload contains trailing data")
 
-proc loadProjectManifest*(projectRoot: string): ProjectManifest =
+proc loadProjectManifest*(projectRoot: string): ProjectManifest {.gcsafe.} =
   result.root = canonicalPath(projectRoot)
   let path = projectManifestPath(projectRoot)
   if path.len == 0 or not fileExists(path):
@@ -588,16 +587,18 @@ proc readEnvelope(
 
 proc loadCachedSourceIndexFingerprint*(
   projectRoot, modulePath: string, sourceHash: uint64, byteLength: int
-): SourceIndex
+): SourceIndex {.gcsafe.}
 
-proc loadCachedSourceIndex*(projectRoot, modulePath, source: string): SourceIndex =
+proc loadCachedSourceIndex*(
+    projectRoot, modulePath, source: string
+): SourceIndex {.gcsafe.} =
   result = loadCachedSourceIndexFingerprint(
     projectRoot, modulePath, contentFingerprint(source), source.len
   )
 
 proc loadCachedSourceIndexFingerprint*(
     projectRoot, modulePath: string, sourceHash: uint64, byteLength: int
-): SourceIndex =
+): SourceIndex {.gcsafe.} =
   let path = cacheFilePath(projectRoot, modulePath)
   if path.len == 0 or not fileExists(path):
     return
@@ -618,7 +619,7 @@ proc loadCachedSourceIndexFingerprint*(
 
 proc saveCachedSourceIndex*(
     projectRoot, modulePath, source: string, index: SourceIndex
-): bool =
+): bool {.gcsafe.} =
   if projectRoot.len == 0 or modulePath.len == 0 or index == nil or
       index.contentHash != contentFingerprint(source) or index.byteLength != source.len:
     return false

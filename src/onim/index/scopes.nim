@@ -56,11 +56,9 @@ proc `==`*(left, right: ScopeId): bool {.borrow.}
 proc malformedToken(token: Token): bool {.inline.} =
   if token.kind == tkIdentifier:
     return not validIdentifier(token)
-  if token.kind != tkString or token.text.len < 2:
-    return token.kind == tkString
-  if token.text.startsWith("\"\"\""):
-    return not token.text.endsWith("\"\"\"")
-  token.text[0] notin {'\"', '\''} or token.text[^1] != token.text[0]
+  if token.kind == tkString:
+    return not isClosedString(token)
+  false
 
 proc isRoutineKind(kind: SourceSymbolKind): bool {.inline.} =
   kind in {
@@ -75,25 +73,20 @@ proc isBlockKeyword(token: Token): bool {.inline.} =
   token.hasKeywordRole(roleBlock)
 
 proc pushDelimiter(stack: var seq[char], text: string): bool {.inline.} =
-  if text.len != 1 or text[0] notin {'(', '[', '{'}:
+  if text.len != 1 or not isOpeningDelimiter(text[0]):
     return false
   stack.add text[0]
   true
 
 proc popDelimiter(stack: var seq[char], text: string): bool {.inline.} =
-  if text.len != 1 or text[0] notin {')', ']', '}'} or stack.len == 0:
+  if text.len != 1 or not isClosingDelimiter(text[0]) or stack.len == 0:
     return false
-  let wanted =
-    case text[0]
-    of ')': '('
-    of ']': '['
-    else: '{'
-  if stack[^1] != wanted:
+  if not matchingDelimiter(stack[^1], text[0]):
     return false
   stack.setLen(stack.len - 1)
   true
 
-proc markMalformed(tokens: openArray[Token], result: var ScopeIndex) =
+proc markMalformed[T](tokens: T, result: var ScopeIndex) =
   var delimiters: seq[char] = @[]
   for token in tokens:
     if malformedToken(token):
@@ -102,13 +95,13 @@ proc markMalformed(tokens: openArray[Token], result: var ScopeIndex) =
       continue
     if pushDelimiter(delimiters, token.text):
       continue
-    if token.text.len == 1 and token.text[0] in {')', ']', '}'} and
+    if token.text.len == 1 and isClosingDelimiter(token.text[0]) and
         not popDelimiter(delimiters, token.text):
       result.uncertainty.incl scopeMalformed
   if delimiters.len > 0:
     result.uncertainty.incl scopeMalformed
 
-proc markGlobalUncertainty(tokens: openArray[Token], result: var ScopeIndex) =
+proc markGlobalUncertainty[T](tokens: T, result: var ScopeIndex) =
   for token in tokens:
     if token.kind != tkIdentifier or not validIdentifier(token) or isStropped(token):
       continue
@@ -119,9 +112,7 @@ proc markGlobalUncertainty(tokens: openArray[Token], result: var ScopeIndex) =
     elif token.hasKeywordRole(roleGenerated):
       result.uncertainty.incl scopeGenerated
 
-proc matchingParen(
-    tokens: openArray[Token], opening: int
-): tuple[closing: int, valid: bool] =
+proc matchingParen[T](tokens: T, opening: int): tuple[closing: int, valid: bool] =
   var stack: seq[char] = @[]
   for index in opening ..< tokens.len:
     let text = tokens[index].text
@@ -134,8 +125,8 @@ proc matchingParen(
         return (index, true)
   (-1, false)
 
-proc routineHeader(
-    tokens: openArray[Token], nameToken: int
+proc routineHeader[T](
+    tokens: T, nameToken: int
 ): tuple[start, opening, closing, equals: int, valid, hasBody: bool] =
   result.start = nameToken - 1
   result.opening = -1
@@ -199,8 +190,8 @@ proc routineHeader(
     return
   result.hasBody = tokens[result.equals].line == tokens[result.start].line
 
-proc declarationGroup(
-    tokens: openArray[Token],
+proc declarationGroup[T](
+    tokens: T,
     first, last: int,
     scope: ScopeId,
     kind: LexicalDeclarationKind,
@@ -263,8 +254,8 @@ proc declarationGroup(
       return false
   true
 
-proc parameters(
-    tokens: openArray[Token],
+proc parameters[T](
+    tokens: T,
     opening, closing: int,
     scope: ScopeId,
     declarations: var seq[LexicalDeclaration],
@@ -299,8 +290,8 @@ proc parameters(
     return false
   true
 
-proc bodyBounds(
-    tokens: openArray[Token], equals: int
+proc bodyBounds[T](
+    tokens: T, equals: int
 ): tuple[first, past, baseColumn: int, valid: bool] =
   if equals < 0 or equals + 1 >= tokens.len:
     return
@@ -324,7 +315,7 @@ proc bodyBounds(
     inc result.past
   result.valid = result.past > result.first
 
-proc statementStart(tokens: openArray[Token], index, first, baseColumn: int): bool =
+proc statementStart[T](tokens: T, index, first, baseColumn: int): bool =
   if index == first:
     return true
   if tokens[index].text == ";":
@@ -333,7 +324,7 @@ proc statementStart(tokens: openArray[Token], index, first, baseColumn: int): bo
     return true
   tokens[index].line != tokens[index - 1].line and tokens[index].column == baseColumn
 
-proc localDeclarationEnd(tokens: openArray[Token], start, past, baseColumn: int): int =
+proc localDeclarationEnd[T](tokens: T, start, past, baseColumn: int): int =
   result = start + 1
   while result < past:
     if tokens[result].text == ";":
@@ -342,8 +333,8 @@ proc localDeclarationEnd(tokens: openArray[Token], start, past, baseColumn: int)
       break
     inc result
 
-proc locals(
-    tokens: openArray[Token],
+proc locals[T](
+    tokens: T,
     bounds: tuple[first, past, baseColumn: int, valid: bool],
     scope: ScopeId,
     declarations: var seq[LexicalDeclaration],
@@ -380,13 +371,13 @@ proc locals(
       result.uncertainty.incl scopeNestedBlock
     inc index
 
-proc routineBodyEnd(tokens: openArray[Token], past, byteLength: int): int =
+proc routineBodyEnd[T](tokens: T, past, byteLength: int): int =
   if past >= tokens.len:
     return byteLength
   tokens[past].startOffset
 
-proc indexedRoutine(
-    tokens: openArray[Token],
+proc indexedRoutine[T](
+    tokens: T,
     symbol: SourceSymbol,
     symbolIndex: int,
     byteLength: int,
@@ -439,8 +430,8 @@ proc indexedRoutine(
     result.uncertainty.incl scopeUnsupportedHeader
   locals(tokens, bounds, scope, result.declarations, result)
 
-proc indexScopes*(
-    tokens: openArray[Token], symbols: openArray[SourceSymbol], byteLength: int
+proc indexScopes*[T](
+    tokens: T, symbols: openArray[SourceSymbol], byteLength: int
 ): ScopeIndex =
   result.scopes.add ScopeInterval(
     parent: InvalidScopeId,
@@ -475,11 +466,8 @@ proc scopeContains(index: ScopeIndex, scope: ScopeId, token: uint32): bool =
   ordinal >= 0 and ordinal < index.scopes.len and
     index.scopes[ordinal].containsToken(token)
 
-proc validateScopes*(
-    index: ScopeIndex,
-    tokens: openArray[Token],
-    symbols: openArray[SourceSymbol],
-    byteLength: int,
+proc validateScopes*[T](
+    index: ScopeIndex, tokens: T, symbols: openArray[SourceSymbol], byteLength: int
 ): bool =
   if byteLength < 0 or index.scopes.len == 0:
     return false

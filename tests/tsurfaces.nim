@@ -75,6 +75,18 @@ suite "native module surfaces":
     check index.lookup("answer").kind == surfaceUnknown
     check index.lookup("missing").kind == surfaceUnknown
 
+  test "resolves owner-relative modules without merging duplicate leaves":
+    let index = buildSurfaceIndex(
+      @[
+        SurfaceInput(module: "pkg/provider", origin: surfaceProject),
+        SurfaceInput(module: "other/provider", origin: surfaceProject),
+      ],
+      universeComplete = true,
+    )
+    check index.moduleForReference("provider", "pkg/consumer") == "pkg/provider"
+    check index.moduleForReference("provider", "other/consumer") == "other/provider"
+    check index.moduleForReference("provider", "main") == ""
+
   test "converts exported source declarations into the same surface":
     let source = indexSource("proc answer*()\n")
     let input = projectSurfaceInput("project/main", source)
@@ -82,13 +94,16 @@ suite "native module surfaces":
     check input.exports[0].name == "answer"
     let index = buildSurfaceIndex(@[input], universeComplete = true)
     check index.valid
-    check index.lookup("answer").kind == surfaceUnknown
-    check index.lookup("private").kind == surfaceUnknown
+    check index.universeIsComplete
+    check index.lookup("answer").kind == surfaceResolved
+    check index.lookup("private").kind == surfaceUnresolved
 
   test "uses the complete generated map without fallback rows":
     let stdlib = loadStdlibMap("")
     check stdlib.surface.valid
     check stdlib.surface.universeIsComplete
+    check stdlib.surfaceIsComplete
+    check stdlib.implicitModule("std/system")
     let walkDir = stdlib.surface.lookupInModule("std/os", "walkDir")
     check walkDir.kind == surfaceResolved
     check walkDir.candidates.len == 1

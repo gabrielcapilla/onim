@@ -1,7 +1,9 @@
 import std/[algorithm, hashes, os, sets, strutils]
 
 import ../index/occurrences
+import ../index/scopes
 import ../index/source_index
+import ../index/symbols
 import ../semantic/compiler_api
 import ../stdlib/map
 import ../syntax/imports
@@ -24,6 +26,20 @@ type
   OrganizeOptions* = object
     useStdPrefix*: bool
 
+  NativeBindingState = enum
+    nativeNoBinding
+    nativeBound
+    nativeUnknown
+
+  NativeModuleUse = enum
+    nativeModuleUseNone
+    nativeModuleUseFound
+    nativeModuleUseUnknown
+
+  NativeRemovalState = enum
+    nativeRemovalUnsupported
+    nativeRemovalReady
+
 proc defaultOrganizeOptions*(): OrganizeOptions =
   OrganizeOptions(useStdPrefix: true)
 
@@ -39,6 +55,19 @@ proc hasImportRemovals(plan: ImportRemovalPlan): bool =
   for names in plan.symbols:
     if names.len > 0:
       return true
+
+proc promoteEmptyFromImports(imports: SourceImports, plan: var ImportRemovalPlan) =
+  for index, item in imports.imports:
+    if item.form != fromModule or plan.symbols[index].len == 0:
+      continue
+    var allSymbolsRemoved = item.importedSymbols.len > 0
+    for symbol in item.importedSymbols:
+      if symbol.name notin plan.symbols[index]:
+        allSymbolsRemoved = false
+        break
+    if allSymbolsRemoved:
+      plan.symbols[index].clear
+      plan.whole.incl index
 
 proc diagnosticBelongsToSource(
     diagnostic: CompilerDiagnostic, filePath, materializedPath: string
@@ -114,12 +143,6 @@ proc findUnusedImport(
       ambiguous = true
   if ambiguous: -1 else: bestIndex
 
-proc tokenInPhysicalImport(imports: SourceImports, token: Token): bool =
-  for item in imports.imports:
-    if not item.synthetic and token.startOffset >= item.startOffset and
-        token.endOffset <= item.endOffset:
-      return true
-
 proc hasIncludedSource(imports: SourceImports): bool =
   for token in imports.tokens:
     if token.isKeyword(kwInclude):
@@ -130,7 +153,7 @@ proc importedNameUsed(
 ): bool =
   for tokenIndex, token in imports.tokens:
     if token.kind != tkIdentifier or token.text != name or
-        token.startOffset <= item.endOffset or tokenInPhysicalImport(imports, token):
+        token.startOffset <= item.endOffset or imports.tokenInsideImport(token):
       continue
     if tokenIndex > 0 and imports.tokens[tokenIndex - 1].text == ".":
       continue
@@ -173,17 +196,7 @@ proc collectUnusedImportPlan(
           not importedNameUsed(source, imports, item, symbol.name):
         result.plan.symbols[index].incl symbol.name
 
-  for index, item in imports.imports:
-    if item.form != fromModule or result.plan.symbols[index].len == 0:
-      continue
-    var allSymbolsRemoved = item.importedSymbols.len > 0
-    for symbol in item.importedSymbols:
-      if symbol.name notin result.plan.symbols[index]:
-        allSymbolsRemoved = false
-        break
-    if allSymbolsRemoved:
-      result.plan.symbols[index].clear
-      result.plan.whole.incl index
+  promoteEmptyFromImports(imports, result.plan)
 
 proc activeImportInfo(imports: SourceImports, plan: ImportRemovalPlan): SourceImports =
   result = cloneSourceImports(imports)
@@ -897,6 +910,417 @@ proc validatesEdits(
       return false
   true
 
+proc renderImportAdditions(
+    source: string,
+    imports: SourceImports,
+    candidates: seq[PlannedImport],
+    stdlib: StdlibMap,
+    options: OrganizeOptions,
+    newline: string,
+): seq[ImportEdit] =
+  var stdCandidates: seq[PlannedImport] = @[]
+  var otherCandidates: seq[PlannedImport] = @[]
+  for planned in candidates:
+    if not planned.fromImport and
+        canonicalModule(planned.candidate.module).startsWith("std/"):
+      stdCandidates.add planned
+    else:
+      otherCandidates.add planned
+
+  let existingStd = groupableStdImports(source, imports, stdlib)
+  if stdCandidates.len > 0 and existingStd.len > 0:
+    var existingStdModules: seq[string] = @[]
+    for statement in existingStd:
+      for module in stdModulesOnStatement(imports, statement, stdlib):
+        addUniqueStdModule(existingStdModules, module)
+
+    let insertion =
+      sourceImportInsertion(source, imports, stdCandidates[0].candidate, stdlib, true)
+    let replacementEnd = statementEndWithNewline(source, existingStd[0])
+    var mergeOtherCandidates = false
+    if otherCandidates.len > 0:
+      var orderedOther = otherCandidates
+      orderedOther.sort(plannedImportOrder)
+      let otherInsertion =
+        sourceImportInsertion(source, imports, orderedOther[0].candidate, stdlib)
+      for item in existingStd:
+        let lineStart = item.startOffset - item.indent.len
+        let lineEnd = statementEndWithNewline(source, item)
+        if otherInsertion >= lineStart and otherInsertion < lineEnd:
+          mergeOtherCandidates = true
+          break
+
+    var replacementCandidates = stdCandidates
+    if mergeOtherCandidates:
+      replacementCandidates = candidates
+      otherCandidates.setLen(0)
+    result.add ImportEdit(
+      startOffset: insertion,
+      endOffset: replacementEnd,
+      newText: renderNewImports(
+        replacementCandidates, options.useStdPrefix, newline, existingStdModules
+      ),
+    )
+    if existingStd.len > 1:
+      for index in 1 ..< existingStd.len:
+        let item = existingStd[index]
+        result.add ImportEdit(
+          startOffset: item.startOffset - item.indent.len,
+          endOffset: statementEndWithNewline(source, item),
+          newText: "",
+        )
+
+    if otherCandidates.len > 0:
+      var orderedOther = otherCandidates
+      orderedOther.sort(plannedImportOrder)
+      let otherInsertion =
+        sourceImportInsertion(source, imports, orderedOther[0].candidate, stdlib)
+      result.add ImportEdit(
+        startOffset: otherInsertion,
+        endOffset: otherInsertion,
+        newText: renderNewImports(otherCandidates, options.useStdPrefix, newline),
+      )
+  elif candidates.len > 0:
+    var orderedModules = candidates
+    orderedModules.sort(plannedImportOrder)
+    let insertion =
+      sourceImportInsertion(source, imports, orderedModules[0].candidate, stdlib)
+    var newText = renderNewImports(candidates, options.useStdPrefix, newline)
+    var physicalImportCount = 0
+    for item in imports.imports:
+      if not item.synthetic:
+        inc physicalImportCount
+    if physicalImportCount == 0:
+      newText.add newline
+    result.add ImportEdit(
+      startOffset: insertion, endOffset: insertion, newText: newText
+    )
+
+proc scopeAncestor(index: SourceIndex, ancestor, descendant: ScopeId): bool =
+  var current = descendant
+  while current != InvalidScopeId:
+    if current == ancestor:
+      return true
+    let ordinal = int(uint32(current)) - 1
+    if ordinal < 0 or ordinal >= index.scopes.scopes.len:
+      return false
+    current = index.scopes.scopes[ordinal].parent
+  false
+
+proc hasLocalDefinition(info: SourceImports, name: string): bool =
+  for definedName in info.localDefinitions:
+    if sameIdentifier(definedName, name):
+      return true
+
+proc forBindingState(
+    index: SourceIndex, name: string, tokenIndex: int
+): NativeBindingState =
+  if index == nil:
+    return nativeUnknown
+  for forIndex, forToken in index.parsed.tokens:
+    if not forToken.hasKeywordRole(roleForBinding):
+      continue
+    var cursor = forIndex + 1
+    var separator = -1
+    var foundName = false
+    while cursor < index.parsed.tokens.len and
+        index.parsed.tokens[cursor].line == forToken.line:
+      let token = index.parsed.tokens[cursor]
+      if token.text == "in" or token.text == "=" or token.text == ":":
+        separator = cursor
+        break
+      if token.kind == tkIdentifier and not isNimKeyword(token) and
+          sameIdentifier(token.text, name):
+        foundName = true
+      inc cursor
+    if not foundName:
+      continue
+    if tokenIndex <= forIndex or separator < 0 or tokenIndex <= separator:
+      return nativeUnknown
+    if index.parsed.tokens[tokenIndex].line == forToken.line:
+      cursor = separator + 1
+      while cursor < index.parsed.tokens.len and
+          index.parsed.tokens[cursor].line == forToken.line and
+          index.parsed.tokens[cursor].text != ":"
+      :
+        inc cursor
+      if tokenIndex >= cursor:
+        return nativeBound
+      return nativeUnknown
+    if index.parsed.tokens[tokenIndex].column > forToken.column:
+      return nativeBound
+    return nativeUnknown
+  return nativeNoBinding
+
+proc nativeBinding(
+    info: SourceImports, index: SourceIndex, name: string, tokenIndex: int
+): NativeBindingState =
+  if index == nil or tokenIndex < 0 or tokenIndex >= index.parsed.tokens.len:
+    return nativeUnknown
+  var found = false
+  for symbol in index.symbols:
+    let symbolIndex = int(symbol.nameToken)
+    if symbolIndex < 0 or symbolIndex >= index.parsed.tokens.len or
+        index.parsed.tokens[symbolIndex].column != 0 or
+        not sameIdentifier(index.parsed.tokens[symbolIndex].text, name):
+      continue
+    found = true
+    if symbolIndex >= tokenIndex:
+      return nativeUnknown
+    result = nativeBound
+
+  let occurrenceScope = index.scopes.innermostScopeAt(uint32(tokenIndex))
+  for declaration in index.scopes.declarations:
+    let declarationIndex = int(declaration.nameToken)
+    if declarationIndex < 0 or declarationIndex >= index.parsed.tokens.len or
+        not sameIdentifier(index.parsed.tokens[declarationIndex].text, name) or
+        not scopeAncestor(index, declaration.scope, occurrenceScope):
+      continue
+    found = true
+    if declarationIndex >= tokenIndex:
+      return nativeUnknown
+    result = nativeBound
+
+  let forBinding = forBindingState(index, name, tokenIndex)
+  if forBinding != nativeNoBinding:
+    return forBinding
+  if found:
+    return
+  if hasLocalDefinition(info, name):
+    return nativeUnknown
+  return nativeNoBinding
+
+proc nativeNameUse(
+    info: SourceImports, index: SourceIndex, itemEnd: int, name: string
+): NativeModuleUse =
+  for occurrence in index.occurrences.identifiers:
+    let tokenIndex = int(occurrence.token)
+    if tokenIndex < 0 or tokenIndex >= index.parsed.tokens.len:
+      continue
+    let token = index.parsed.tokens[tokenIndex]
+    if token.startOffset <= itemEnd or not sameIdentifier(token.text, name):
+      continue
+    if tokenIndex > 0 and index.parsed.tokens[tokenIndex - 1].text == ".":
+      continue
+    case nativeBinding(info, index, token.text, tokenIndex)
+    of nativeBound:
+      discard
+    of nativeUnknown:
+      return nativeModuleUseUnknown
+    of nativeNoBinding:
+      if hasLocalDefinition(info, name):
+        return nativeModuleUseUnknown
+      return nativeModuleUseFound
+  nativeModuleUseNone
+
+proc nativeUnqualifiedUse(stdlib: StdlibMap, name, module: string): NativeModuleUse =
+  let resolved = stdlib.resolveUniqueCandidate(name, "", -1)
+  case resolved.state
+  of candidateResolutionMissing:
+    nativeModuleUseNone
+  of candidateResolutionAmbiguous:
+    for candidate in stdlib.candidatesFor(name, "", -1):
+      if sameModule(candidate.module, module):
+        return nativeModuleUseUnknown
+    nativeModuleUseNone
+  of candidateResolutionResolved:
+    if sameModule(resolved.candidate.module, module):
+      nativeModuleUseFound
+    else:
+      nativeModuleUseNone
+
+proc nativeModuleUsed(
+    info: SourceImports, index: SourceIndex, item: ImportInfo, stdlib: StdlibMap
+): NativeModuleUse =
+  let module = canonicalModule(item.module)
+  let qualifier =
+    if item.alias.len > 0:
+      item.alias
+    else:
+      moduleLeaf(item.module)
+  for occurrence in index.occurrences.identifiers:
+    let tokenIndex = int(occurrence.token)
+    if tokenIndex < 0 or tokenIndex >= index.parsed.tokens.len:
+      continue
+    let token = index.parsed.tokens[tokenIndex]
+    if token.startOffset <= item.endOffset:
+      continue
+
+    if tokenIndex >= 2 and index.parsed.tokens[tokenIndex - 1].text == ".":
+      let qualifierIndex = tokenIndex - 2
+      let qualifierToken = index.parsed.tokens[qualifierIndex]
+      if qualifierToken.kind == tkIdentifier and
+          (qualifierIndex == 0 or index.parsed.tokens[qualifierIndex - 1].text != ".") and
+      (
+        tokenIndex + 1 >= index.parsed.tokens.len or
+        index.parsed.tokens[tokenIndex + 1].text != "."
+      ) and sameIdentifier(qualifierToken.text, qualifier):
+        let binding = nativeBinding(info, index, qualifierToken.text, qualifierIndex)
+        if binding == nativeUnknown:
+          return nativeModuleUseUnknown
+        if binding == nativeNoBinding:
+          return nativeModuleUseFound
+      if qualifierToken.kind == tkIdentifier and
+          sameIdentifier(qualifierToken.text, qualifier):
+        let binding = nativeBinding(info, index, qualifierToken.text, qualifierIndex)
+        if binding == nativeUnknown:
+          return nativeModuleUseUnknown
+      continue
+
+    if tokenIndex > 0 and index.parsed.tokens[tokenIndex - 1].text == "." or
+        tokenIndex + 1 < index.parsed.tokens.len and
+        index.parsed.tokens[tokenIndex + 1].text == ".":
+      continue
+    if item.alias.len == 0:
+      let binding = nativeBinding(info, index, token.text, tokenIndex)
+      if binding == nativeUnknown:
+        return nativeModuleUseUnknown
+      if binding == nativeNoBinding:
+        let use = nativeUnqualifiedUse(stdlib, token.text, module)
+        if use != nativeModuleUseNone:
+          return use
+  nativeModuleUseNone
+
+proc nativeImportRemovalPlan(
+    info: SourceImports, index: SourceIndex, stdlib: StdlibMap
+): tuple[state: NativeRemovalState, plan: ImportRemovalPlan] =
+  result.plan = initImportRemovalPlan(info)
+  if not info.nativeIndexSafe(index):
+    return
+  for itemIndex, item in info.imports:
+    let module = canonicalModule(item.module)
+    if not module.startsWith("std/") or module notin stdlib.modules:
+      return
+    if item.keep:
+      continue
+    case item.form
+    of importModule:
+      case nativeModuleUsed(info, index, item, stdlib)
+      of nativeModuleUseFound:
+        discard
+      of nativeModuleUseNone:
+        result.plan.whole.incl itemIndex
+      of nativeModuleUseUnknown:
+        return
+    of fromModule:
+      if item.importedSymbols.len == 0:
+        return
+      for imported in item.importedSymbols:
+        case nativeNameUse(info, index, item.endOffset, imported.name)
+        of nativeModuleUseFound:
+          discard
+        of nativeModuleUseNone:
+          result.plan.symbols[itemIndex].incl imported.name
+        of nativeModuleUseUnknown:
+          return
+  promoteEmptyFromImports(info, result.plan)
+  result.state = nativeRemovalReady
+
+proc nativeProvidesName(info: SourceImports, name: string): bool =
+  for item in info.imports:
+    if item.synthetic or item.conditional or item.form != fromModule:
+      continue
+    for imported in item.importedSymbols:
+      if sameIdentifier(imported.name, name):
+        return true
+
+proc nativeImportAdditions(
+    source: string, info: SourceImports, index: SourceIndex, stdlib: StdlibMap
+): tuple[safe: bool, candidates: seq[PlannedImport]] =
+  result.safe = true
+  for occurrence in index.occurrences.identifiers:
+    let tokenIndex = int(occurrence.token)
+    if tokenIndex < 0 or tokenIndex >= index.parsed.tokens.len:
+      continue
+    let token = index.parsed.tokens[tokenIndex]
+
+    var name = token.text
+    var qualifier = ""
+    if tokenIndex >= 2 and index.parsed.tokens[tokenIndex - 1].text == ".":
+      let qualifierIndex = tokenIndex - 2
+      if qualifierIndex < 0 or index.parsed.tokens[qualifierIndex].kind != tkIdentifier or
+          (qualifierIndex > 0 and index.parsed.tokens[qualifierIndex - 1].text == "."):
+        continue
+      qualifier = index.parsed.tokens[qualifierIndex].text
+      let binding = nativeBinding(info, index, qualifier, qualifierIndex)
+      if binding == nativeBound:
+        continue
+      if binding == nativeUnknown:
+        result.safe = false
+        return
+    elif tokenIndex > 0 and index.parsed.tokens[tokenIndex - 1].text == "." or
+        tokenIndex + 1 < index.parsed.tokens.len and
+        index.parsed.tokens[tokenIndex + 1].text == ".":
+      continue
+
+    let resolved = stdlib.resolveUniqueCandidate(
+      name, qualifier, callArity(info, source, tokenIndex)
+    )
+    if resolved.state == candidateResolutionMissing:
+      continue
+    if qualifier.len == 0:
+      let binding = nativeBinding(info, index, token.text, tokenIndex)
+      if binding == nativeBound:
+        continue
+      if binding == nativeUnknown:
+        result.safe = false
+        return
+    if resolved.state == candidateResolutionAmbiguous:
+      result.safe = false
+      return
+    let candidate = resolved.candidate
+    if stdlib.implicitModule(candidate.module):
+      continue
+    if candidate.module.len == 0 or
+        not canonicalModule(candidate.module).startsWith("std/") or
+        canonicalModule(candidate.module) notin stdlib.modules:
+      result.safe = false
+      return
+    if nativeProvidesName(info, name) or
+        (qualifier.len > 0 and info.providesQualifier(qualifier)) or
+        findExistingModule(info, candidate.module).plain >= 0:
+      continue
+    addUniqueModule(result.candidates, candidate, false)
+
+proc tryOrganizeSourceWithIndex*(
+    filePath, source: string,
+    index: SourceIndex,
+    stdlib: StdlibMap,
+    options = defaultOrganizeOptions(),
+): tuple[handled: bool, edits: seq[ImportEdit]] =
+  if filePath.toLowerAscii.endsWith(".nimble") or filePath.toLowerAscii.endsWith(".cfg") or
+      index == nil or index.contentHash != contentFingerprint(source) or
+      index.byteLength != source.len or index.tokenCount != index.parsed.tokens.len or
+      not index.scopes.validateScopes(
+        index.parsed.tokens, index.symbols, index.byteLength
+      ) or not index.occurrences.validateOccurrences(index.parsed.tokens) or
+      not stdlib.surfaceIsComplete:
+    return
+  let info = index.parsed
+  let nativeRemovals = nativeImportRemovalPlan(info, index, stdlib)
+  if nativeRemovals.state != nativeRemovalReady:
+    return
+  result.handled = true
+  let activeInfo = activeImportInfo(info, nativeRemovals.plan)
+  let newline = if source.contains("\r\n"): "\r\n" else: "\n"
+  let additions = nativeImportAdditions(source, activeInfo, index, stdlib)
+  if not additions.safe:
+    result.handled = false
+    return
+  result.edits = renderImportAdditions(
+    source, activeInfo, additions.candidates, stdlib, options, newline
+  )
+  var removals = unusedImportEdits(
+    source, info, nativeRemovals.plan, stdlib, options.useStdPrefix, newline
+  )
+  if additions.candidates.len == 0:
+    let grouped = groupedStdRemovalEdits(
+      source, info, nativeRemovals.plan, stdlib, options.useStdPrefix, newline
+    )
+    if grouped.len > 0:
+      removals = combineImportEdits(grouped, removals)
+  result.edits = combineImportEdits(result.edits, removals)
+
 proc organizeSourceImpl(
     filePath, source: string,
     info: var SourceImports,
@@ -978,84 +1402,10 @@ proc organizeSourceImpl(
     addUniqueModule(newModules, candidate, false)
 
   if newModules.len > 0:
-    var stdCandidates: seq[PlannedImport] = @[]
-    var otherCandidates: seq[PlannedImport] = @[]
-    for planned in newModules:
-      if not planned.fromImport and
-          canonicalModule(planned.candidate.module).startsWith("std/"):
-        stdCandidates.add planned
-      else:
-        otherCandidates.add planned
-
-    let existingStd = groupableStdImports(source, activeInfo, stdlib)
-    if stdCandidates.len > 0 and existingStd.len > 0:
-      var existingStdModules: seq[string] = @[]
-      for statement in existingStd:
-        for module in stdModulesOnStatement(activeInfo, statement, stdlib):
-          addUniqueStdModule(existingStdModules, module)
-
-      let insertion = sourceImportInsertion(
-        source, activeInfo, stdCandidates[0].candidate, stdlib, true
-      )
-      let replacementEnd = statementEndWithNewline(source, existingStd[0])
-      var mergeOtherCandidates = false
-      if otherCandidates.len > 0:
-        var orderedOther = otherCandidates
-        orderedOther.sort(plannedImportOrder)
-        let otherInsertion =
-          sourceImportInsertion(source, activeInfo, orderedOther[0].candidate, stdlib)
-        for item in existingStd:
-          let lineStart = item.startOffset - item.indent.len
-          let lineEnd = statementEndWithNewline(source, item)
-          if otherInsertion >= lineStart and otherInsertion < lineEnd:
-            mergeOtherCandidates = true
-            break
-
-      var replacementCandidates = stdCandidates
-      if mergeOtherCandidates:
-        replacementCandidates = newModules
-        otherCandidates.setLen(0)
-      result.add ImportEdit(
-        startOffset: insertion,
-        endOffset: replacementEnd,
-        newText: renderNewImports(
-          replacementCandidates, options.useStdPrefix, newline, existingStdModules
-        ),
-      )
-      if existingStd.len > 1:
-        for index in 1 ..< existingStd.len:
-          let item = existingStd[index]
-          result.add ImportEdit(
-            startOffset: item.startOffset - item.indent.len,
-            endOffset: statementEndWithNewline(source, item),
-            newText: "",
-          )
-
-      if otherCandidates.len > 0:
-        var orderedOther = otherCandidates
-        orderedOther.sort(plannedImportOrder)
-        let otherInsertion =
-          sourceImportInsertion(source, activeInfo, orderedOther[0].candidate, stdlib)
-        result.add ImportEdit(
-          startOffset: otherInsertion,
-          endOffset: otherInsertion,
-          newText: renderNewImports(otherCandidates, options.useStdPrefix, newline),
-        )
-    else:
-      var orderedModules = newModules
-      orderedModules.sort(plannedImportOrder)
-      let insertion =
-        sourceImportInsertion(source, activeInfo, orderedModules[0].candidate, stdlib)
-      var newText = renderNewImports(newModules, options.useStdPrefix, newline)
-      var physicalImportCount = 0
-      for item in activeInfo.imports:
-        if not item.synthetic:
-          inc physicalImportCount
-      if physicalImportCount == 0:
-        newText.add newline
-      result.add ImportEdit(
-        startOffset: insertion, endOffset: insertion, newText: newText
-      )
+    for edit in renderImportAdditions(
+      source, activeInfo, newModules, stdlib, options, newline
+    ):
+      result.add edit
 
   var removals =
     unusedImportEdits(source, info, removalPlan, stdlib, options.useStdPrefix, newline)
@@ -1081,21 +1431,27 @@ proc organizeSourceWithImports*(
 proc organizeSource*(
     filePath, source: string, options = defaultOrganizeOptions()
 ): seq[ImportEdit] =
-  var info = parseSourceImports(source)
+  let index = indexSource(source)
+  let indexed =
+    tryOrganizeSourceWithIndex(filePath, source, index, stdlibMap(), options)
+  if indexed.handled:
+    return indexed.edits
+  var info = cloneSourceImports(index.parsed)
   result = organizeSourceImpl(filePath, source, info, options)
 
 proc organizeSourceWithIndex*(
     filePath, source: string, index: SourceIndex, options = defaultOrganizeOptions()
 ): seq[ImportEdit] =
-  ## Use the immutable index for a safe compiler-free no-op. All other
-  ## decisions continue through the compiler-backed organizer until native
-  ## scopes and module surfaces are complete.
   if index == nil or index.contentHash != contentFingerprint(source) or
       index.byteLength != source.len:
     return organizeSource(filePath, source, options)
   if index.parsed.imports.len == 0 and index.symbols.len == 0 and index.includes.len == 0 and
       index.occurrences.identifiers.len == 0 and index.occurrences.isComplete:
     return
+  let indexed =
+    tryOrganizeSourceWithIndex(filePath, source, index, stdlibMap(), options)
+  if indexed.handled:
+    return indexed.edits
   organizeSourceWithImports(filePath, source, index.parsed, options)
 
 proc applyEdits*(source: string, edits: seq[ImportEdit]): string =

@@ -1,6 +1,7 @@
 import std/[algorithm, strutils, tables]
 
 import ../syntax/lexer
+import ../session/module_catalog
 import ./occurrences
 import ./scopes
 import ./source_index
@@ -93,13 +94,7 @@ proc `==`*(left, right: SurfaceId): bool {.borrow.}
 proc `==`*(left, right: BindingId): bool {.borrow.}
 
 proc canonicalSurfaceModule*(module: string): string =
-  result = module.strip(chars = {'"', '\'', '`'})
-  result = result.replace('\\', '/')
-  result = result.replace('.', '/')
-  while result.contains("//"):
-    result = result.replace("//", "/")
-  if result.startsWith("./"):
-    result = result[2 .. ^1]
+  canonicalModuleName(module)
 
 proc surfaceKey(name: string): string {.inline.} =
   identifierKey(name)
@@ -246,6 +241,27 @@ proc valid*(index: SurfaceIndex): bool =
 proc universeIsComplete*(index: SurfaceIndex): bool =
   index != nil and index.valid and index.universeComplete
 
+proc moduleKnown*(index: SurfaceIndex, module: string): bool =
+  index != nil and index.valid and index.byModule.hasKey(canonicalSurfaceModule(module))
+
+proc moduleForReference*(
+    index: SurfaceIndex, reference: string, owner: string = ""
+): string =
+  if index == nil or not index.valid:
+    return
+  let target = canonicalSurfaceModule(reference)
+  if target.len == 0:
+    return
+  if index.byModule.hasKey(target):
+    return target
+  let current = canonicalSurfaceModule(owner)
+  let slash = current.rfind('/')
+  if slash < 0:
+    return
+  let relative = current[0 ..< slash] & "/" & target
+  if index.byModule.hasKey(relative):
+    return relative
+
 proc moduleCount*(index: SurfaceIndex): int =
   if index != nil:
     return index.modules.len
@@ -331,6 +347,8 @@ proc addSourceUncertainty(
     target: var set[SurfaceUncertainty], reason: ScopeUncertainty
 ) =
   case reason
+  of scopeNestedBlock:
+    discard
   of scopeConditional:
     target.incl surfaceConditional
   of scopeInclude:
@@ -346,6 +364,8 @@ proc addOccurrenceUncertainty(
     target: var set[SurfaceUncertainty], reason: OccurrenceUncertainty
 ) =
   case reason
+  of uncertaintyNestedScope, uncertaintyDeclarationOrder:
+    discard
   of uncertaintyConditional:
     target.incl surfaceConditional
   of uncertaintyInclude:

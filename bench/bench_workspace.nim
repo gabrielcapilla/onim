@@ -50,12 +50,24 @@ let warmStarted = getMonoTime()
 warmWorkspace.indexWorkspace()
 let warmNanoseconds = (getMonoTime() - warmStarted).inNanoseconds
 
+let lazyWorkspace = initWorkspace()
+let prepareStarted = getMonoTime()
+discard lazyWorkspace.prepareWorkspace(root)
+let prepareNanoseconds = (getMonoTime() - prepareStarted).inNanoseconds
+let bootstrapStarted = getMonoTime()
+discard lazyWorkspace.bootstrapWorkspace()
+let bootstrapNanoseconds = (getMonoTime() - bootstrapStarted).inNanoseconds
+
 echo "modules=",
   moduleCount,
   " cold_ms=",
   coldNanoseconds.float / 1_000_000,
   " warm_ms=",
   warmNanoseconds.float / 1_000_000,
+  " prepare_ms=",
+  prepareNanoseconds.float / 1_000_000,
+  " bootstrap_ms=",
+  bootstrapNanoseconds.float / 1_000_000,
   " graph_complete=",
   warmWorkspace.graphComplete
 

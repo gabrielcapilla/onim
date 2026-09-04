@@ -1,6 +1,9 @@
 {
   "generator": "gen_stdlib_map.nim",
   "nimVersion": "2.2.10",
+  "implicitModules": [
+    "std/system"
+  ],
   "modules": {
     "std/algorithm": true,
     "std/alloc": true,

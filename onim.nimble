@@ -1,16 +1,17 @@
 # Package
 
-version       = "0.1.0"
-author        = "Gabriel Capilla"
-description   = "A standalone Nim language server with compiler-backed import organization"
-license       = "MIT"
-srcDir        = "src"
-bin           = @["onim"]
-installFiles  = @["stdlib_map.json"]
+version = "0.1.0"
+author = "Gabriel Capilla"
+description =
+  "A standalone Nim language server with indexed import organization"
+license = "MIT"
+srcDir = "src"
+bin = @["onim"]
+installFiles = @["stdlib_map.json"]
 
 # Dependencies
 
-requires      "nim >= 2.0.0"
+requires "nim >= 2.0.0"
 
 # Tasks
 
@@ -24,6 +25,9 @@ task test, "run the organize-imports regression suite":
   exec "nim c -r --path:src --hints:off --warnings:off tests/tscopes.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/tdefinition.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/tsurfaces.nim"
+  exec "nim c -r --path:src --hints:off --warnings:off tests/tdiagnostics.nim"
+  exec "nim c -r --path:src --hints:off --warnings:off tests/tmodules.nim"
+  exec "nim c -r --path:src --hints:off --warnings:off tests/tbootstrap.nim"
 
 task generateStdlibMap, "regenerate the compiler-derived stdlib symbol map":
   exec "nim c -r --hints:off --warnings:off gen_stdlib_map.nim"
@@ -31,5 +35,7 @@ task generateStdlibMap, "regenerate the compiler-derived stdlib symbol map":
 task bench, "measure organize-imports and workspace-index latency":
   exec "nim c --path:src --hints:off --warnings:off bench/bench_organize.nim"
   exec "bench/bench_organize"
+  exec "nim c --path:src --hints:off --warnings:off bench/bench_incremental.nim"
+  exec "bench/bench_incremental"
   exec "nim c --path:src --hints:off --warnings:off bench/bench_workspace.nim"
   exec "bench/bench_workspace"

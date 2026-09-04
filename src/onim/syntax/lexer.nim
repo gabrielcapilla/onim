@@ -104,6 +104,121 @@ type
     line*: int
     column*: int
 
+const tokenBlockLength* = 64
+
+type
+  TokenBase = ref object
+    values: seq[Token]
+
+  TokenBlock = ref object
+    values: array[tokenBlockLength, Token]
+
+  TokenOverrides = ref object
+    blocks: seq[TokenBlock]
+
+  TokenStore* = object
+    base: TokenBase
+    overrides: TokenOverrides
+    count: int
+
+proc initTokenStore*(tokens: sink seq[Token]): TokenStore =
+  new(result.base)
+  result.base.values = tokens
+  result.count = tokens.len
+
+proc len*(tokens: TokenStore): int {.inline.} =
+  tokens.count
+
+proc high*(tokens: TokenStore): int {.inline.} =
+  tokens.count - 1
+
+proc `[]`*(tokens: TokenStore, index: int): lent Token {.inline.} =
+  if index < 0 or index >= tokens.count:
+    raise newException(IndexDefect, "token index out of bounds")
+  let blockIndex = index div tokenBlockLength
+  if tokens.overrides != nil and tokens.overrides.blocks[blockIndex] != nil:
+    return tokens.overrides.blocks[blockIndex].values[index mod tokenBlockLength]
+  tokens.base.values[index]
+
+proc tokenContaining*(tokens: TokenStore, startOffset, endOffset: int): int =
+  var first = 0
+  var past = tokens.len
+  while first < past:
+    let middle = (first + past) div 2
+    if tokens[middle].startOffset <= startOffset:
+      first = middle + 1
+    else:
+      past = middle
+  let candidate = first - 1
+  if candidate >= 0 and tokens[candidate].startOffset <= startOffset and
+      endOffset <= tokens[candidate].endOffset: candidate else: -1
+
+proc tokenAtOffset*(tokens: TokenStore, offset: int): int =
+  if offset < 0:
+    return -1
+  let candidate = tokens.tokenContaining(offset, offset + 1)
+  if candidate >= 0 and tokens[candidate].kind == tkIdentifier: candidate else: -1
+
+iterator items*(tokens: TokenStore): lent Token =
+  var index = 0
+  while index < tokens.count:
+    yield tokens[index]
+    inc index
+
+iterator pairs*(tokens: TokenStore): (int, lent Token) =
+  var index = 0
+  while index < tokens.count:
+    yield (index, tokens[index])
+    inc index
+
+proc copyDirectory(tokens: TokenStore): TokenOverrides =
+  new(result)
+  let blockCount = (tokens.count + tokenBlockLength - 1) div tokenBlockLength
+  result.blocks = newSeq[TokenBlock](blockCount)
+  if tokens.overrides != nil:
+    for index in 0 ..< blockCount:
+      result.blocks[index] = tokens.overrides.blocks[index]
+
+proc copyBlock(tokens: TokenStore, blockIndex: int): TokenBlock =
+  new(result)
+  let first = blockIndex * tokenBlockLength
+  let past = min(tokens.count, first + tokenBlockLength)
+  for index in first ..< past:
+    result.values[index - first] = tokens[index]
+
+proc withToken*(tokens: TokenStore, index: int, token: sink Token): TokenStore =
+  if index < 0 or index >= tokens.count:
+    raise newException(IndexDefect, "token index out of bounds")
+  result = tokens
+  result.overrides = copyDirectory(tokens)
+  let blockIndex = index div tokenBlockLength
+  result.overrides.blocks[blockIndex] = copyBlock(tokens, blockIndex)
+  result.overrides.blocks[blockIndex].values[index mod tokenBlockLength] = token
+
+proc toSeq*(tokens: TokenStore): seq[Token] =
+  result = newSeqOfCap[Token](tokens.count)
+  for token in tokens:
+    result.add token
+
+proc `==`*(left, right: TokenStore): bool =
+  if left.count != right.count:
+    return false
+  for index in 0 ..< left.count:
+    if left[index] != right[index]:
+      return false
+  true
+
+proc `==`*(left: TokenStore, right: openArray[Token]): bool =
+  if left.count != right.len:
+    return false
+  for index in 0 ..< left.count:
+    if left[index] != right[index]:
+      return false
+  true
+
+proc `==`*(left: openArray[Token], right: TokenStore): bool =
+  right == left
+
 proc keywordId*(text: string): NimKeyword {.inline.} =
   case text
   of "addr": kwAddr
@@ -238,11 +353,73 @@ proc hasKeywordRole*(token: Token, role: KeywordRole): bool {.inline.} =
   let keyword = keywordOf(token)
   keyword != kwNone and role in keywordRoles(keyword)
 
+proc isExportMarker*[T](tokens: T, index: int): bool {.inline.} =
+  if index <= 0 or index >= tokens.len or tokens[index].text != "*" or
+      tokens[index - 1].kind != tkIdentifier or
+      tokens[index - 1].line != tokens[index].line:
+    return false
+  var cursor = index - 2
+  while cursor >= 0:
+    if tokens[cursor].line == tokens[index].line:
+      if tokens[cursor].text == "=" or tokens[cursor].text == ";":
+        return false
+      if tokens[cursor].hasKeywordRole(roleDeclaration):
+        return true
+    elif tokens[cursor].column == 0:
+      return
+        tokens[cursor].hasKeywordRole(roleTypeDeclaration) or
+        tokens[cursor].hasKeywordRole(roleValueDeclaration)
+    dec cursor
+  false
+
+proc isRoutineHeaderEquals*[T](tokens: T, index: int): bool {.inline.} =
+  if index <= 0 or index >= tokens.len or tokens[index].text != "=":
+    return false
+  var cursor = index - 1
+  while cursor >= 0 and tokens[cursor].line == tokens[index].line:
+    if tokens[cursor].text == "=" or tokens[cursor].text == ";":
+      return false
+    if tokens[cursor].hasKeywordRole(roleRoutine):
+      return not tokens[cursor].hasKeywordRole(roleGenerated)
+    dec cursor
+  false
+
 proc validIdentifier*(token: Token): bool {.inline.} =
   if token.kind != tkIdentifier or token.text.len == 0:
     return false
   let span = tokenSpan(token)
   span == token.text.len or span == token.text.len + 2
+
+proc isClosedString*(token: Token): bool {.inline.} =
+  if token.kind != tkString or token.text.len < 2:
+    return false
+  let triple =
+    token.text.len >= 3 and token.text[0] == '"' and token.text[1] == '"' and
+    token.text[2] == '"'
+  if triple:
+    return
+      token.text.len >= 6 and token.text[^3] == '"' and token.text[^2] == '"' and
+      token.text[^1] == '"'
+  (token.text[0] == '"' or token.text[0] == char(39)) and token.text[^1] == token.text[
+    0
+  ]
+
+proc matchingDelimiter*(opening, closing: char): bool {.inline.} =
+  case closing
+  of ')':
+    opening == '('
+  of ']':
+    opening == '['
+  of '}':
+    opening == '{'
+  else:
+    false
+
+proc isOpeningDelimiter*(value: char): bool {.inline.} =
+  value in {'(', '[', '{'}
+
+proc isClosingDelimiter*(value: char): bool {.inline.} =
+  value in {')', ']', '}'}
 
 proc isNimKeyword*(token: Token): bool {.inline.} =
   keywordOf(token) != kwNone

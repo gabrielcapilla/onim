@@ -47,34 +47,26 @@ proc normalToken(source: string, token: Token): bool =
 proc keyword(source: string, token: Token, wanted: NimKeyword): bool =
   normalToken(source, token) and token.isKeyword(wanted)
 
-proc sectionEnd(tokens: openArray[Token], start: int): int =
+proc sectionEnd[T](tokens: T, start: int): int =
   let startLine = tokens[start].line
   result = tokens.len
   for index in start + 1 ..< tokens.len:
     if tokens[index].line > startLine and tokens[index].column == 0:
       return index
 
-proc addSymbol(
-    symbols: var seq[SourceSymbol],
-    tokens: openArray[Token],
-    tokenIndex: int,
-    kind: SourceSymbolKind,
+proc addSymbol[T](
+    symbols: var seq[SourceSymbol], tokens: T, tokenIndex: int, kind: SourceSymbolKind
 ): bool =
   if tokenIndex < 0 or tokenIndex >= tokens.len or
       tokens[tokenIndex].kind != tkIdentifier:
     return false
-  let exported =
-    tokenIndex + 1 < tokens.len and
-    tokens[tokenIndex + 1].line == tokens[tokenIndex].line and
-    tokens[tokenIndex + 1].text == "*"
+  let exported = tokenIndex + 1 < tokens.len and tokens.isExportMarker(tokenIndex + 1)
   symbols.add SourceSymbol(
     nameToken: uint32(tokenIndex), kind: kind, exported: exported
   )
   true
 
-proc declarationNameEnd(
-    tokens: openArray[Token], start, limit: int, typeDeclaration: bool
-): bool =
+proc declarationNameEnd[T](tokens: T, start, limit: int, typeDeclaration: bool): bool =
   ## Check the short, same-line prefix of a declaration without trying to
   ## parse its type or body. This intentionally returns false for uncertain
   ## constructs so a later parser can replace this conservative scan.
@@ -103,9 +95,7 @@ proc declarationNameEnd(
   cursor < limit and tokens[cursor].text == "=" and
     tokens[cursor].line == tokens[start].line
 
-proc collectTypeSymbols(
-    tokens: openArray[Token], start: int, symbols: var seq[SourceSymbol]
-) =
+proc collectTypeSymbols[T](tokens: T, start: int, symbols: var seq[SourceSymbol]) =
   let limit = sectionEnd(tokens, start)
   var cursor = start + 1
   while cursor < limit and tokens[cursor].line == tokens[start].line:
@@ -129,14 +119,14 @@ proc collectTypeSymbols(
         discard addSymbol(symbols, tokens, cursor, symbolType)
     inc cursor
 
-proc lineEnd(tokens: openArray[Token], start, limit: int): int =
+proc lineEnd[T](tokens: T, start, limit: int): int =
   result = start
   let line = tokens[start].line
   while result < limit and tokens[result].line == line:
     inc result
 
-proc collectValueLine(
-    tokens: openArray[Token],
+proc collectValueLine[T](
+    tokens: T,
     start, limit: int,
     indent: int,
     kind: SourceSymbolKind,
@@ -164,11 +154,8 @@ proc collectValueLine(
       break
     inc cursor
 
-proc collectValueSymbols(
-    tokens: openArray[Token],
-    start: int,
-    kind: SourceSymbolKind,
-    symbols: var seq[SourceSymbol],
+proc collectValueSymbols[T](
+    tokens: T, start: int, kind: SourceSymbolKind, symbols: var seq[SourceSymbol]
 ) =
   let limit = sectionEnd(tokens, start)
   var indent = -1
@@ -186,17 +173,14 @@ proc collectValueSymbols(
       collectValueLine(tokens, cursor, limit, indent, kind, symbols)
     cursor = lineEnd(tokens, cursor, limit)
 
-proc collectRoutineSymbol(
-    tokens: openArray[Token],
-    start: int,
-    kind: SourceSymbolKind,
-    symbols: var seq[SourceSymbol],
+proc collectRoutineSymbol[T](
+    tokens: T, start: int, kind: SourceSymbolKind, symbols: var seq[SourceSymbol]
 ) =
   let name = start + 1
   if name < tokens.len and tokens[name].kind == tkIdentifier:
     discard addSymbol(symbols, tokens, name, kind)
 
-proc indexSymbols*(source: string, tokens: openArray[Token]): seq[SourceSymbol] =
+proc indexSymbols*[T](source: string, tokens: T): seq[SourceSymbol] =
   ## Index only declarations whose keyword is at module indentation. A
   ## complete parser will later provide scopes, overload pairing, and
   ## conditional semantics; this surface intentionally declines to guess.
@@ -236,9 +220,7 @@ proc symbolToken*(symbols: openArray[SourceSymbol], tokenIndex: uint32): int =
       return index
   -1
 
-proc lookupSymbol*(
-    symbols: openArray[SourceSymbol], tokens: openArray[Token], name: string
-): int =
+proc lookupSymbol*[T](symbols: openArray[SourceSymbol], tokens: T, name: string): int =
   let wanted = identifierKey(name)
   if wanted.len == 0:
     return -1

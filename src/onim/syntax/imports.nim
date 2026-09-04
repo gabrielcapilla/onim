@@ -2,6 +2,8 @@ import std/[sets, strutils]
 
 import ./lexer
 
+export lexer
+
 type
   ImportForm* = enum
     importModule
@@ -35,7 +37,7 @@ type
     keep*: bool
 
   SourceImports* = object
-    tokens*: seq[Token]
+    tokens*: TokenStore
     imports*: seq[ImportInfo]
     localDefinitions*: HashSet[string]
     availableNames*: HashSet[string]
@@ -126,13 +128,6 @@ proc statementEnd(tokens: seq[Token], start: int): int =
         break
     inc index
   index
-
-proc addImportedName(info: var ImportInfo, token: Token) =
-  if token.kind == tkIdentifier and token.text != "*":
-    info.imported.incl token.text
-    info.importedSymbols.add ImportSymbol(
-      name: token.text, startOffset: token.startOffset, endOffset: token.endOffset
-    )
 
 proc addFromImportedName(
     info: var ImportInfo, tokens: seq[Token], cursor: var int, finish: int
@@ -350,17 +345,17 @@ proc collectDefinitions(tokens: seq[Token]): HashSet[string] =
         result.incl tokens[cursor].text
 
 proc parseSourceImports*(source: string): SourceImports =
-  result.tokens = lex(source)
-  result.localDefinitions = collectDefinitions(result.tokens)
+  var tokens = lex(source)
+  result.localDefinitions = collectDefinitions(tokens)
   result.availableNames = initHashSet[string]()
   result.qualifiedNames = initHashSet[string]()
   var index = 0
-  while index < result.tokens.len:
-    if result.tokens[index].isKeyword(kwImport):
-      let parsed = parseImport(result.tokens, source, index)
+  while index < tokens.len:
+    if tokens[index].isKeyword(kwImport):
+      let parsed = parseImport(tokens, source, index)
       for parsedItem in parsed.items:
         var item = parsedItem
-        item.conditional = conditionalImport(source, result.tokens[index])
+        item.conditional = conditionalImport(source, tokens[index])
         result.imports.add item
         if item.conditional:
           continue
@@ -371,11 +366,11 @@ proc parseSourceImports*(source: string): SourceImports =
           for excluded in item.excluded:
             discard excluded
       index = max(index + 1, parsed.next)
-    elif result.tokens[index].isKeyword(kwFrom):
-      let parsed = parseFrom(result.tokens, source, index)
+    elif tokens[index].isKeyword(kwFrom):
+      let parsed = parseFrom(tokens, source, index)
       if parsed.valid:
         var item = parsed.item
-        item.conditional = conditionalImport(source, result.tokens[index])
+        item.conditional = conditionalImport(source, tokens[index])
         result.imports.add item
         if not item.conditional:
           for name in item.imported:
@@ -385,6 +380,7 @@ proc parseSourceImports*(source: string): SourceImports =
       inc index
   for name in result.localDefinitions:
     result.availableNames.incl name
+  result.tokens = initTokenStore(tokens)
 
 proc cloneSourceImports*(source: SourceImports): SourceImports =
   result.tokens = source.tokens
@@ -409,6 +405,12 @@ proc cloneSourceImports*(source: SourceImports): SourceImports =
     for symbol in item.importedSymbols:
       copied.importedSymbols.add symbol
     result.imports.add copied
+
+proc tokenInsideImport*(imports: SourceImports, token: Token): bool =
+  for item in imports.imports:
+    if not item.synthetic and token.startOffset >= item.startOffset and
+        token.endOffset <= item.endOffset:
+      return true
 
 proc hasModuleImport*(imports: SourceImports, module: string): bool =
   for item in imports.imports:

@@ -32,23 +32,6 @@ proc validSource(source: WorkspaceSnapshot): bool =
     source.index.contentHash == contentFingerprint(source.text) and
     source.index.byteLength == source.text.len
 
-proc tokenAtOffset(tokens: openArray[Token], offset: int): int =
-  if offset < 0:
-    return -1
-  for index, token in tokens:
-    if token.kind == tkIdentifier and token.startOffset <= offset and
-        offset < token.endOffset:
-      return index
-  -1
-
-proc tokenInImport(imports: SourceImports, token: Token): bool =
-  for item in imports.imports:
-    if item.synthetic:
-      continue
-    if item.startOffset <= token.startOffset and token.endOffset <= item.endOffset:
-      return true
-  false
-
 proc symbolMatches(index: SourceIndex, name: string, exportedOnly = false): seq[int] =
   if index == nil:
     return
@@ -70,7 +53,7 @@ proc routineKind(kind: SourceSymbolKind): bool =
     symbolConverter,
   }
 
-proc routineHasBody(tokens: openArray[Token], symbol: SourceSymbol): bool =
+proc routineHasBody[T](tokens: T, symbol: SourceSymbol): bool =
   let nameIndex = int(symbol.nameToken)
   if nameIndex < 0 or nameIndex + 1 >= tokens.len:
     return false
@@ -166,9 +149,7 @@ proc fromBindingState(
           not plainImported(source.text, symbol):
         result.uncertain = true
 
-proc qualifiedMember(
-    tokens: openArray[Token], tokenIndex: int
-): tuple[qualifier, member: int] =
+proc qualifiedMember[T](tokens: T, tokenIndex: int): tuple[qualifier, member: int] =
   result = (-1, -1)
   if tokenIndex < 2 or tokens[tokenIndex - 1].text != ".":
     return
@@ -269,7 +250,7 @@ proc resolveDefinition*(
   if tokenIndex < 0:
     return
   let token = source.index.parsed.tokens[tokenIndex]
-  if tokenInImport(source.index.parsed, token):
+  if source.index.parsed.tokenInsideImport(token):
     return
 
   let matches = symbolMatches(source.index, token.text)

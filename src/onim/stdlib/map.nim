@@ -9,6 +9,15 @@ type
     candidateDefault
     candidateCanonical
 
+  CandidateResolutionState* = enum
+    candidateResolutionMissing
+    candidateResolutionResolved
+    candidateResolutionAmbiguous
+
+  StdlibMetadataState = enum
+    metadataMissing
+    metadataComplete
+
   SymbolCandidate* = object
     module*: string
     name*: string
@@ -21,6 +30,9 @@ type
     symbols*: Table[string, seq[SymbolCandidate]]
     modules*: HashSet[string]
     surface*: SurfaceIndex
+    symbolKeys: Table[string, seq[string]]
+    implicitModules: HashSet[string]
+    metadata: StdlibMetadataState
 
 const bundledStdlibMap = staticRead("../../../stdlib_map.json")
 
@@ -127,6 +139,23 @@ proc newStdlibMap(): StdlibMap =
   new(result)
   result.symbols = initTable[string, seq[SymbolCandidate]]()
   result.modules = initHashSet[string]()
+  result.symbolKeys = initTable[string, seq[string]]()
+  result.implicitModules = initHashSet[string]()
+
+proc registerSymbolKey(stdlib: StdlibMap, name: string) =
+  let key = identifierKey(name)
+  if key.len == 0:
+    return
+  if not stdlib.symbolKeys.hasKey(key):
+    stdlib.symbolKeys[key] = @[]
+  for existing in stdlib.symbolKeys[key]:
+    if existing == name:
+      return
+  stdlib.symbolKeys[key].add name
+
+proc surfaceIsComplete*(stdlib: StdlibMap): bool =
+  stdlib != nil and stdlib.surface != nil and stdlib.surface.valid() and
+    stdlib.surface.universeIsComplete() and stdlib.metadata == metadataComplete
 
 proc emptyStdlibMap*(): StdlibMap =
   result = newStdlibMap()
@@ -168,11 +197,24 @@ proc loadStdlibMap*(path: string): StdlibMap =
         if normalized.len == 0:
           return emptyStdlibMap()
         result.modules.incl normalized
+    if not root.hasKey("implicitModules") or root["implicitModules"].kind != JArray:
+      return emptyStdlibMap()
+    for entry in root["implicitModules"].items:
+      if entry.kind != JString:
+        return emptyStdlibMap()
+      let module = canonicalModule(entry.getStr)
+      if module.len == 0:
+        return emptyStdlibMap()
+      result.implicitModules.incl module
+    if result.implicitModules.len == 0:
+      return emptyStdlibMap()
+    result.metadata = metadataComplete
     if not root.hasKey("symbols") or root["symbols"].kind != JObject:
       return emptyStdlibMap()
     for name in root["symbols"].keys:
       if name.len == 0:
         return emptyStdlibMap()
+      result.registerSymbolKey(name)
       let entries = root["symbols"][name]
       if entries.kind != JArray:
         return emptyStdlibMap()
@@ -211,17 +253,36 @@ proc loadStdlibMap*(path: string): StdlibMap =
 proc candidatesFor*(
     stdlib: StdlibMap, name, qualifier: string, arity = -1
 ): seq[SymbolCandidate] =
-  if not stdlib.symbols.hasKey(name):
+  if stdlib == nil:
     return
-  for candidate in stdlib.symbols[name]:
-    if qualifier.len > 0 and moduleBase(candidate.module) != qualifier:
-      continue
-    if arity >= 0 and candidate.arity >= 0 and candidate.arity != arity:
-      continue
-    result.add candidate
-  if result.len == 0 and arity >= 0 and qualifier.len == 0:
-    for candidate in stdlib.symbols[name]:
+  var names: seq[string] = @[]
+  let key = identifierKey(name)
+  if stdlib.symbolKeys.hasKey(key):
+    names = stdlib.symbolKeys[key]
+  elif stdlib.symbols.hasKey(name):
+    names.add name
+  for symbolName in names:
+    for candidate in stdlib.symbols[symbolName]:
+      if qualifier.len > 0 and
+          not sameIdentifier(moduleBase(candidate.module), qualifier):
+        continue
+      if arity >= 0 and candidate.arity >= 0 and candidate.arity != arity:
+        continue
       result.add candidate
+  if result.len == 0 and arity >= 0:
+    for symbolName in names:
+      for candidate in stdlib.symbols[symbolName]:
+        if qualifier.len > 0 and
+            not sameIdentifier(moduleBase(candidate.module), qualifier):
+          continue
+        result.add candidate
+
+proc implicitModule*(stdlib: StdlibMap, module: string): bool =
+  stdlib != nil and canonicalModule(module) in stdlib.implicitModules
+
+proc resolveUniqueCandidate*(
+  stdlib: StdlibMap, name, qualifier: string, arity = -1
+): tuple[state: CandidateResolutionState, candidate: SymbolCandidate]
 
 proc resolveCandidate*(
     stdlib: StdlibMap, name, qualifier: string, arity = -1
@@ -229,22 +290,57 @@ proc resolveCandidate*(
   let candidates = stdlib.candidatesFor(name, qualifier, arity)
   if candidates.len == 0:
     return
-
-  for candidate in candidates:
-    if candidate.priority == candidateCanonical:
-      return candidate
-  if qualifier.len == 0:
-    for candidate in stdlib.symbols[name]:
-      if candidate.priority == candidateCanonical:
-        return candidate
-  if candidates.len == 1:
-    return candidates[0]
+  let unique = stdlib.resolveUniqueCandidate(name, qualifier, arity)
+  if unique.state == candidateResolutionResolved:
+    return unique.candidate
   var ordered = candidates
   ordered.sort(
     proc(left, right: SymbolCandidate): int =
       cmp(left.module, right.module)
   )
   ordered[0]
+
+proc resolveUniqueCandidate*(
+    stdlib: StdlibMap, name, qualifier: string, arity = -1
+): tuple[state: CandidateResolutionState, candidate: SymbolCandidate] =
+  ## Resolve only when the map gives one safe module identity. The legacy
+  ## `resolveCandidate` API remains available for callers that explicitly
+  ## accept its deterministic fallback; semantic features use this stricter
+  ## result so a collision cannot become an unsafe edit or diagnostic.
+  let candidates = stdlib.candidatesFor(name, qualifier, arity)
+  if candidates.len == 0:
+    return
+
+  if qualifier.len == 0:
+    var canonicalModuleName = ""
+    var canonicalFound = false
+    var canonicalCandidate: SymbolCandidate
+    for candidate in stdlib.candidatesFor(name, "", -1):
+      if candidate.priority != candidateCanonical:
+        continue
+      let module = canonicalModule(candidate.module)
+      if not canonicalFound:
+        canonicalModuleName = module
+        canonicalCandidate = candidate
+        canonicalFound = true
+      elif module != canonicalModuleName:
+        return (candidateResolutionAmbiguous, SymbolCandidate())
+    if canonicalFound:
+      return (candidateResolutionResolved, canonicalCandidate)
+
+  if candidates.len == 1:
+    return (candidateResolutionResolved, candidates[0])
+
+  let firstModule = canonicalModule(candidates[0].module)
+  var sameModule = true
+  for candidate in candidates[1 .. ^1]:
+    if canonicalModule(candidate.module) != firstModule:
+      sameModule = false
+      break
+  if sameModule:
+    return (candidateResolutionResolved, candidates[0])
+
+  result.state = candidateResolutionAmbiguous
 
 proc findStdlibMap*(): string =
   let configured = getEnv("ONIM_STDLIB_MAP")

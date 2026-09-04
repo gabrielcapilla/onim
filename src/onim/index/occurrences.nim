@@ -46,13 +46,6 @@ proc malformedIdentifierToken(token: Token): bool {.inline.} =
   token.kind == tkIdentifier and token.text.len == 0 or
     (token.kind == tkIdentifier and not validIdentifier(token))
 
-proc closedStringToken(token: Token): bool =
-  if token.kind != tkString or token.text.len < 2:
-    return false
-  if token.text.startsWith("\"\"\""):
-    return token.text.len >= 6 and token.text.endsWith("\"\"\"")
-  token.text[0] in {'\"', '\''} and token.text[^1] == token.text[0]
-
 proc declarationKeyword(token: Token): bool {.inline.} =
   token.hasKeywordRole(roleDeclaration)
 
@@ -64,7 +57,7 @@ proc markImportSpans(parsed: SourceImports, excluded: var seq[bool]) =
       if token.startOffset >= item.startOffset and token.endOffset <= item.endOffset:
         excluded[index] = true
 
-proc markDeclarationNames(tokens: openArray[Token], excluded: var seq[bool]) =
+proc markDeclarationNames[T](tokens: T, excluded: var seq[bool]) =
   ## Exclude the small set of declaration heads understood by the existing
   ## source index. Unsupported nested declarations still force fallback.
   var index = 0
@@ -100,7 +93,7 @@ proc markDeclarationNames(tokens: openArray[Token], excluded: var seq[bool]) =
         excluded[cursor] = true
     inc index
 
-proc operatorPunctuation(text: string): bool {.inline.} =
+proc operatorPunctuation*(text: string): bool {.inline.} =
   text.len == 1 and
     text[0] in {
       '+', '-', '*', '/', '\\', '<', '>', '=', '@', '$', '~', '&', '%', '!', '?', '^',
@@ -116,7 +109,7 @@ proc markUncertainty(
 
   for index, token in parsed.tokens:
     if token.kind == tkString:
-      if not closedStringToken(token):
+      if not isClosedString(token):
         result.uncertainty.incl uncertaintyMalformed
       continue
 
@@ -138,6 +131,10 @@ proc markUncertainty(
       if declarationKeyword(token):
         result.uncertainty.incl uncertaintyDeclarationOrder
     elif not excluded[index] and operatorPunctuation(token.text):
+      if token.text == "=" and parsed.tokens.isRoutineHeaderEquals(index):
+        continue
+      if parsed.tokens.isExportMarker(index):
+        continue
       result.uncertainty.incl uncertaintyUnsupportedSyntax
     elif not excluded[index] and token.text == "{" and index + 1 < parsed.tokens.len and
         parsed.tokens[index + 1].text == ".":
@@ -148,7 +145,7 @@ proc markUncertainty(
       result.uncertainty.incl uncertaintyInclude
       break
 
-proc exportUse(tokens: openArray[Token], index: int): bool =
+proc exportUse[T](tokens: T, index: int): bool =
   var cursor = index - 1
   while cursor >= 0 and tokens[cursor].line == tokens[index].line and
       tokens[cursor].text != ";":
@@ -156,10 +153,10 @@ proc exportUse(tokens: openArray[Token], index: int): bool =
       return true
     dec cursor
 
-proc addUsage(
+proc addUsage[T](
     index: var OccurrenceIndex,
     lookup: var Table[string, int],
-    tokens: openArray[Token],
+    tokens: T,
     occurrence: IdentifierOccurrence,
 ) =
   let tokenIndex = int(occurrence.token)
@@ -180,6 +177,15 @@ proc addUsage(
   if occurrenceExport in occurrence.roles:
     inc summary.exportCount
   index.usage[summaryIndex] = summary
+
+proc sortUsage*[T](index: var OccurrenceIndex, tokens: T) =
+  index.usage.sort(
+    proc(left, right: UsageSummary): int =
+      cmp(
+        identifierKey(tokens[int(left.representativeToken)].text),
+        identifierKey(tokens[int(right.representativeToken)].text),
+      )
+  )
 
 proc indexOccurrences*(
     parsed: SourceImports, symbols: openArray[SourceSymbol]
@@ -225,21 +231,12 @@ proc indexOccurrences*(
     result.qualified.add QualifiedOccurrence(
       qualifierToken: uint32(tokenIndex), memberToken: uint32(tokenIndex + 2)
     )
-
-  result.usage.sort(
-    proc(left, right: UsageSummary): int =
-      cmp(
-        identifierKey(parsed.tokens[int(left.representativeToken)].text),
-        identifierKey(parsed.tokens[int(right.representativeToken)].text),
-      )
-  )
+  result.sortUsage(parsed.tokens)
 
 proc isComplete*(index: OccurrenceIndex): bool =
   index.uncertainty == {}
 
-proc usageFor*(
-    index: OccurrenceIndex, tokens: openArray[Token], name: string
-): UsageSummary =
+proc usageFor*[T](index: OccurrenceIndex, tokens: T, name: string): UsageSummary =
   let wanted = identifierKey(name)
   if wanted.len == 0:
     return
@@ -248,10 +245,10 @@ proc usageFor*(
         identifierKey(tokens[int(summary.representativeToken)].text) == wanted:
       return summary
 
-proc hasUsage*(index: OccurrenceIndex, tokens: openArray[Token], name: string): bool =
+proc hasUsage*[T](index: OccurrenceIndex, tokens: T, name: string): bool =
   index.usageFor(tokens, name).referenceCount > 0
 
-proc validateOccurrences*(index: OccurrenceIndex, tokens: openArray[Token]): bool =
+proc validateOccurrences*[T](index: OccurrenceIndex, tokens: T): bool =
   var occurrenceByToken = newSeq[bool](tokens.len)
   var previousToken = high(uint32)
   for occurrence in index.identifiers:

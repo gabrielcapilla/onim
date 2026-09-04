@@ -1,8 +1,8 @@
 # onim
 
-`onim` is a standalone Nim 2.0+ language server and compiler-backed organize-imports provider. It is an independent implementation; it does not fork `nimlangserver` or `nimsuggest`.
+`onim` is a standalone Nim 2.0+ language server and indexed organize-imports provider. It is an independent implementation; it does not fork `nimlangserver` or `nimsuggest`.
 
-When Zed requests `source.organizeImports`, onim asks the embedded Nim compiler/nimsuggest API for real undeclared-identifier and unused-import diagnostics, resolves missing names against the generated standard-library map, and returns a minimal `WorkspaceEdit`. It removes unused imports and names, then sorts and groups remaining `std/*` imports. The LSP never writes the document. The CLI applies the same edit to a file.
+When Zed requests `source.organizeImports`, onim first uses the in-memory source index and generated standard-library map to resolve the safe stdlib-only case without starting a compiler process. Ambiguous or unsupported cases use the isolated Nim compiler/nimsuggest boundary for authoritative diagnostics. Onim returns a minimal `WorkspaceEdit`, removes unused imports and names, then sorts and groups remaining `std/*` imports. The LSP never writes the document. The CLI applies the same edit to a file.
 
 ## Build and run
 
@@ -26,8 +26,8 @@ The implementation is organized by responsibility under `src/onim`:
   validated disk cache.
 - `session/` owns numeric identities, document overlays, snapshots, and the
   workspace dependency graph.
-- `features/` owns user-facing language actions such as organize-imports and
-  the conservative native definition resolver.
+- `features/` owns user-facing language actions such as organize-imports, the
+  conservative native definition resolver, and indexed document symbols.
 - `semantic/` owns the compiler adapter and its isolated semantic worker.
 - `protocol/` owns the LSP transport and request lifecycle.
 - `stdlib/` owns generated standard-library symbol data and lookup.
@@ -51,26 +51,29 @@ The generated map is bundled into the executable and may also be overridden with
 
 ## Workspace index
 
-The LSP builds one workspace index when it receives `initialize`. Each Nim file gets a stable numeric `FileId`; its parsed import/include/export references are retained in a compact per-file index, while forward and reverse dependency edges use numeric IDs. A document overlay is authoritative while it is open, so organize-imports reads the same bytes that Zed is editing.
+The LSP binds the project root and restores manifest metadata during `initialize`; it does not scan the whole workspace on the initialize request path. Each Nim file gets a stable numeric `FileId`; its parsed import/include/export references are retained in a compact per-file index, while forward and reverse dependency edges use numeric IDs. A document overlay is authoritative while it is open, so organize-imports reads the same bytes that Zed is editing. Native local operations are available immediately; an unresolved cross-file definition request performs one conservative workspace bootstrap and retries against the resulting graph.
 
 On-disk source indexes are cached under `ONIM_CACHE_DIR` when set, then `XDG_CACHE_HOME/onim`, or `~/.cache/onim`. A project manifest records the canonical module inventory and file stamps; per-module records are keyed by canonical project/module paths and exact source fingerprints. At restart, an unchanged record can be loaded from the manifest without reading or retaining its source text; the exact bytes are hydrated when a feature requests that module. Cache data is acceleration only: an identity, version, checksum, bounds, stamp, or source mismatch falls back to a fresh in-memory index.
 
 Each source index also contains immutable numeric identifier postings, qualified
 member pairs, style-aware usage summaries, and explicit uncertainty reasons.
-They are reconstructed from the already-cached tokens, imports, and symbols, so
-the cache format stays compatible while a warm LSP request can inspect the
-preflight data without reparsing. Only a proven comment/string-only no-op skips
-the compiler today; uncertain semantic cases remain compiler-authoritative.
+Its token stream uses a flat immutable base with 64-token copy-on-write blocks,
+so a proven same-length identifier edit does not clone the complete token
+array. These structures are reconstructed from the already-cached tokens,
+imports, and symbols, so the cache format stays compatible while a warm LSP
+request can inspect the preflight data without reparsing. Complete conservative
+stdlib-only files can organize imports from the native index without invoking
+the compiler; uncertain semantic cases remain compiler-authoritative.
 The scope index adds one module interval plus conservative routine intervals,
 parameter declarations, direct local declarations, and source order without
 duplicating identifier strings. Nested blocks, complex headers, and binding
 semantics remain explicitly uncertain.
 
-`didOpen` and full-text `didChange` update only the affected file. A changed file invalidates its reverse import/include/export closure, including transitive dependents and cycles exactly once. Filesystem add/delete/recreate transitions reconcile the numeric graph and preserve tombstone IDs without resolving deleted modules. Disk indexes are published only after a stable `stat -> read -> stat` pair. If a non-stdlib dependency cannot be resolved yet, onim conservatively invalidates the whole workspace until the graph becomes complete. Configuration changes invalidate the whole workspace. Code actions are cached by content, dependency, configuration, and stdlib-prefix generations, so repeated requests for an unchanged snapshot do not invoke the compiler again.
+`didOpen` and full-text `didChange` update only the affected file. A changed file invalidates its reverse import/include/export closure, including transitive dependents and cycles exactly once. Filesystem add/delete/recreate transitions reconcile the numeric graph and preserve tombstone IDs without resolving deleted modules. Disk indexes are published only after a stable `stat -> read -> stat` pair. If a non-stdlib dependency cannot be resolved yet, onim invalidates that unresolved root and its reverse-dependent closure conservatively; unrelated modules remain reusable. Configuration changes invalidate the whole workspace. Code actions are cached by content, dependency, configuration, and stdlib-prefix generations, so repeated requests for an unchanged snapshot do not invoke the compiler again.
 
 The stdio server also keeps semantic organization in a persistent helper process. The helper owns the embedded compiler graph on one thread, while the LSP process remains free to receive edits. `didOpen` and `didChange` prefetch the current snapshot; at most one compiler request is in flight and intermediate edits are coalesced to the newest snapshot for each file. A code action returns from the generation cache when prefetch has completed, without placing compiler work on the LSP request path. The standalone CLI remains synchronous because its process lifetime ends after one file operation.
 
-The index is an orchestration layer, not yet a semantic replacement for Nim. An uncached organize-imports request still asks the embedded compiler/nimsuggest boundary for `undeclared identifier`; the lexical index determines what needs to be refreshed. Field-layout analysis and a future `onim --compact` opt-in remain separate from `source.organizeImports`.
+The index is an orchestration layer, not yet a complete semantic replacement for Nim. The native indexed organizer handles the proven stdlib-only path; the embedded compiler/nimsuggest boundary remains a fallback for `undeclared identifier`, complex imports, and other unsupported semantic cases. Native syntax diagnostics are published independently of that fallback. Field-layout analysis and a future `onim --compact` opt-in remain separate from `source.organizeImports`.
 
 The native symbol and module-surface indexes are deliberately narrower than a
 compiler symbol table:
@@ -92,6 +95,11 @@ qualifier, import alias, or plain `from` binding without calling the compiler,
 loading the target source, or walking the filesystem. Conditional, excluded,
 private, overloaded, forward, nested, aliased-symbol, and external-module
 cases intentionally return no location.
+
+The LSP also publishes document symbols directly from the current source index.
+Their names, kinds, and UTF-16 selection ranges are available without invoking
+the compiler; declarations outside the conservative native index are omitted
+until the parser can represent them safely.
 
 ## Zed
 
@@ -138,6 +146,19 @@ bench/bench_organize
 ```
 
 It reports median and p95 wall-clock latency after compiler/map warm-up; compiler diagnostics remain the correctness gate for every uncached source.
+
+The incremental benchmark compares full indexing with the copy-on-write
+identifier path at 100, 1,800, and 10,000 lines:
+
+```sh
+nim c -d:release --path:src bench/bench_incremental.nim
+bench/bench_incremental
+```
+
+It reports median, p95, p99, fallback counts, and edit positions. The fast path
+is intentionally conservative; edits that change token boundaries, line
+structure, imports, declarations, or uncertain syntax use the complete index
+path.
 
 The workspace benchmark builds a 256-module dependency chain and reports cold
 indexing versus a fresh workspace loading the manifest-backed module records:

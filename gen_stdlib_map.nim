@@ -209,6 +209,7 @@ proc generate(config: GeneratorConfig, nimVersion: string) =
   var root = newJObject()
   root["generator"] = %"gen_stdlib_map.nim"
   root["nimVersion"] = %nimVersion
+  root["implicitModules"] = %*["std/system"]
   root["modules"] = newJObject()
   var moduleNames = toSeq(modules.keys)
   moduleNames.sort
