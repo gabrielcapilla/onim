@@ -5,6 +5,7 @@ import ../syntax/lexer
 import ./occurrences
 import ./scopes
 import ./symbols
+import ./types
 import ../syntax/parser
 
 export lexer
@@ -18,6 +19,7 @@ type
     syntax*: PartialSyntaxTree
     symbols*: seq[SourceSymbol]
     scopes*: ScopeIndex
+    types*: TypeIndex
     occurrences*: OccurrenceIndex
     imports*: seq[string]
     exports*: seq[string]
@@ -277,6 +279,7 @@ proc cloneIncrementalIndex(oldIndex: SourceIndex, source: string): SourceIndex =
   result.syntax = oldIndex.syntax
   result.symbols = oldIndex.symbols
   result.scopes = oldIndex.scopes
+  result.types = oldIndex.types
   result.occurrences = oldIndex.occurrences
   result.imports = oldIndex.imports
   result.exports = oldIndex.exports
@@ -341,6 +344,7 @@ proc indexSource*(source: string): SourceIndex {.gcsafe.} =
   result.symbols = indexSymbols(source, result.parsed.tokens)
   result.scopes =
     indexScopes(result.parsed.tokens, result.symbols, result.byteLength, result.syntax)
+  result.types = indexTypes(result.parsed.tokens, result.symbols, result.scopes)
   result.occurrences = indexOccurrences(result.parsed, result.symbols)
 
   for item in result.parsed.imports:

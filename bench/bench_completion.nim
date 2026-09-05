@@ -12,6 +12,10 @@ const
   queriesPerSample = 100
   lspQueryCount = 1_000
 
+type ObjectCompletionMode = enum
+  objectAnnotation
+  objectConstructor
+
 proc percentile(values: var seq[float], rank: float): float =
   values.sort
   let index = min(values.high, int(float(values.len - 1) * rank))
@@ -20,6 +24,12 @@ proc percentile(values: var seq[float], rank: float): float =
 proc median(values: seq[float]): float =
   var ordered = values
   ordered.percentile(0.5)
+
+proc mad(values: seq[float], middle: float): float =
+  var deviations = newSeqOfCap[float](values.len)
+  for value in values:
+    deviations.add abs(value - middle)
+  deviations.percentile(0.5)
 
 proc localSnapshot(source: string): WorkspaceSnapshot =
   result.valid = true
@@ -41,6 +51,16 @@ proc nestedSource(depth: int): string =
     result.add " ".repeat(2 * (level + 1)) & "block:\n"
     result.add " ".repeat(2 * (level + 2)) & "let nested" & $level & " = value\n"
   result.add " ".repeat(2 * (depth + 1)) & "echo nested\n"
+
+proc objectSource(fieldCount: int, mode: ObjectCompletionMode): string =
+  result = "type\n  Measured = object\n"
+  for fieldIndex in 0 ..< fieldCount:
+    result.add "    field" & $fieldIndex & ": int\n"
+  result.add "\n"
+  if mode == objectConstructor:
+    result.add "proc measure() =\n  let value = Measured()\n  value.field\n"
+  else:
+    result.add "proc measure(value: Measured) =\n  value.field\n"
 
 proc moduleSource(prefix: string): string =
   "import std/os as filesystem\nproc measure() =\n  filesystem." & prefix & "\n"
@@ -86,6 +106,75 @@ proc retainedMemory(snapshot: WorkspaceSnapshot, offset: int) =
     inc checksum, completion.items.len
   let after = getOccupiedMem()
   echo "retained_memory_before=",
+    before,
+    " after=",
+    after,
+    " delta=",
+    int64(after) - int64(before),
+    " checksum=",
+    checksum
+
+proc measureTypeMembers(label: string, source: string, mode: ObjectCompletionMode) =
+  var indexSamples: seq[float] = @[]
+  for _ in 0 ..< warmupCount:
+    discard indexSource(source)
+  for _ in 0 ..< sampleCount:
+    let started = getMonoTime()
+    discard indexSource(source)
+    indexSamples.add (getMonoTime() - started).inNanoseconds.float / 1_000_000
+
+  let snapshot = localSnapshot(source)
+  let workspace = initWorkspace()
+  let offset = source.completionOffset("field")
+  for _ in 0 ..< warmupCount:
+    let warm = completeAt(workspace, snapshot, offset, emptyStdlibMap())
+    doAssert warm.state == completionAvailable and warm.items.len > 0
+  var samples: seq[float] = @[]
+  var checksum = 0
+  var failures = 0
+  for _ in 0 ..< sampleCount:
+    let started = getMonoTime()
+    for _ in 0 ..< queriesPerSample:
+      let completion = completeAt(workspace, snapshot, offset, emptyStdlibMap())
+      if completion.state != completionAvailable:
+        inc failures
+      else:
+        inc checksum, completion.items.len
+    samples.add (getMonoTime() - started).inNanoseconds.float /
+      (1_000_000 * queriesPerSample)
+  let middle = samples.median()
+  echo label,
+    " fields=",
+    snapshot.index.types.fields.len,
+    " mode=",
+    mode,
+    " index_median_ms=",
+    indexSamples.median(),
+    " index_p95_ms=",
+    indexSamples.percentile(0.95),
+    " median_us=",
+    middle * 1_000,
+    " p95_us=",
+    samples.percentile(0.95) * 1_000,
+    " mad_us=",
+    samples.mad(middle) * 1_000,
+    " candidates=",
+    checksum div (sampleCount * queriesPerSample),
+    " failures=",
+    failures,
+    " checksum=",
+    checksum
+
+proc retainedMemberMemory(snapshot: WorkspaceSnapshot, offset: int) =
+  let before = getOccupiedMem()
+  let workspace = initWorkspace()
+  var checksum = 0
+  for _ in 0 ..< 100_000:
+    let completion = completeAt(workspace, snapshot, offset, emptyStdlibMap())
+    doAssert completion.state == completionAvailable
+    inc checksum, completion.items.len
+  let after = getOccupiedMem()
+  echo "retained_member_memory_before=",
     before,
     " after=",
     after,
@@ -238,7 +327,9 @@ proc readResponse(output: Stream, id: int): JsonNode =
       return message
 
 proc measureLsp(source: string, cursorText: string): bool =
-  let executable = getCurrentDir() / "onim"
+  var executable = getEnv("ONIM_BIN")
+  if executable.len == 0:
+    executable = getCurrentDir() / "onim"
   if not fileExists(executable):
     echo "lsp_roundtrip=skipped (build ./onim first)"
     return
@@ -309,6 +400,7 @@ proc measureLsp(source: string, cursorText: string): bool =
     doAssert response != nil
     inc checksum, response["result"]["items"].len
   let elapsed = (getMonoTime() - started).inNanoseconds.float / 1_000_000
+  echo "lsp_executable=", executable
   echo "lsp_roundtrip_queries=",
     lspQueryCount,
     " median_ms=",
@@ -336,9 +428,26 @@ for depth in [1, 8, 32]:
   let snapshot = localSnapshot(source)
   discard measureFeature("nested", snapshot, source.completionOffset("nested"))
 
+for fieldCount in [8, 64, 512]:
+  measureTypeMembers(
+    "object_members_annotation",
+    objectSource(fieldCount, objectAnnotation),
+    objectAnnotation,
+  )
+  measureTypeMembers(
+    "object_members_constructor",
+    objectSource(fieldCount, objectConstructor),
+    objectConstructor,
+  )
+
 let retainedSource = sourceFor(64)
 let retainedSnapshot = localSnapshot(retainedSource)
 retainedMemory(retainedSnapshot, retainedSource.completionOffset("local"))
+let retainedMemberSource = objectSource(64, objectAnnotation)
+let retainedMemberSnapshot = localSnapshot(retainedMemberSource)
+retainedMemberMemory(
+  retainedMemberSnapshot, retainedMemberSource.completionOffset("field")
+)
 let stdlib = loadStdlibMap("")
 measureModuleFeature(stdlib)
 for unrelatedCount in [0, 128, 512]:

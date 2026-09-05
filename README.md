@@ -22,13 +22,13 @@ The implementation is organized by responsibility under `src/onim`:
 
 - `syntax/` owns lexical tokens and structural import/source parsing.
 - `index/` owns per-file source indexes, the conservative module-surface symbol,
-  shared module-surface, and numeric occurrence/scope indexes, plus their
-  validated disk cache.
+  shared module-surface, numeric occurrence/scope indexes, and conservative
+  same-file object type shapes, plus their validated disk cache.
 - `session/` owns numeric identities, document overlays, snapshots, and the
   workspace dependency graph.
 - `features/` owns user-facing language actions such as organize-imports, native
-  lexical completion, the conservative native definition resolver, and indexed
-  document symbols.
+  lexical and field completion, the conservative native definition resolver, and
+  indexed document symbols.
 - `semantic/` owns the compiler adapter and its isolated semantic worker.
 - `protocol/` owns the LSP transport and request lifecycle.
 - `stdlib/` owns generated standard-library symbol data and lookup.
@@ -95,11 +95,13 @@ and direct `let`/`var`/`const` declarations from supported routine and
 unnamed-block scopes, plus members of one direct imported project or complete
 stdlib module. Project completion uses a complete indexed module surface and
 graph; canonical `std/...` completion uses the complete bundled surface. Direct
-imports, aliases, empty member prefixes, and Nim identifier prefixes are
-supported. Unsupported contexts return `null` without invoking
-the compiler or semantic worker; the response remains marked incomplete while
-type/member inference, UFCS, `from` completion, re-exports, and keyword
-completion remain future native milestones.
+imports, aliases, empty member prefixes, Nim identifier prefixes, and fields of
+same-file nominal `object`, `ref object`, and `ptr object` types are supported.
+Local fields may come from an explicit annotation or a direct object
+constructor. Unsupported contexts return `null` without invoking the compiler
+or semantic worker; the response remains marked incomplete while imported type
+shapes, UFCS, `from` completion, re-exports, and keyword completion remain
+future native milestones.
 
 The shared surface index stores sorted module ranges, normalized identifier keys,
 overload records, and deterministic ambiguity results. Project surfaces are
@@ -188,10 +190,11 @@ is intentionally conservative; edits that change token boundaries, line
 structure, imports, declarations, or uncertain syntax use the complete index
 path.
 
-The completion benchmark measures warm local completion, complete stdlib-module
-completion, and a 256-member project module with 0, 128, and 512 unrelated
-modules. It also measures stdio round trips for local and stdlib-member
-completion:
+The completion benchmark measures warm local completion, same-file object-field
+completion for annotation and constructor receivers with 8, 64, and 512
+fields, complete stdlib-module completion, and a 256-member project module with
+0, 128, and 512 unrelated modules. It also measures retained memory and stdio
+round trips for local and stdlib-member completion:
 
 ```sh
 nim c -d:release -o:onim-release --path:src --hints:off --warnings:off src/onim.nim

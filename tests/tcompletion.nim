@@ -23,6 +23,11 @@ proc completionAt(source, prefix: string): CompletionResult =
   let offset = source.rfind(prefix) + prefix.len
   snapshot.completeLocals(offset)
 
+proc memberCompletionAt(source, prefix: string): CompletionResult =
+  let snapshot = localSnapshot(source)
+  let workspace = initWorkspace()
+  completeAt(workspace, snapshot, source.rfind(prefix) + prefix.len, emptyStdlibMap())
+
 suite "native local completion":
   test "returns visible parameters and locals by prefix":
     let source = """proc show(value: int) =
@@ -177,6 +182,81 @@ proc show() =
     else:
       delEnv("ONIM_CACHE_DIR")
     removeDir(root)
+
+  test "matches fresh and incrementally updated type indexes":
+    let oldSource = """type
+  Alpha = object
+    alpha: int
+  Bravo = object
+    bravo: int
+
+proc show() =
+  let value = Alpha()
+  value.
+"""
+    let newSource = oldSource.replace("Alpha()", "Bravo()")
+    let oldIndex = indexSource(oldSource)
+    let updated = tryIndexSourceIncremental(oldSource, oldIndex, newSource)
+    check updated != nil
+    var snapshot = localSnapshot(newSource)
+    snapshot.index = updated
+    let result = completeAt(
+      initWorkspace(),
+      snapshot,
+      newSource.find("value.") + "value.".len,
+      emptyStdlibMap(),
+    )
+    check result.state == completionAvailable
+    check result.items.mapIt(it.label) == @["bravo"]
+
+  test "reconstructs object type facts from the cache":
+    let root = getTempDir() / ("onim-object-completion-cache-" & $getCurrentProcessId())
+    let cacheRoot =
+      getTempDir() / ("onim-object-completion-cache-data-" & $getCurrentProcessId())
+    if dirExists(root):
+      removeDir(root)
+    if dirExists(cacheRoot):
+      removeDir(cacheRoot)
+    createDir(root)
+    let path = root / "main.nim"
+    let source = """type
+  Person = object
+    name: string
+
+proc show(person: Person) =
+  person.na
+"""
+    let previous = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
+    defer:
+      if previous.len > 0:
+        putEnv("ONIM_CACHE_DIR", previous)
+      else:
+        delEnv("ONIM_CACHE_DIR")
+      if dirExists(root):
+        removeDir(root)
+      if dirExists(cacheRoot):
+        removeDir(cacheRoot)
+    let original = indexSource(source)
+    check saveCachedSourceIndex(root, path, source, original)
+    let cached = loadCachedSourceIndex(root, path, source)
+    check cached != nil
+    let workspace = initWorkspace()
+    let offset = source.find("person.na") + "person.na".len
+    let fresh = completeAt(
+      workspace,
+      WorkspaceSnapshot(valid: true, path: path, text: source, index: original),
+      offset,
+      emptyStdlibMap(),
+    )
+    let restored = completeAt(
+      workspace,
+      WorkspaceSnapshot(valid: true, path: path, text: source, index: cached),
+      offset,
+      emptyStdlibMap(),
+    )
+    check restored.state == fresh.state
+    check restored.items == fresh.items
 
   test "completes canonical stdlib module members":
     let root = getTempDir() / ("onim-module-completion-" & $getCurrentProcessId())
@@ -357,3 +437,102 @@ proc use() =
     let duplicateOffset = duplicate.find("p.an") + "p.an".len
     check completeAt(workspace, duplicateSnapshot, duplicateOffset, stdlib).state ==
       completionUnsupported
+
+  test "completes fields from explicit nominal object types":
+    let source = """type
+  Person = object
+    name: string
+    age: int
+
+proc show(person: Person) =
+  person.na
+"""
+    let result = memberCompletionAt(source, "person.na")
+    check result.state == completionAvailable
+    check result.items.mapIt(it.label) == @["name"]
+    check result.items[0].kind == completionField
+    check result.replaceStart == source.rfind("na")
+    check result.replaceEnd == result.replaceStart + 2
+
+  test "supports ref, ptr, constructors, and lexical type shadowing":
+    let source = """type
+  Shared = ref object
+    value: int
+  Raw = object
+    flag: bool
+  Person = object
+    name: string
+  Other = object
+    code: int
+
+proc show(shared: Shared; raw: ptr Raw; person: Person) =
+  shared.va
+  raw.fl
+  let made = Person(name: "Ada")
+  made.na
+  block:
+    let person: Other = Other(code: 1)
+    person.co
+"""
+    let shared = memberCompletionAt(source, "shared.va")
+    check shared.state == completionAvailable
+    check shared.items.mapIt(it.label) == @["value"]
+    let raw = memberCompletionAt(source, "raw.fl")
+    check raw.state == completionAvailable
+    check raw.items.mapIt(it.label) == @["flag"]
+    let made = memberCompletionAt(source, "made.na")
+    check made.state == completionAvailable
+    check made.items.mapIt(it.label) == @["name"]
+    let shadowed = memberCompletionAt(source, "person.co")
+    check shadowed.state == completionAvailable
+    check shadowed.items.mapIt(it.label) == @["code"]
+
+  test "keeps unsupported type shapes conservative and never falls through":
+    let generic = """type
+  Box[T] = object
+    value: T
+
+proc show(value: Box[int]) =
+  value.va
+"""
+    check memberCompletionAt(generic, "value.va").state == completionUnsupported
+
+    let variant = """type
+  Variant = object
+    case kind: bool
+    of true:
+      first: int
+    else:
+      second: int
+
+proc show(value: Variant) =
+  value.fi
+"""
+    check memberCompletionAt(variant, "value.fi").state == completionUnsupported
+
+    let inherited = """type
+  Base = object
+    base: int
+  Child = object of Base
+    child: int
+
+proc show(value: Child) =
+  value.ch
+"""
+    check memberCompletionAt(inherited, "value.ch").state == completionUnsupported
+
+    let alias = """type
+  Person = object
+    name: string
+  Alias = Person
+
+proc show(value: Alias) =
+  value.na
+"""
+    check memberCompletionAt(alias, "value.na").state == completionUnsupported
+
+    let unknownLocal = """import std/os
+proc show(os: Unknown) =
+  os.walkD
+"""
+    check memberCompletionAt(unknownLocal, "os.walkD").state == completionUnsupported

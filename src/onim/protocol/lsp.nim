@@ -688,6 +688,7 @@ proc completionItemKind(kind: CompletionKind): int {.inline.} =
   of completionConstant: 21
   of completionFunction: 3
   of completionMethod: 2
+  of completionField: 5
   of completionType: 7
 
 proc completionResponse(

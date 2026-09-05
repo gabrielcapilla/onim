@@ -672,6 +672,20 @@ proc validateScopes*[T](
 proc isComplete*(index: ScopeIndex): bool =
   index.uncertainty == {}
 
+proc declarationOrdinalAt*(index: ScopeIndex, nameToken: uint32): int {.inline.} =
+  var first = 0
+  var past = index.declarations.len
+  while first < past:
+    let middle = (first + past) div 2
+    let candidate = index.declarations[middle].nameToken
+    if candidate < nameToken:
+      first = middle + 1
+    elif candidate > nameToken:
+      past = middle
+    else:
+      return middle
+  -1
+
 proc parentScope*(index: ScopeIndex, scope: ScopeId): ScopeId {.inline.} =
   let ordinal = int(uint32(scope)) - 1
   if ordinal >= 0 and ordinal < index.scopes.len:

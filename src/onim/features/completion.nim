@@ -7,6 +7,7 @@ import ../index/scopes
 import ../index/source_index
 import ../index/symbols
 import ../index/surfaces
+import ../index/types
 import ../stdlib/map
 import ../session/ids
 import ../session/module_catalog
@@ -24,6 +25,7 @@ type
     completionConstant
     completionFunction
     completionMethod
+    completionField
     completionType
 
   CompletionItem* = object
@@ -382,6 +384,47 @@ proc appendVisible(
       candidates[candidateByName[key]] = visible
   true
 
+proc completeLocalMembers(
+    source: WorkspaceSnapshot, context: MemberContext, declarationToken: uint32
+): CompletionResult =
+  if not source.valid or source.index == nil or not source.index.bindingsReady or
+      not source.index.parsed.nativeIndexSafe(source.index):
+    return
+  let declarationOrdinal = source.index.scopes.declarationOrdinalAt(declarationToken)
+  if declarationOrdinal < 0 or declarationOrdinal >= source.index.types.localTypeUses.len:
+    return
+  let typeToken = source.index.types.localTypeUses[declarationOrdinal]
+  let objectOrdinal = source.index.types.objectOrdinalForType(
+    source.index.parsed.tokens, source.index.symbols, typeToken
+  )
+  if objectOrdinal < 0 or objectOrdinal >= source.index.types.objects.len:
+    return
+  let objectType = source.index.types.objects[objectOrdinal]
+  var candidates: seq[VisibleCompletion] = @[]
+  var candidateByName = initTable[string, int]()
+  for fieldIndex in objectType.firstField ..< objectType.pastField:
+    let tokenIndex = int(source.index.types.fields[int(fieldIndex)].nameToken)
+    if tokenIndex < 0 or tokenIndex >= source.index.parsed.tokens.len:
+      return
+    let token = source.index.parsed.tokens[tokenIndex]
+    if not appendCompletionCandidate(
+      token.text,
+      completionField,
+      identifierKey(context.prefix),
+      candidates,
+      candidateByName,
+    ):
+      return
+  if candidates.len == 0:
+    return
+  candidates.sort(compareCompletion)
+  result.state = completionAvailable
+  result.replaceStart = context.replaceStart
+  result.replaceEnd = context.replaceEnd
+  result.items = newSeqOfCap[CompletionItem](candidates.len)
+  for candidate in candidates:
+    result.items.add candidate.item
+
 proc completeLocals*(source: WorkspaceSnapshot, byteOffset: int): CompletionResult =
   if not source.valid or source.index == nil or
       source.path.toLowerAscii.endsWith(".nimble") or
@@ -425,7 +468,10 @@ proc completeLocals*(source: WorkspaceSnapshot, byteOffset: int): CompletionResu
     result.items.add candidate.item
 
 proc completeModuleMembers(
-    workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int, stdlib: StdlibMap
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    stdlib: StdlibMap,
+    context: MemberContext,
 ): CompletionResult =
   if workspace == nil or not source.valid or source.index == nil or
       source.index.contentHash != contentFingerprint(source.text) or
@@ -433,7 +479,6 @@ proc completeModuleMembers(
       source.path.toLowerAscii.endsWith(".nimble") or
       source.path.toLowerAscii.endsWith(".cfg"):
     return
-  let context = source.index.memberContext(byteOffset)
   if context.state != memberContextReady or not source.index.bindingsReady or
       not source.index.parsed.nativeIndexSafe(source.index):
     return
@@ -493,7 +538,14 @@ proc completeAt*(
   let context = source.index.memberContext(byteOffset)
   case context.state
   of memberContextReady:
-    completeModuleMembers(workspace, source, byteOffset, stdlib)
+    let binding = source.index.resolveBinding(uint32(context.qualifierToken))
+    case binding.state
+    of bindingResolved:
+      completeLocalMembers(source, context, binding.declarationToken)
+    of bindingAmbiguous:
+      CompletionResult()
+    of bindingUnknown:
+      completeModuleMembers(workspace, source, stdlib, context)
   of memberContextInvalid:
     CompletionResult()
   of memberContextAbsent:

@@ -7,6 +7,7 @@ import ./source_index
 import ./occurrences
 import ./scopes
 import ./symbols
+import ./types
 import ../session/paths
 
 const
@@ -334,6 +335,11 @@ proc readSourceIndex(
     result.scopes, result.parsed.tokens, result.symbols, result.byteLength
   ):
     invalidCache("cache scope index is invalid")
+  result.types = indexTypes(result.parsed.tokens, result.symbols, result.scopes)
+  if not validateTypeIndex(
+    result.types, result.parsed.tokens, result.symbols, result.scopes
+  ):
+    invalidCache("cache type index is invalid")
   result.occurrences = indexOccurrences(result.parsed, result.symbols)
   if not validateOccurrences(result.occurrences, result.parsed.tokens):
     invalidCache("cache occurrence index is invalid")

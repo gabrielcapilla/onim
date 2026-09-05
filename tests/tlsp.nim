@@ -941,3 +941,74 @@ suite "stdio LSP":
     )
     check readResponse(process.outputStream, 2)["result"].kind == JNull
     sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+
+  test "returns native field completion with UTF-16 ranges":
+    let projectRoot = currentSourcePath().parentDir.parentDir
+    let uri = "file:///tmp/onim-native-field-completion.nim"
+    let source = """type
+  Person = object
+    name: string
+
+proc show(person: Person) =
+  echo 😀 person.na
+"""
+    let process =
+      startProcess(projectRoot / "onim", args = ["--stdio"], workingDir = projectRoot)
+    defer:
+      close process
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 101,
+        "method": "initialize",
+        "params": {"rootUri": "file://" & projectRoot.replace('\\', '/')},
+      },
+    )
+    check readResponse(process.outputStream, 101) != nil
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "method": "initialized", "params": {}}
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument":
+            {"uri": uri, "languageId": "nim", "version": 1, "text": source}
+        },
+      },
+    )
+    let diagnostics = readMessage(process.outputStream)
+    check diagnostics != nil
+    check diagnostics["method"].getStr == "textDocument/publishDiagnostics"
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 102,
+        "method": "textDocument/completion",
+        "params":
+          {"textDocument": {"uri": uri}, "position": {"line": 5, "character": 19}},
+      },
+    )
+    let completion = readResponse(process.outputStream, 102)
+    check completion != nil
+    check completion["result"]["isIncomplete"].getBool
+    check completion["result"]["items"].len == 1
+    check completion["result"]["items"][0]["label"].getStr == "name"
+    check completion["result"]["items"][0]["kind"].getInt == 5
+    check completion["result"]["items"][0]["textEdit"]["range"]["start"]["character"].getInt ==
+      17
+    check completion["result"]["items"][0]["textEdit"]["range"]["end"]["character"].getInt ==
+      19
+
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "id": 103, "method": "shutdown", "params": nil},
+    )
+    check readResponse(process.outputStream, 103)["result"].kind == JNull
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
