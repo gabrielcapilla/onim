@@ -5,6 +5,7 @@ import ../syntax/lexer
 import ./occurrences
 import ./scopes
 import ./symbols
+import ../syntax/parser
 
 export lexer
 
@@ -14,6 +15,7 @@ type
     byteLength*: int
     tokenCount*: int
     parsed*: SourceImports
+    syntax*: PartialSyntaxTree
     symbols*: seq[SourceSymbol]
     scopes*: ScopeIndex
     occurrences*: OccurrenceIndex
@@ -244,6 +246,7 @@ proc cloneIncrementalIndex(oldIndex: SourceIndex, source: string): SourceIndex =
   # The parsed sets, import records, and token store are immutable for this
   # fast path. The changed token receives a copy-on-write block below.
   result.parsed = oldIndex.parsed
+  result.syntax = oldIndex.syntax
   result.symbols = oldIndex.symbols
   result.scopes = oldIndex.scopes
   result.occurrences = oldIndex.occurrences
@@ -264,6 +267,7 @@ proc tryIndexSourceIncremental*(
   updatedToken.text = newText
   updatedToken.keyword = keywordId(newText)
   result.parsed.tokens = result.parsed.tokens.withToken(edit.tokenIndex, updatedToken)
+  result.syntax.tokens = result.parsed.tokens
   let oldKey = identifierKey(oldToken.text)
   let newKey = identifierKey(newText)
   if not result.patchUsage(oldIndex, edit.tokenIndex, oldKey, newKey):
@@ -304,6 +308,7 @@ proc indexSource*(source: string): SourceIndex {.gcsafe.} =
   result.contentHash = contentFingerprint(source)
   result.byteLength = source.len
   result.parsed = parseSourceImports(source)
+  result.syntax = parsePartialSyntax(result.parsed.tokens)
   result.tokenCount = result.parsed.tokens.len
   result.symbols = indexSymbols(source, result.parsed.tokens)
   result.scopes = indexScopes(result.parsed.tokens, result.symbols, result.byteLength)

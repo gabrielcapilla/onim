@@ -90,24 +90,17 @@ proc isContainer(kind: SyntaxNodeKind): bool {.inline.} =
 proc assignParents(tree: var PartialSyntaxTree) =
   if tree.nodes.len < 2:
     return
+  var containers: seq[int] = @[]
   for childIndex in 1 ..< tree.nodes.len:
     let child = tree.nodes[childIndex]
-    var parentIndex = -1
-    var parentWidth = high(uint32)
-    for candidateIndex in 1 ..< tree.nodes.len:
-      if candidateIndex == childIndex:
-        continue
-      let candidate = tree.nodes[candidateIndex]
-      if not candidate.kind.isContainer:
-        continue
-      if candidate.firstToken <= child.firstToken and
-          child.pastToken <= candidate.pastToken:
-        let width = candidate.pastToken - candidate.firstToken
-        if width < parentWidth:
-          parentWidth = width
-          parentIndex = candidateIndex
-    if parentIndex >= 0:
-      tree.nodes[childIndex].parent = SyntaxNodeId(uint32(parentIndex + 1))
+    while containers.len > 0 and tree.nodes[containers[^1]].pastToken <= child.firstToken:
+      containers.setLen(containers.len - 1)
+    if containers.len > 0:
+      let parentIndex = containers[^1]
+      if child.pastToken <= tree.nodes[parentIndex].pastToken:
+        tree.nodes[childIndex].parent = SyntaxNodeId(uint32(parentIndex + 1))
+    if child.kind.isContainer:
+      containers.add childIndex
 
 proc applyLexicalUncertainty(tree: var PartialSyntaxTree) =
   for issue in lexicalIssues(tree.tokens):
@@ -117,9 +110,8 @@ proc applyLexicalUncertainty(tree: var PartialSyntaxTree) =
     of lexicalUnexpectedDelimiter, lexicalUnclosedDelimiter:
       tree.uncertainty.incl parserUnbalanced
 
-proc parsePartialSyntax*(source: string): PartialSyntaxTree =
-  let lexed = lex(source)
-  result.tokens = initTokenStore(lexed)
+proc parsePartialSyntax*(tokens: TokenStore): PartialSyntaxTree =
+  result.tokens = tokens
   result.root = result.addNode(syntaxModule, 0, result.tokens.len)
   result.applyLexicalUncertainty()
 
@@ -187,6 +179,9 @@ proc parsePartialSyntax*(source: string): PartialSyntaxTree =
       inc index
 
   result.assignParents()
+
+proc parsePartialSyntax*(source: string): PartialSyntaxTree =
+  parsePartialSyntax(initTokenStore(lex(source)))
 
 proc isComplete*(tree: PartialSyntaxTree): bool {.inline.} =
   tree.uncertainty == {}

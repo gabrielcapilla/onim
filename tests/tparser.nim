@@ -1,5 +1,6 @@
 import std/[os, strutils, unittest]
 
+import onim/index/source_index
 import onim/syntax/imports
 import onim/syntax/parser
 
@@ -35,6 +36,9 @@ proc main(value: int) =
     check tree.validateSyntaxTree
     check tree.importsMatch(imports)
     check tree.isComplete
+    let indexed = indexSource(source)
+    check indexed.syntax.validateSyntaxTree
+    check indexed.syntax.importsMatch(indexed.parsed)
     check countNodes(tree, syntaxImport) == 2
     check countNodes(tree, syntaxFromImport) == 1
     check countNodes(tree, syntaxWhen) == 1
