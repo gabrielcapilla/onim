@@ -84,10 +84,9 @@ proc keepImport(source: string, tokens: seq[Token], start, finish: int): bool =
   statement = statement.replace(" ", "").replace("\t", "").replace("\r", "")
   statement.contains("{.all.}")
 
-proc conditionalImport(source: string, token: Token): bool =
+proc conditionalImport(lines: openArray[string], token: Token): bool =
   if token.line <= 0:
     return false
-  let lines = source.splitLines
   var line = token.line - 1
   while line >= 0:
     let text = lines[line].strip
@@ -346,6 +345,7 @@ proc collectDefinitions(tokens: seq[Token]): HashSet[string] =
 
 proc parseSourceImports*(source: string): SourceImports =
   var tokens = lex(source)
+  let lines = source.splitLines
   result.localDefinitions = collectDefinitions(tokens)
   result.availableNames = initHashSet[string]()
   result.qualifiedNames = initHashSet[string]()
@@ -355,7 +355,7 @@ proc parseSourceImports*(source: string): SourceImports =
       let parsed = parseImport(tokens, source, index)
       for parsedItem in parsed.items:
         var item = parsedItem
-        item.conditional = conditionalImport(source, tokens[index])
+        item.conditional = conditionalImport(lines, tokens[index])
         result.imports.add item
         if item.conditional:
           continue
@@ -370,7 +370,7 @@ proc parseSourceImports*(source: string): SourceImports =
       let parsed = parseFrom(tokens, source, index)
       if parsed.valid:
         var item = parsed.item
-        item.conditional = conditionalImport(source, tokens[index])
+        item.conditional = conditionalImport(lines, tokens[index])
         result.imports.add item
         if not item.conditional:
           for name in item.imported:
