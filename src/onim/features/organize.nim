@@ -1,7 +1,8 @@
-import std/[algorithm, hashes, os, sets, strutils]
+import std/[algorithm, hashes, os, sets, strutils, tables]
 
 import ../index/occurrences
 import ../index/scopes
+import ../index/cache
 import ../index/source_index
 import ../index/symbols
 import ../semantic/compiler_api
@@ -39,6 +40,14 @@ type
   NativeRemovalState = enum
     nativeRemovalUnsupported
     nativeRemovalReady
+
+  IncludedImportCacheEntry = object
+    stamp: FileStamp
+    imports: SourceImports
+
+const maxIncludedImportCacheEntries = 128
+
+var includedImportCache = initTable[string, IncludedImportCacheEntry]()
 
 proc defaultOrganizeOptions*(): OrganizeOptions =
   OrganizeOptions(useStdPrefix: true)
@@ -500,6 +509,24 @@ proc mergeIncludedNames(target: var SourceImports, source: SourceImports) =
   for name in source.qualifiedNames:
     target.qualifiedNames.incl name
 
+proc cachedIncludedImports(path: string, imports: var SourceImports): bool =
+  let stamp = fileStamp(path)
+  if not usableStamp(stamp):
+    return false
+  if includedImportCache.hasKey(path) and
+      sameFileStamp(includedImportCache[path].stamp, stamp):
+    imports = cloneSourceImports(includedImportCache[path].imports)
+    return true
+  try:
+    let parsed = parseSourceImports(readFile(path))
+    if includedImportCache.len >= maxIncludedImportCacheEntries:
+      includedImportCache.clear()
+    includedImportCache[path] = IncludedImportCacheEntry(stamp: stamp, imports: parsed)
+    imports = cloneSourceImports(parsed)
+    true
+  except CatchableError:
+    false
+
 proc importsAvailableFromIncluded(
     sourcePath: string,
     info: var SourceImports,
@@ -523,21 +550,20 @@ proc importsAvailableFromIncluded(
       else:
         splitFile(sourcePath).dir / includeName
     let absolute = absolutePath(includePath)
-    if absolute in visited or not fileExists(absolute):
+    if absolute in visited:
       continue
     visited.incl absolute
-    try:
-      let included = parseSourceImports(readFile(absolute))
-      mergeIncludedNames(info, included)
-      var nested = included
-      importsAvailableFromIncluded(absolute, nested, visited, depth + 1)
-      mergeIncludedNames(info, nested)
-      for item in nested.imports:
-        var importedItem = item
-        importedItem.synthetic = true
-        info.imports.add importedItem
-    except CatchableError:
-      discard
+    var included: SourceImports
+    if not cachedIncludedImports(absolute, included):
+      continue
+    mergeIncludedNames(info, included)
+    var nested = cloneSourceImports(included)
+    importsAvailableFromIncluded(absolute, nested, visited, depth + 1)
+    mergeIncludedNames(info, nested)
+    for item in nested.imports:
+      var importedItem = item
+      importedItem.synthetic = true
+      info.imports.add importedItem
 
 proc applyEdits*(source: string, edits: seq[ImportEdit]): string
 
