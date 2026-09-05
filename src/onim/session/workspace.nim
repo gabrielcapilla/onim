@@ -22,6 +22,10 @@ type
     workspaceBootstrapComplete
     workspaceBootstrapFailed
 
+  DependencyRestoreMode = enum
+    restoreIndexed
+    restoreLazy
+
   WorkspaceSnapshot* = object
     valid*: bool
     id*: SnapshotId
@@ -148,17 +152,32 @@ proc persistManifest(workspace: Workspace) =
   var graphValid = true
   for index in 0 ..< workspace.files.len:
     let file = workspace.files[index]
-    if file.state != workspaceOnDisk or file.index == nil:
+    if file.state != workspaceOnDisk:
       graphValid = false
       continue
     let stamp = fileStamp(file.path)
     if stamp.size < 0 or file.stamp.size < 0 or not sameFileStamp(stamp, file.stamp):
       graphValid = false
       continue
+    var sourceHash: uint64
+    var byteLength: int64
+    if file.index != nil:
+      sourceHash = file.index.contentHash
+      byteLength = int64(file.index.byteLength)
+    elif workspace.manifestByPath.hasKey(file.path):
+      let previous = workspace.manifestByPath[file.path]
+      if previous.byteLength < 0 or previous.byteLength != stamp.size:
+        graphValid = false
+        continue
+      sourceHash = previous.sourceHash
+      byteLength = previous.byteLength
+    else:
+      graphValid = false
+      continue
     entries.add ManifestEntry(
       path: file.path,
-      sourceHash: file.index.contentHash,
-      byteLength: int64(file.index.byteLength),
+      sourceHash: sourceHash,
+      byteLength: byteLength,
       stamp: stamp,
       unresolved: uint32(file.id) in workspace.unresolved,
     )
@@ -594,7 +613,7 @@ proc rebuildDependencies(workspace: Workspace) =
   for index in 0 ..< workspace.files.len:
     replaceDependencies(workspace, workspace.files[index].id)
 
-proc restoreDependencies(workspace: Workspace): bool =
+proc restoreDependencies(workspace: Workspace, mode = restoreIndexed): bool =
   if not workspace.manifest.graphValid or
       workspace.manifest.entries.len != workspace.files.len:
     return false
@@ -610,10 +629,13 @@ proc restoreDependencies(workspace: Workspace): bool =
     if index < 0 or index >= workspace.files.len or seen[index] or entry.byteLength < 0 or
         entry.byteLength > int64(high(int)) or
         workspace.files[index].state != workspaceOnDisk or
-        workspace.files[index].index == nil or
-        not sameFileStamp(workspace.files[index].stamp, entry.stamp) or
-        workspace.files[index].index.contentHash != entry.sourceHash or
-        workspace.files[index].index.byteLength != int(entry.byteLength):
+        (mode == restoreIndexed and workspace.files[index].index == nil) or
+        not sameFileStamp(workspace.files[index].stamp, entry.stamp):
+      return false
+    if workspace.files[index].index != nil and (
+      workspace.files[index].index.contentHash != entry.sourceHash or
+      workspace.files[index].index.byteLength != int(entry.byteLength)
+    ):
       return false
     seen[index] = true
     idsByOrdinal[ordinal] = id
@@ -908,8 +930,43 @@ proc indexWorkspaceImpl(workspace: Workspace): bool =
       if hadRecords:
         topologyChanged = true
 
+  var lazyRestored =
+    not topologyChanged and workspace.manifest.graphValid and
+    workspace.manifest.entries.len == workspace.files.len and
+    paths.len == workspace.files.len
+  if lazyRestored:
+    for path in paths:
+      let id = workspace.paths[path]
+      let index = id.recordIndex
+      if index < 0 or index >= workspace.files.len or
+          workspace.files[index].state == workspaceOpen or
+          not workspace.manifestByPath.hasKey(path):
+        lazyRestored = false
+        break
+      let entry = workspace.manifestByPath[path]
+      let stamp = fileStamp(path)
+      if entry.byteLength < 0 or entry.byteLength > int64(high(int)) or
+          stamp.size != entry.byteLength or not sameFileStamp(stamp, entry.stamp):
+        lazyRestored = false
+        break
+    if lazyRestored:
+      for path in paths:
+        let id = workspace.paths[path]
+        let index = id.recordIndex
+        let entry = workspace.manifestByPath[path]
+        workspace.files[index].state = workspaceOnDisk
+        workspace.files[index].version = -1
+        workspace.files[index].text = ""
+        workspace.files[index].textLoaded = false
+        workspace.files[index].stamp = entry.stamp
+        workspace.files[index].index = nil
+        workspace.files[index].contentGeneration = workspace.nextContent()
+      lazyRestored = workspace.restoreDependencies(restoreLazy)
+
   for path in paths:
     let id = workspace.paths[path]
+    if lazyRestored:
+      continue
     if workspace.files[id.recordIndex].state == workspaceOpen:
       continue
     let wasMissing = workspace.files[id.recordIndex].state == workspaceMissing
@@ -953,7 +1010,9 @@ proc indexWorkspaceImpl(workspace: Workspace): bool =
       if hadRecords and not wasMissing:
         topologyChanged = true
   workspace.moduleCatalogCache = nil
-  let restored = not topologyChanged and workspace.restoreDependencies()
+  var restored = lazyRestored
+  if not restored:
+    restored = not topologyChanged and workspace.restoreDependencies()
   if not restored:
     rebuildDependencies(workspace)
   if topologyChanged:
