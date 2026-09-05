@@ -67,9 +67,10 @@ invoking the compiler; uncertain semantic cases remain compiler-authoritative.
 Project action keys include a surface generation, so provider-module edits
 cannot leave a stale organize result cached for a consumer.
 The scope index adds one module interval plus conservative routine intervals,
-parameter declarations, direct local declarations, and source order without
-duplicating identifier strings. Nested blocks, complex headers, and binding
-semantics remain explicitly uncertain.
+parameter declarations, direct local declarations, and explicit unnamed
+multiline block scopes without duplicating identifier strings. Conditional
+control-flow scopes, complex headers, and unsupported binding forms remain
+explicitly uncertain.
 
 `didOpen` and full-text `didChange` update only the affected file. A changed file invalidates its reverse import/include/export closure, including transitive dependents and cycles exactly once. Filesystem add/delete/recreate transitions reconcile the numeric graph and preserve tombstone IDs without resolving deleted modules. Disk indexes are published only after a stable `stat -> read -> stat` pair. If a non-stdlib dependency cannot be resolved yet, onim invalidates that unresolved root and its reverse-dependent closure conservatively; unrelated modules remain reusable. Configuration changes invalidate the whole workspace. Code actions are cached by content, dependency, configuration, and stdlib-prefix generations, so repeated requests for an unchanged snapshot do not invoke the compiler again.
 
