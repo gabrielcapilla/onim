@@ -256,8 +256,7 @@ proc nativeDiagnostics*(
     catalog: ModuleCatalog = nil,
 ): seq[NativeDiagnostic] =
   result = nativeSyntaxDiagnostics(index)
-  if result.len == 0:
-    result.add nativeMissingDiagnostics(index, stdlib, project, catalog, owner)
+  result.add nativeMissingDiagnostics(index, stdlib, project, catalog, owner)
 
 proc nativeSyntaxDiagnostics*(index: SourceIndex): seq[NativeDiagnostic] =
   if index == nil:

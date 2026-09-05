@@ -34,6 +34,16 @@ suite "native diagnostics":
     check diagnostics.len == 1
     check diagnostics[0].kind == nativeMalformedIdentifier
 
+  test "keeps missing-name diagnostics with syntax diagnostics":
+    var index = indexSource("proc main() =\n  discard walkDir(\"/tmp\")\n")
+    var token = index.parsed.tokens[1]
+    token.endOffset = token.endOffset + 1
+    index.parsed.tokens = index.parsed.tokens.withToken(1, token)
+    let diagnostics = nativeDiagnostics(index, loadStdlibMap(""))
+    check diagnostics.len == 2
+    check diagnostics[0].kind == nativeMalformedIdentifier
+    check diagnostics[1].kind == nativeMissingStdlibImport
+
   test "reports a missing stdlib import from an unqualified use":
     let diagnostics = nativeMissingStdlibDiagnostics(
       indexSource(
