@@ -346,6 +346,9 @@ proc resolveDefinition*(
   let token = source.index.parsed.tokens[tokenIndex]
   if source.index.parsed.tokenInsideImport(token):
     return
+  let local = resolveLocalDefinitionAtToken(source, tokenIndex)
+  if local.kind != definitionUnknown:
+    return local
 
   let matches = symbolMatches(source.index, token.text)
   let declarationIndex = source.index.symbols.symbolToken(uint32(tokenIndex))

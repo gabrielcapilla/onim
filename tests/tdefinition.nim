@@ -41,6 +41,26 @@ proc forward*() = discard
 """
 
 suite "native definition resolution":
+  test "resolves routine parameters and direct locals":
+    let text = """proc add(value: int) =
+  let total = value + 1
+  echo total
+"""
+    let workspace = initWorkspace()
+    let fileId = workspace.openDocument(
+      "file:///tmp/onim-local-definition.nim", "/tmp/onim-local-definition.nim", text, 1
+    )
+    let snapshot = workspace.snapshotForFile(fileId)
+    let parameter = resolveDefinition(workspace, snapshot, text.rfind("value"))
+    check parameter.kind == definitionResolved
+    check parameter.target.fileId.value == fileId.value
+    check parameter.target.nameToken == 3'u32
+
+    let local = resolveDefinition(workspace, snapshot, text.rfind("total"))
+    check local.kind == definitionResolved
+    check local.target.fileId.value == fileId.value
+    check local.target.nameToken == 9'u32
+
   test "resolves module qualifiers, aliases, and from bindings":
     let root = getTempDir() / ("onim-definition-project-" & $getCurrentProcessId())
     let cacheRoot = getTempDir() / ("onim-definition-cache-" & $getCurrentProcessId())

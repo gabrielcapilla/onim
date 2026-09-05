@@ -233,6 +233,24 @@ suite "stdio LSP":
     check referencesResult["result"][1]["range"]["start"]["line"].getInt == 1
     check referencesResult["result"][1]["range"]["start"]["character"].getInt == 16
 
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "textDocument/definition",
+        "params": {
+          "textDocument": {"uri": referencesUri},
+          "position": {"line": 1, "character": 16},
+        },
+      },
+    )
+    let localDefinition = readResponse(process.outputStream, 12)
+    check localDefinition != nil
+    check localDefinition["result"]["uri"].getStr == referencesUri
+    check localDefinition["result"]["range"]["start"]["line"].getInt == 0
+    check localDefinition["result"]["range"]["start"]["character"].getInt == 9
+
     let providerUri = "file:///tmp/onim-provider/provider.nim"
     let consumerUri = "file:///tmp/onim-provider/consumer.nim"
     sendMessage(
