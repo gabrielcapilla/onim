@@ -774,6 +774,23 @@ proc stableDiskSource(
     except CatchableError:
       return
 
+proc cachedManifestIndex(
+    workspace: Workspace, id: FileId, stamp: FileStamp
+): SourceIndex =
+  let index = id.recordIndex
+  if index < 0 or index >= workspace.files.len or
+      workspace.files[index].state != workspaceOnDisk or
+      not workspace.manifestByPath.hasKey(workspace.files[index].path):
+    return
+  let path = workspace.files[index].path
+  let entry = workspace.manifestByPath[path]
+  if entry.byteLength < 0 or entry.byteLength > int64(high(int)) or
+      entry.byteLength != stamp.size:
+    return
+  loadCachedSourceIndexFingerprint(
+    workspace.root, path, entry.sourceHash, int(entry.byteLength)
+  )
+
 proc ensureText(workspace: Workspace, id: FileId, invalidate = true): bool =
   let index = id.recordIndex
   if index < 0 or index >= workspace.files.len:
@@ -792,6 +809,9 @@ proc ensureText(workspace: Workspace, id: FileId, invalidate = true): bool =
       workspace.files[index].textLoaded and
       sameFileStamp(currentStamp, workspace.files[index].stamp):
     return true
+  if workspace.files[index].state == workspaceOnDisk and
+      workspace.files[index].index == nil:
+    workspace.files[index].index = workspace.cachedManifestIndex(id, currentStamp)
 
   let stable = stableDiskSource(path)
   if not stable.valid:
@@ -836,15 +856,14 @@ proc ensureIndex(workspace: Workspace, id: FileId): bool =
     discard workspace.ensureText(id)
     return workspace.files[index].index != nil
 
+  let cached = workspace.cachedManifestIndex(id, currentStamp)
+  if cached != nil:
+    workspace.files[index].index = cached
+    return true
+
   if workspace.manifestByPath.hasKey(path):
     let entry = workspace.manifestByPath[path]
     if entry.byteLength == currentStamp.size and entry.byteLength <= int64(high(int)):
-      let cached = loadCachedSourceIndexFingerprint(
-        workspace.root, path, entry.sourceHash, int(entry.byteLength)
-      )
-      if cached != nil:
-        workspace.files[index].index = cached
-        return true
       let stable = stableDiskSource(path)
       if stable.valid and sameFileStamp(stable.stamp, currentStamp) and
           stable.source.len == int(entry.byteLength) and
