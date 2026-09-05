@@ -642,6 +642,40 @@ suite "stdio LSP":
         "method": "textDocument/didChange",
         "params": {
           "textDocument": {"uri": consumerUri, "version": 2},
+          "contentChanges": [{"text": "import provider\nprovider.an\n"}],
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "textDocument/completion",
+        "params": {
+          "textDocument": {"uri": consumerUri}, "position": {"line": 1, "character": 11}
+        },
+      },
+    )
+    let projectCompletion = readResponse(process.outputStream, 7)
+    check projectCompletion != nil
+    check projectCompletion["result"]["items"].len == 1
+    check projectCompletion["result"]["items"][0]["label"].getStr == "answer"
+    check projectCompletion["result"]["items"][0]["kind"].getInt == 3
+    check projectCompletion["result"]["items"][0]["textEdit"]["range"]["start"][
+      "character"
+    ].getInt == 9
+    check projectCompletion["result"]["items"][0]["textEdit"]["range"]["end"][
+      "character"
+    ].getInt == 11
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+          "textDocument": {"uri": consumerUri, "version": 3},
           "contentChanges": [
             {
               "text":
@@ -651,6 +685,21 @@ suite "stdio LSP":
         },
       },
     )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "textDocument/completion",
+        "params": {
+          "textDocument": {"uri": consumerUri}, "position": {"line": 2, "character": 9}
+        },
+      },
+    )
+    let implicitResultCompletion = readResponse(process.outputStream, 8)
+    check implicitResultCompletion != nil
+    check implicitResultCompletion["result"].kind == JNull
+
     sendMessage(
       process.inputStream,
       %*{
@@ -686,7 +735,6 @@ suite "stdio LSP":
     createDir(root)
     let providerPath = root / "provider.nim"
     let consumerPath = root / "consumer.nim"
-    let providerUri = "file://" & providerPath.replace('\\', '/')
     let consumerUri = "file://" & consumerPath.replace('\\', '/')
     writeFile(providerPath, "proc answer*() = discard\n")
     let process =

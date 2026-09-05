@@ -5,6 +5,7 @@ import onim/index/cache
 import onim/index/source_index
 import onim/session/ids as onimIds
 import onim/session/workspace
+import onim/stdlib/map
 
 proc localSnapshot(source: string, path = "main.nim"): WorkspaceSnapshot =
   WorkspaceSnapshot(
@@ -128,6 +129,27 @@ suite "native local completion":
 """
     check completionAt(macroSource, "val").state == completionUnsupported
 
+  test "dispatches ordinary locals and rejects malformed members":
+    let source = """proc show(value: int) =
+  let localValue = value
+  echo loc
+"""
+    let snapshot = localSnapshot(source)
+    let workspace = initWorkspace()
+    let ordinary =
+      completeAt(workspace, snapshot, source.rfind("loc") + 3, emptyStdlibMap())
+    check ordinary.state == completionAvailable
+    check ordinary.items.mapIt(it.label) == @["localValue"]
+
+    let chained = """import std/os as filesystem
+proc show() =
+  filesystem.os.walkD
+"""
+    let chainedSnapshot = localSnapshot(chained)
+    let chainedOffset = chained.rfind("walkD") + "walkD".len
+    check completeAt(workspace, chainedSnapshot, chainedOffset, emptyStdlibMap()).state ==
+      completionUnsupported
+
   test "matches the cached source index":
     let root = getTempDir() / ("onim-completion-cache-" & $getCurrentProcessId())
     let path = root / "main.nim"
@@ -155,3 +177,183 @@ suite "native local completion":
     else:
       delEnv("ONIM_CACHE_DIR")
     removeDir(root)
+
+  test "completes canonical stdlib module members":
+    let root = getTempDir() / ("onim-module-completion-" & $getCurrentProcessId())
+    let cacheRoot =
+      getTempDir() / ("onim-module-completion-cache-" & $getCurrentProcessId())
+    if dirExists(root):
+      removeDir(root)
+    if dirExists(cacheRoot):
+      removeDir(cacheRoot)
+    createDir(root)
+    let path = root / "main.nim"
+    let direct = """import std/os as filesystem
+proc main() =
+  filesystem.walkD
+"""
+    writeFile(path, direct)
+    let previous = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
+    defer:
+      if previous.len > 0:
+        putEnv("ONIM_CACHE_DIR", previous)
+      else:
+        delEnv("ONIM_CACHE_DIR")
+      removeFile(path)
+      removeDir(root)
+      if dirExists(cacheRoot):
+        removeDir(cacheRoot)
+
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    check workspace.graphComplete
+    let stdlib = loadStdlibMap("")
+    let directId = workspace.fileIdForPath(path)
+    let directSnapshot = workspace.snapshotForFile(directId)
+    let directOffset = direct.find("filesystem.walkD") + "filesystem.".len + "walkD".len
+    let directResult = completeAt(workspace, directSnapshot, directOffset, stdlib)
+    check directResult.state == completionAvailable
+    check directResult.replaceStart == direct.find("walkD")
+    check directResult.replaceEnd == directOffset
+    check directResult.items.anyIt(it.label == "walkDir")
+    check directResult.items.anyIt(it.label == "walkDirRec")
+    check completeAt(workspace, directSnapshot, directOffset, emptyStdlibMap()).state ==
+      completionUnsupported
+
+    let legacy = """import os as filesystem
+proc main() =
+  filesystem.
+"""
+    discard workspace.changeDocument("file://" & path, path, legacy, 2)
+    let legacySnapshot = workspace.snapshotForFile(directId)
+    let legacyOffset = legacy.find("filesystem.") + "filesystem.".len
+    let legacyResult = completeAt(workspace, legacySnapshot, legacyOffset, stdlib)
+    check legacyResult.state == completionUnsupported
+
+  test "completes project members, refreshes overlays, and respects precedence":
+    let root = getTempDir() / ("onim-project-completion-" & $getCurrentProcessId())
+    let cacheRoot =
+      getTempDir() / ("onim-project-completion-cache-" & $getCurrentProcessId())
+    if dirExists(root):
+      removeDir(root)
+    if dirExists(cacheRoot):
+      removeDir(cacheRoot)
+    createDir(root)
+    let providerPath = root / "provider.nim"
+    let consumerPath = root / "consumer.nim"
+    let shadowPath = root / "stdlib_shadow.nim"
+    let provider = """proc answer*() = discard
+proc another*() = discard
+proc private() = discard
+"""
+    let consumer = """import provider as p
+proc main() =
+  p.an
+"""
+    writeFile(providerPath, provider)
+    writeFile(consumerPath, consumer)
+    writeFile(root / "os.nim", "proc localOnly*() = discard\n")
+    writeFile(shadowPath, "import os\nproc main() =\n  os.loc\n")
+    let previous = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
+    defer:
+      if previous.len > 0:
+        putEnv("ONIM_CACHE_DIR", previous)
+      else:
+        delEnv("ONIM_CACHE_DIR")
+      for path in [providerPath, consumerPath, shadowPath, root / "os.nim"]:
+        if fileExists(path):
+          removeFile(path)
+      removeDir(root)
+      if dirExists(cacheRoot):
+        removeDir(cacheRoot)
+
+    let stdlib = loadStdlibMap("")
+
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    check workspace.graphComplete
+    let consumerId = workspace.fileIdForPath(consumerPath)
+    let consumerSnapshot = workspace.snapshotForFile(consumerId)
+    let memberOffset = consumer.find("p.an") + "p.an".len
+    let projectResult = completeAt(workspace, consumerSnapshot, memberOffset, stdlib)
+    check projectResult.state == completionAvailable
+    check projectResult.items.anyIt(it.label == "answer")
+    check projectResult.items.anyIt(it.label == "another")
+    check not projectResult.items.anyIt(it.label == "private")
+    check projectResult.items.anyIt(it.kind == completionFunction)
+
+    let shadowId = workspace.fileIdForPath(shadowPath)
+    let shadowSnapshot = workspace.snapshotForFile(shadowId)
+    let shadowOffset = shadowSnapshot.text.find("os.loc") + "os.loc".len
+    let shadowResult = completeAt(workspace, shadowSnapshot, shadowOffset, stdlib)
+    check shadowResult.state == completionAvailable
+    check shadowResult.items.mapIt(it.label) == @["localOnly"]
+
+    let overlay = """proc answer*() = discard
+proc anew*() = discard
+"""
+    discard workspace.openDocument("file://" & providerPath, providerPath, overlay, 2)
+    let refreshedSnapshot = workspace.snapshotForFile(consumerId)
+    let refreshedResult = completeAt(workspace, refreshedSnapshot, memberOffset, stdlib)
+    check refreshedResult.state == completionAvailable
+    check refreshedResult.items.anyIt(it.label == "anew")
+    check not refreshedResult.items.anyIt(it.label == "another")
+
+    let shadowed = """import provider as p
+proc main(p: int) =
+  p.an
+"""
+    discard
+      workspace.changeDocument("file://" & consumerPath, consumerPath, shadowed, 3)
+    let shadowedSnapshot = workspace.snapshotForFile(consumerId)
+    let shadowedOffset = shadowed.find("p.an") + "p.an".len
+    check completeAt(workspace, shadowedSnapshot, shadowedOffset, stdlib).state ==
+      completionUnsupported
+
+    let implicit = """import provider as result
+proc use(): int =
+  result.an
+"""
+    discard
+      workspace.changeDocument("file://" & consumerPath, consumerPath, implicit, 4)
+    let implicitSnapshot = workspace.snapshotForFile(consumerId)
+    let implicitOffset = implicit.find("result.an") + "result.an".len
+    check completeAt(workspace, implicitSnapshot, implicitOffset, stdlib).state ==
+      completionUnsupported
+
+    let conditional = """when defined(posix):
+  import provider as p
+proc use() =
+  p.an
+"""
+    discard
+      workspace.changeDocument("file://" & consumerPath, consumerPath, conditional, 5)
+    let conditionalSnapshot = workspace.snapshotForFile(consumerId)
+    let conditionalOffset = conditional.find("p.an") + "p.an".len
+    check completeAt(workspace, conditionalSnapshot, conditionalOffset, stdlib).state ==
+      completionUnsupported
+
+    let excluded = """import provider except answer
+proc use() =
+  provider.an
+"""
+    discard
+      workspace.changeDocument("file://" & consumerPath, consumerPath, excluded, 6)
+    let excludedSnapshot = workspace.snapshotForFile(consumerId)
+    let excludedOffset = excluded.find("provider.an") + "provider.an".len
+    check completeAt(workspace, excludedSnapshot, excludedOffset, stdlib).state ==
+      completionUnsupported
+
+    let duplicate = """import provider as p
+import std/os as p
+proc use() =
+  p.an
+"""
+    discard
+      workspace.changeDocument("file://" & consumerPath, consumerPath, duplicate, 7)
+    let duplicateSnapshot = workspace.snapshotForFile(consumerId)
+    let duplicateOffset = duplicate.find("p.an") + "p.an".len
+    check completeAt(workspace, duplicateSnapshot, duplicateOffset, stdlib).state ==
+      completionUnsupported

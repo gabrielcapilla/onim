@@ -1,4 +1,4 @@
-import std/[os, tables, unittest]
+import std/[os, sequtils, tables, unittest]
 
 import onim/index/source_index
 import onim/index/surfaces
@@ -58,6 +58,43 @@ suite "native module surfaces":
     check collision.candidates.len == 2
     check index.moduleAt(collision.candidates[0].surface).module == "std/alpha"
     check index.moduleAt(collision.candidates[1].surface).module == "std/zeta"
+
+    var allMembers: seq[BindingCandidate] = @[]
+    check index.appendBindingsInModule("std/alpha", "", allMembers)
+    check allMembers.mapIt(it.name) == @["Foo_Bar", "split"]
+    var fooMembers: seq[BindingCandidate] = @[]
+    check index.appendBindingsInModule("std/alpha", "Foo", fooMembers)
+    check fooMembers.mapIt(it.name) == @["Foo_Bar"]
+    var unchanged = @[allMembers[0]]
+    check not index.appendBindingsInModule("std/missing", "", unchanged)
+    check unchanged.len == 1
+
+    let uncertain = buildSurfaceIndex(
+      @[
+        SurfaceInput(
+          module: "std/uncertain",
+          origin: surfaceStdlib,
+          uncertainty: {surfaceConditional},
+          exports: @[exported("member", symbolProc)],
+        )
+      ],
+      universeComplete = true,
+    )
+    var uncertainDestination = @[allMembers[0]]
+    check not uncertain.appendBindingsInModule(
+      "std/uncertain", "", uncertainDestination
+    )
+    check uncertainDestination.len == 1
+
+    let incomplete = buildSurfaceIndex(
+      @[SurfaceInput(module: "std/incomplete", origin: surfaceStdlib)],
+      universeComplete = false,
+    )
+    var incompleteDestination = @[allMembers[0]]
+    check not incomplete.appendBindingsInModule(
+      "std/incomplete", "", incompleteDestination
+    )
+    check incompleteDestination.len == 1
 
   test "marks uncertain modules as unknown instead of guessing":
     let index = buildSurfaceIndex(

@@ -4,6 +4,7 @@ import onim/features/completion
 import onim/index/source_index
 import onim/session/ids as onimIds
 import onim/session/workspace
+import onim/stdlib/map
 
 const
   warmupCount = 10
@@ -40,6 +41,9 @@ proc nestedSource(depth: int): string =
     result.add " ".repeat(2 * (level + 1)) & "block:\n"
     result.add " ".repeat(2 * (level + 2)) & "let nested" & $level & " = value\n"
   result.add " ".repeat(2 * (depth + 1)) & "echo nested\n"
+
+proc moduleSource(prefix: string): string =
+  "import std/os as filesystem\nproc measure() =\n  filesystem." & prefix & "\n"
 
 proc completionOffset(source: string, prefix: string): int =
   let start = source.rfind(prefix)
@@ -90,6 +94,120 @@ proc retainedMemory(snapshot: WorkspaceSnapshot, offset: int) =
     " checksum=",
     checksum
 
+proc measureModuleFeature(stdlib: StdlibMap) =
+  let source = moduleSource("walkD")
+  let snapshot = localSnapshot(source)
+  let workspace = initWorkspace()
+  let offset = source.completionOffset("walkD")
+  for _ in 0 ..< warmupCount:
+    let warm = completeAt(workspace, snapshot, offset, stdlib)
+    doAssert warm.state == completionAvailable and warm.items.len > 0
+  var samples: seq[float] = @[]
+  var checksum = 0
+  for _ in 0 ..< sampleCount:
+    let started = getMonoTime()
+    for _ in 0 ..< queriesPerSample:
+      let completion = completeAt(workspace, snapshot, offset, stdlib)
+      doAssert completion.state == completionAvailable
+      inc checksum, completion.items.len
+    samples.add (getMonoTime() - started).inNanoseconds.float /
+      (1_000_000 * queriesPerSample)
+  let middle = samples.median()
+  let upper = samples.percentile(0.95)
+  echo "module_stdlib",
+    " prefix=walkD",
+    " median_us=",
+    middle * 1_000,
+    " p95_us=",
+    upper * 1_000,
+    " candidates=",
+    checksum div (sampleCount * queriesPerSample)
+
+proc cleanProjectTree(root: string) =
+  if not dirExists(root):
+    return
+  var directories: seq[string] = @[]
+  for path in walkDirRec(root):
+    if fileExists(path):
+      removeFile(path)
+    elif dirExists(path):
+      directories.add path
+  directories.sort(
+    proc(left, right: string): int =
+      cmp(right.len, left.len)
+  )
+  for path in directories:
+    if dirExists(path):
+      removeDir(path)
+  if dirExists(root):
+    removeDir(root)
+
+proc projectProviderSource(memberCount: int): string =
+  for memberIndex in 0 ..< memberCount:
+    result.add "proc member" & $memberIndex & "*() = discard\n"
+
+proc measureProjectMembers(
+    name: string, memberCount, unrelatedCount: int, stdlib: StdlibMap
+) =
+  let root = getTempDir() / ("onim-completion-bench-" & $getCurrentProcessId())
+  let cacheRoot =
+    getTempDir() / ("onim-completion-bench-cache-" & $getCurrentProcessId())
+  cleanProjectTree(root)
+  cleanProjectTree(cacheRoot)
+  createDir(root)
+  createDir(cacheRoot)
+  let providerPath = root / "provider.nim"
+  let consumerPath = root / "consumer.nim"
+  writeFile(providerPath, projectProviderSource(memberCount))
+  let source = "import provider\nproc measure() =\n  provider.member\n"
+  writeFile(consumerPath, source)
+  for unrelatedIndex in 0 ..< unrelatedCount:
+    writeFile(
+      root / ("unrelated" & $unrelatedIndex & ".nim"),
+      "proc unrelated" & $unrelatedIndex & "*() = discard\n",
+    )
+  let previousCacheRoot = getEnv("ONIM_CACHE_DIR")
+  putEnv("ONIM_CACHE_DIR", cacheRoot)
+  defer:
+    if previousCacheRoot.len > 0:
+      putEnv("ONIM_CACHE_DIR", previousCacheRoot)
+    else:
+      delEnv("ONIM_CACHE_DIR")
+    cleanProjectTree(root)
+    cleanProjectTree(cacheRoot)
+
+  let workspace = initWorkspace(root)
+  workspace.indexWorkspace()
+  let consumerId = workspace.fileIdForPath(consumerPath)
+  let snapshot = workspace.snapshotForFile(consumerId)
+  let offset = source.completionOffset("member")
+  for _ in 0 ..< warmupCount:
+    let warm = completeAt(workspace, snapshot, offset, stdlib)
+    doAssert warm.state == completionAvailable and warm.items.len == memberCount
+  var samples: seq[float] = @[]
+  var checksum = 0
+  for _ in 0 ..< sampleCount:
+    let started = getMonoTime()
+    for _ in 0 ..< queriesPerSample:
+      let completion = completeAt(workspace, snapshot, offset, stdlib)
+      doAssert completion.state == completionAvailable
+      inc checksum, completion.items.len
+    samples.add (getMonoTime() - started).inNanoseconds.float /
+      (1_000_000 * queriesPerSample)
+  let middle = samples.median()
+  let upper = samples.percentile(0.95)
+  echo name,
+    " members=",
+    memberCount,
+    " unrelated=",
+    unrelatedCount,
+    " median_us=",
+    middle * 1_000,
+    " p95_us=",
+    upper * 1_000,
+    " candidates=",
+    checksum div (sampleCount * queriesPerSample)
+
 proc sendMessage(input: Stream, message: JsonNode) =
   let body = $message
   input.write("Content-Length: " & $body.len & "\r\n\r\n" & body)
@@ -119,7 +237,7 @@ proc readResponse(output: Stream, id: int): JsonNode =
     if message.hasKey("id") and message["id"].kind == JInt and message["id"].getInt == id:
       return message
 
-proc measureLsp(source: string): bool =
+proc measureLsp(source: string, cursorText: string): bool =
   let executable = getCurrentDir() / "onim"
   if not fileExists(executable):
     echo "lsp_roundtrip=skipped (build ./onim first)"
@@ -156,7 +274,7 @@ proc measureLsp(source: string): bool =
   )
 
   let line = max(0, source.count('\n') - 1)
-  let character = "  echo local".len
+  let character = cursorText.len
   let warmRequest = 10
   sendMessage(
     process.inputStream,
@@ -221,4 +339,9 @@ for depth in [1, 8, 32]:
 let retainedSource = sourceFor(64)
 let retainedSnapshot = localSnapshot(retainedSource)
 retainedMemory(retainedSnapshot, retainedSource.completionOffset("local"))
-discard measureLsp(sourceFor(8))
+let stdlib = loadStdlibMap("")
+measureModuleFeature(stdlib)
+for unrelatedCount in [0, 128, 512]:
+  measureProjectMembers("module_project", 256, unrelatedCount, stdlib)
+discard measureLsp(sourceFor(8), "  echo local")
+discard measureLsp(moduleSource("walkD"), "  filesystem.walkD")

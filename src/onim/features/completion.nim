@@ -1,10 +1,15 @@
-import std/[algorithm, os, sets, strutils, tables]
+import std/[algorithm, sets, strutils, tables]
 
+import ./definition
 import ../index/bindings
 import ../index/occurrences
 import ../index/scopes
 import ../index/source_index
 import ../index/symbols
+import ../index/surfaces
+import ../stdlib/map
+import ../session/ids
+import ../session/module_catalog
 import ../session/workspace
 import ../syntax/imports
 import ../syntax/lexer
@@ -17,6 +22,9 @@ type
   CompletionKind* = enum
     completionVariable
     completionConstant
+    completionFunction
+    completionMethod
+    completionType
 
   CompletionItem* = object
     label*: string
@@ -34,6 +42,27 @@ type
     distance: uint32
     declarationToken: uint32
 
+  MemberContextState = enum
+    memberContextAbsent
+    memberContextInvalid
+    memberContextReady
+
+  MemberContext = object
+    state: MemberContextState
+    qualifierToken: int
+    prefix: string
+    replaceStart: int
+    replaceEnd: int
+
+  ImportMatchState = enum
+    importMatchMissing
+    importMatchUnique
+    importMatchAmbiguous
+
+  ImportMatch = object
+    state: ImportMatchState
+    item: ImportInfo
+
 proc scopeOrdinal(scope: ScopeId): int {.inline.} =
   int(uint32(scope)) - 1
 
@@ -46,6 +75,63 @@ proc prefixToken(index: SourceIndex, byteOffset: int): int =
   if index.parsed.tokens[candidate].endOffset != byteOffset:
     return -1
   candidate
+
+proc memberContext(index: SourceIndex, byteOffset: int): MemberContext =
+  if index == nil or byteOffset <= 0 or byteOffset > index.byteLength:
+    return
+  let candidate = index.parsed.tokens.tokenContaining(byteOffset - 1, byteOffset)
+  if candidate < 0 or index.parsed.tokens[candidate].endOffset != byteOffset:
+    return
+
+  var dotToken = -1
+  var memberToken = -1
+  let token = index.parsed.tokens[candidate]
+  if token.kind == tkIdentifier:
+    memberToken = candidate
+    dotToken = candidate - 1
+    result.replaceStart = token.startOffset
+    result.replaceEnd = byteOffset
+  elif token.kind == tkPunctuation and token.text == ".":
+    dotToken = candidate
+    result.replaceStart = byteOffset
+    result.replaceEnd = byteOffset
+  else:
+    return
+
+  if dotToken < 0 or dotToken >= index.parsed.tokens.len or
+      index.parsed.tokens[dotToken].kind != tkPunctuation or
+      index.parsed.tokens[dotToken].text != ".":
+    if memberToken >= 0:
+      return
+    result.state = memberContextInvalid
+    return
+
+  let dot = index.parsed.tokens[dotToken]
+  let qualifierToken = dotToken - 1
+  if qualifierToken < 0 or qualifierToken >= index.parsed.tokens.len or
+      dot.line != index.parsed.tokens[qualifierToken].line or
+      index.parsed.tokens[qualifierToken].kind != tkIdentifier or
+      not index.parsed.tokens[qualifierToken].validIdentifier or
+      index.parsed.tokens[qualifierToken].isStropped or
+      isNimKeyword(index.parsed.tokens[qualifierToken].text) or
+      index.parsed.tokens[qualifierToken].endOffset != dot.startOffset or
+      (qualifierToken > 0 and index.parsed.tokens[qualifierToken - 1].text == "."):
+    result.state = memberContextInvalid
+    return
+  if memberToken >= 0:
+    let member = index.parsed.tokens[memberToken]
+    if member.line != dot.line or member.startOffset != dot.endOffset or
+        not member.validIdentifier or member.isStropped or isNimKeyword(member.text):
+      result.state = memberContextInvalid
+      return
+
+  result.state = memberContextReady
+  result.qualifierToken = qualifierToken
+  result.prefix =
+    if memberToken >= 0:
+      index.parsed.tokens[memberToken].text
+    else:
+      ""
 
 proc declarationToken(index: SourceIndex, tokenIndex: uint32): bool {.inline.} =
   for symbol in index.symbols:
@@ -72,6 +158,134 @@ proc completionContext(index: SourceIndex, tokenIndex: int): bool =
   ):
     return false
   index.occurrences.rolesForToken(uint32(tokenIndex)) == {occurrenceReference}
+
+proc importedQualifier(item: ImportInfo): string {.inline.} =
+  if item.alias.len > 0:
+    item.alias
+  else:
+    moduleLeaf(item.module)
+
+proc moduleDeclarationShadows(index: SourceIndex, tokenIndex: int): bool =
+  if index == nil or tokenIndex < 0 or tokenIndex >= index.parsed.tokens.len:
+    return true
+  let wanted = identifierKey(index.parsed.tokens[tokenIndex].text)
+  if wanted.len == 0:
+    return true
+  for symbol in index.symbols:
+    if symbol.nameToken == uint32(tokenIndex) or
+        symbol.nameToken >= uint32(index.parsed.tokens.len):
+      continue
+    if identifierKey(index.parsed.tokens[int(symbol.nameToken)].text) == wanted:
+      return true
+  false
+
+proc importForQualifier(source: WorkspaceSnapshot, qualifier: string): ImportMatch =
+  if source.index == nil or qualifier.len == 0:
+    return
+  for item in source.index.parsed.imports:
+    if item.form != importModule or not sameIdentifier(
+      item.importedQualifier, qualifier
+    ):
+      continue
+    case result.state
+    of importMatchMissing:
+      result.state = importMatchUnique
+      result.item = item
+    of importMatchUnique, importMatchAmbiguous:
+      result.state = importMatchAmbiguous
+      return
+
+proc appendCompletionCandidate(
+    name: string,
+    kind: CompletionKind,
+    prefixKey: string,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+): bool =
+  let key = identifierKey(name)
+  if key.len == 0 or (prefixKey.len > 0 and not key.startsWith(prefixKey)):
+    return true
+  let visible = VisibleCompletion(
+    item: CompletionItem(label: name, kind: kind),
+    key: key,
+    declarationToken: high(uint32),
+  )
+  if not candidateByName.hasKey(key):
+    candidateByName[key] = candidates.len
+    candidates.add visible
+  elif ord(visible.item.kind) < ord(candidates[candidateByName[key]].item.kind):
+    candidates[candidateByName[key]] = visible
+  true
+
+proc memberCompletionKind(kind: SourceSymbolKind): CompletionKind {.inline.} =
+  case kind
+  of symbolConst:
+    completionConstant
+  of symbolMethod:
+    completionMethod
+  of symbolType:
+    completionType
+  of symbolProc, symbolFunc, symbolIterator, symbolMacro, symbolTemplate,
+      symbolConverter:
+    completionFunction
+  of symbolVar, symbolLet:
+    completionVariable
+
+proc appendProjectMembers(
+    input: SurfaceInput,
+    prefixKey: string,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+): bool =
+  if input.module.len == 0 or input.uncertainty != {}:
+    return false
+  for exported in input.exports:
+    if not exported.kindKnown or identifierKey(exported.name).len == 0:
+      return false
+    discard appendCompletionCandidate(
+      exported.name,
+      memberCompletionKind(exported.kind),
+      prefixKey,
+      candidates,
+      candidateByName,
+    )
+  true
+
+proc stdlibModuleName(stdlib: StdlibMap, reference: string): string =
+  if stdlib == nil or not stdlib.surfaceIsComplete:
+    return
+  let surface = stdlib.surfaceIndex()
+  if surface == nil or not surface.valid or not surface.universeIsComplete:
+    return
+  let canonical = canonicalSurfaceModule(reference)
+  if canonical.startsWith("std/") and surface.moduleKnown(canonical):
+    return canonical
+
+proc appendStdlibMembers(
+    stdlib: StdlibMap,
+    module, prefix: string,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+): bool =
+  let moduleName = stdlib.stdlibModuleName(module)
+  if moduleName.len == 0:
+    return false
+  let surface = stdlib.surfaceIndex()
+  var bindings: seq[BindingCandidate] = @[]
+  if not surface.appendBindingsInModule(moduleName, prefix, bindings):
+    return false
+  for binding in bindings:
+    let exports = surface.exportsFor(binding)
+    if exports.len == 0:
+      return false
+    discard appendCompletionCandidate(
+      binding.name,
+      memberCompletionKind(exports[0].kind),
+      identifierKey(prefix),
+      candidates,
+      candidateByName,
+    )
+  true
 
 proc unsupportedStructure(index: SourceIndex): bool =
   for symbol in index.symbols:
@@ -209,3 +423,78 @@ proc completeLocals*(source: WorkspaceSnapshot, byteOffset: int): CompletionResu
   result.items = newSeqOfCap[CompletionItem](candidates.len)
   for candidate in candidates:
     result.items.add candidate.item
+
+proc completeModuleMembers(
+    workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int, stdlib: StdlibMap
+): CompletionResult =
+  if workspace == nil or not source.valid or source.index == nil or
+      source.index.contentHash != contentFingerprint(source.text) or
+      source.index.byteLength != source.text.len or
+      source.path.toLowerAscii.endsWith(".nimble") or
+      source.path.toLowerAscii.endsWith(".cfg"):
+    return
+  let context = source.index.memberContext(byteOffset)
+  if context.state != memberContextReady or not source.index.bindingsReady or
+      not source.index.parsed.nativeIndexSafe(source.index):
+    return
+  let qualifier = source.index.parsed.tokens[context.qualifierToken].text
+  if not source.importedUseSupported(context.qualifierToken, qualifier):
+    return
+  if source.index.moduleDeclarationShadows(context.qualifierToken):
+    return
+  let qualifierDefinition =
+    resolveDefinitionAtToken(workspace, source, context.qualifierToken)
+  if qualifierDefinition.kind != definitionUnknown:
+    return
+  let matched = source.importForQualifier(qualifier)
+  if matched.state != importMatchUnique or matched.item.synthetic or
+      matched.item.conditional or matched.item.excluded.len > 0:
+    return
+  let catalog = workspace.moduleCatalog()
+  if catalog == nil or not catalog.complete:
+    return
+
+  var candidates: seq[VisibleCompletion] = @[]
+  var candidateByName = initTable[string, int]()
+  let owner = workspace.moduleForPath(source.path)
+  let project = catalog.resolveModuleName(owner, matched.item.module)
+  case project.kind
+  of moduleResolved:
+    if not workspace.graphComplete:
+      return
+    let view = workspace.indexViewForFile(project.id)
+    if not view.valid or view.index == nil or view.id.value != source.id.value or
+        not view.index.parsed.nativeIndexSafe(view.index):
+      return
+    let input = projectSurfaceInput(project.module, view.index)
+    if not appendProjectMembers(
+      input, identifierKey(context.prefix), candidates, candidateByName
+    ):
+      return
+  of moduleMissing:
+    if not appendStdlibMembers(
+      stdlib, matched.item.module, context.prefix, candidates, candidateByName
+    ):
+      return
+  of moduleAmbiguous, moduleUnknown:
+    return
+
+  candidates.sort(compareCompletion)
+  result.state = completionAvailable
+  result.replaceStart = context.replaceStart
+  result.replaceEnd = context.replaceEnd
+  result.items = newSeqOfCap[CompletionItem](candidates.len)
+  for candidate in candidates:
+    result.items.add candidate.item
+
+proc completeAt*(
+    workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int, stdlib: StdlibMap
+): CompletionResult =
+  let context = source.index.memberContext(byteOffset)
+  case context.state
+  of memberContextReady:
+    completeModuleMembers(workspace, source, byteOffset, stdlib)
+  of memberContextInvalid:
+    CompletionResult()
+  of memberContextAbsent:
+    completeLocals(source, byteOffset)

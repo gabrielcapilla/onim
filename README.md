@@ -90,11 +90,16 @@ references preserve same-file binding identity and extend those project targets
 through the direct reverse dependency graph; unsupported, ambiguous, stale, or
 incomplete snapshots return `null` instead of guessing.
 
-Native completion is deliberately conservative: it currently returns visible
-parameters and direct `let`/`var`/`const` declarations from supported routine
-and unnamed-block scopes. Unsupported contexts return `null` without invoking
-the compiler or semantic worker; the response is marked incomplete while
-module, type, member, and keyword completion remain future native milestones.
+Native completion is deliberately conservative: it returns visible parameters
+and direct `let`/`var`/`const` declarations from supported routine and
+unnamed-block scopes, plus members of one direct imported project or complete
+stdlib module. Project completion uses a complete indexed module surface and
+graph; canonical `std/...` completion uses the complete bundled surface. Direct
+imports, aliases, empty member prefixes, and Nim identifier prefixes are
+supported. Unsupported contexts return `null` without invoking
+the compiler or semantic worker; the response remains marked incomplete while
+type/member inference, UFCS, `from` completion, re-exports, and keyword
+completion remain future native milestones.
 
 The shared surface index stores sorted module ranges, normalized identifier keys,
 overload records, and deterministic ambiguity results. Project surfaces are
@@ -179,6 +184,21 @@ It reports median, p95, p99, fallback counts, and edit positions. The fast path
 is intentionally conservative; edits that change token boundaries, line
 structure, imports, declarations, or uncertain syntax use the complete index
 path.
+
+The completion benchmark measures warm local completion, complete stdlib-module
+completion, and a 256-member project module with 0, 128, and 512 unrelated
+modules. It also measures stdio round trips for local and stdlib-member
+completion:
+
+```sh
+nim c -d:release -o:onim-release --path:src --hints:off --warnings:off src/onim.nim
+nim c -d:release -o:bench/bench_completion --path:src --hints:off --warnings:off bench/bench_completion.nim
+ONIM_BIN="$PWD/onim-release" ./bench/bench_completion
+```
+
+The project-member samples verify that unrelated indexed modules do not enter
+the request path; the benchmark reports median and p95 latency together with
+the returned candidate count.
 
 The workspace benchmark builds a 256-module dependency chain and reports cold
 indexing versus a fresh workspace loading the manifest-backed module records:

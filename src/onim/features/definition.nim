@@ -211,7 +211,7 @@ proc localDeclarationShadows(
     scope = source.index.scopes.parentScope(scope)
   false
 
-proc importedUseSupported(
+proc importedUseSupported*(
     source: WorkspaceSnapshot, tokenIndex: int, name: string
 ): bool =
   if source.index == nil or not source.index.bindingsReady or tokenIndex < 0 or

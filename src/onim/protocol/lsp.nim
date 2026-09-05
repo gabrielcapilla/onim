@@ -630,8 +630,13 @@ proc completionItemKind(kind: CompletionKind): int {.inline.} =
   case kind
   of completionVariable: 6
   of completionConstant: 21
+  of completionFunction: 3
+  of completionMethod: 2
+  of completionType: 7
 
-proc completionResponse(params: JsonNode, workspace: Workspace): JsonNode =
+proc completionResponse(
+    params: JsonNode, workspace: Workspace, stdlib: StdlibMap
+): JsonNode =
   result = newJNull()
   let textDocument = valueOrEmpty(params, "textDocument")
   if textDocument.kind != JObject or not textDocument.hasKey("uri") or
@@ -647,7 +652,7 @@ proc completionResponse(params: JsonNode, workspace: Workspace): JsonNode =
     return
   let positions = initPositionIndex(snapshot.text)
   let offset = offsetAt(positions, snapshot.text, valueOrEmpty(params, "position"))
-  let completion = completeLocals(snapshot, offset)
+  let completion = completeAt(workspace, snapshot, offset, stdlib)
   if completion.state != completionAvailable:
     return
   let start = positionAt(positions, snapshot.text, completion.replaceStart)
@@ -1310,7 +1315,7 @@ proc runLsp*() =
         sendResponse(id, renameResponse(params, workspace))
     of "textDocument/completion":
       if hasId:
-        sendResponse(id, completionResponse(params, workspace))
+        sendResponse(id, completionResponse(params, workspace, stdlib))
     of "textDocument/documentSymbol":
       if hasId:
         sendResponse(id, documentSymbols(params, workspace))

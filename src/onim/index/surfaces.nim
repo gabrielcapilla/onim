@@ -405,6 +405,28 @@ proc moduleAt*(index: SurfaceIndex, id: SurfaceId): ModuleSurface =
   if ordinal >= 0 and ordinal < index.modules.len:
     return index.modules[ordinal]
 
+proc appendBindingsInModule*(
+    index: SurfaceIndex, module, prefix: string, destination: var seq[BindingCandidate]
+): bool =
+  if index == nil or not index.valid or not index.universeComplete:
+    return false
+  let canonical = canonicalSurfaceModule(module)
+  if canonical.len == 0 or not index.byModule.hasKey(canonical):
+    return false
+  let surface = index.moduleAt(index.byModule[canonical])
+  if surface.moduleUncertain:
+    return false
+  let wanted = surfaceKey(prefix)
+  let first = int(surface.firstBinding)
+  let past = int(surface.pastBinding)
+  if first < 0 or first > past or past > index.bindings.len:
+    return false
+  for ordinal in first ..< past:
+    let binding = index.bindings[ordinal]
+    if wanted.len == 0 or binding.key.startsWith(wanted):
+      destination.add binding
+  true
+
 proc bindingAt*(index: SurfaceIndex, id: BindingId): BindingCandidate =
   if index == nil:
     return
