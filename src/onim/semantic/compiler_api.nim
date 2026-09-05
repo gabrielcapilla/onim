@@ -1,4 +1,6 @@
-import std/[os, osproc, strutils, tables]
+import std/[hashes, os, osproc, strutils, tables]
+
+import ../index/source_index
 
 when defined(onimEmbedded):
   import nimsuggest/nimsuggest
@@ -24,10 +26,16 @@ type
     column*: int
     message*: string
 
+  DiagnosticCacheKey = object
+    project: string
+    target: string
+    contentHash: uint64
+    byteLength: uint32
+
 const maxDiagnosticCacheEntries = 16
 
-var diagnosticCache = initTable[string, seq[CompilerDiagnostic]]()
-var diagnosticCacheOrder: seq[string] = @[]
+var diagnosticCache = initTable[DiagnosticCacheKey, seq[CompilerDiagnostic]]()
+var diagnosticCacheOrder: seq[DiagnosticCacheKey] = @[]
 
 proc extractUndeclaredName(message: string): string =
   let marker = "undeclared identifier"
@@ -309,13 +317,23 @@ else:
         seen.add diagnostic.name
         result.add diagnostic
 
-proc diagnosticCacheKey(filePath, dirtyPath, source: string): string =
-  let project = absolutePath(if filePath.len > 0: filePath else: dirtyPath)
-  let target = absolutePath(if dirtyPath.len > 0: dirtyPath else: filePath)
-  project & "\n" & target & "\n" & source
+proc hash(key: DiagnosticCacheKey): Hash =
+  result = hash(key.project)
+  result = result !& hash(key.target)
+  result = result !& hash(key.contentHash)
+  result = result !& hash(key.byteLength)
+  result = !$result
 
-proc rememberDiagnostics(key: string, diagnostics: seq[CompilerDiagnostic]) =
-  if key.len == 0:
+proc diagnosticCacheKey(filePath, dirtyPath, source: string): DiagnosticCacheKey =
+  result.project = absolutePath(if filePath.len > 0: filePath else: dirtyPath)
+  result.target = absolutePath(if dirtyPath.len > 0: dirtyPath else: filePath)
+  result.contentHash = contentFingerprint(source)
+  result.byteLength = uint32(source.len)
+
+proc rememberDiagnostics(
+    key: DiagnosticCacheKey, diagnostics: seq[CompilerDiagnostic]
+) =
+  if key.project.len == 0 or key.target.len == 0:
     return
   if diagnosticCache.hasKey(key):
     diagnosticCache[key] = diagnostics
@@ -342,13 +360,11 @@ proc cachedCheckFile*(filePath: string, dirtyPath = ""): seq[CompilerDiagnostic]
 
   # Included files are external inputs to the source text. Do not cache those
   # checks unless their dependency graph is fingerprinted as well.
-  let cacheable = not source.contains("include")
-  let key =
-    if cacheable:
-      diagnosticCacheKey(filePath, dirtyPath, source)
-    else:
-      ""
-  if key.len > 0 and diagnosticCache.hasKey(key):
+  let cacheable = not source.contains("include") and source.len <= int(high(uint32))
+  if not cacheable:
+    return checkFile(filePath, dirtyPath)
+  let key = diagnosticCacheKey(filePath, dirtyPath, source)
+  if diagnosticCache.hasKey(key):
     let cached = diagnosticCache[key]
     let oldIndex = diagnosticCacheOrder.find(key)
     if oldIndex >= 0:
