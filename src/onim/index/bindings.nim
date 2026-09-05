@@ -32,12 +32,6 @@ proc localScope(index: ScopeIndex, scope: ScopeId): bool {.inline.} =
   ordinal >= 0 and ordinal < index.scopes.len and
     index.scopes[ordinal].kind in {scopeRoutine, scopeBlock}
 
-proc parentScope(index: ScopeIndex, scope: ScopeId): ScopeId {.inline.} =
-  let ordinal = int(uint32(scope)) - 1
-  if ordinal >= 0 and ordinal < index.scopes.len:
-    return index.scopes[ordinal].parent
-  InvalidScopeId
-
 proc declarationName(
     index: SourceIndex, declaration: LexicalDeclaration
 ): string {.inline.} =

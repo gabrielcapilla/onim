@@ -1034,17 +1034,6 @@ proc renderImportAdditions(
       startOffset: insertion, endOffset: insertion, newText: newText
     )
 
-proc scopeAncestor(index: SourceIndex, ancestor, descendant: ScopeId): bool =
-  var current = descendant
-  while current != InvalidScopeId:
-    if current == ancestor:
-      return true
-    let ordinal = int(uint32(current)) - 1
-    if ordinal < 0 or ordinal >= index.scopes.scopes.len:
-      return false
-    current = index.scopes.scopes[ordinal].parent
-  false
-
 proc hasLocalDefinition(info: SourceImports, name: string): bool =
   for definedName in info.localDefinitions:
     if sameIdentifier(definedName, name):
@@ -1112,7 +1101,7 @@ proc nativeBinding(
     let declarationIndex = int(declaration.nameToken)
     if declarationIndex < 0 or declarationIndex >= index.parsed.tokens.len or
         not sameIdentifier(index.parsed.tokens[declarationIndex].text, name) or
-        not scopeAncestor(index, declaration.scope, occurrenceScope):
+        not index.scopes.isScopeAncestor(declaration.scope, occurrenceScope):
       continue
     found = true
     if declarationIndex >= tokenIndex:

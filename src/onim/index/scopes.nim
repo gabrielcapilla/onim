@@ -672,6 +672,12 @@ proc validateScopes*[T](
 proc isComplete*(index: ScopeIndex): bool =
   index.uncertainty == {}
 
+proc parentScope*(index: ScopeIndex, scope: ScopeId): ScopeId {.inline.} =
+  let ordinal = int(uint32(scope)) - 1
+  if ordinal >= 0 and ordinal < index.scopes.len:
+    return index.scopes[ordinal].parent
+  InvalidScopeId
+
 proc innermostScopeAt*(index: ScopeIndex, token: uint32): ScopeId =
   for ordinal, scope in index.scopes:
     if scope.containsToken(token):
@@ -679,3 +685,11 @@ proc innermostScopeAt*(index: ScopeIndex, token: uint32): ScopeId =
         result = ScopeId(uint32(ordinal + 1))
       elif scope.firstToken >= index.scopes[int(uint32(result)) - 1].firstToken:
         result = ScopeId(uint32(ordinal + 1))
+
+proc isScopeAncestor*(index: ScopeIndex, ancestor, descendant: ScopeId): bool =
+  var current = descendant
+  while current != InvalidScopeId:
+    if current == ancestor:
+      return true
+    current = index.parentScope(current)
+  false

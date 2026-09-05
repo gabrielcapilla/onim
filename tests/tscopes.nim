@@ -110,6 +110,8 @@ proc second(value: int) =
     check index.scopes.innermostScopeAt(local) == ScopeId(3)
     let after = uint32(index.parsed.tokens.len - 1)
     check index.scopes.innermostScopeAt(after) == ScopeId(2)
+    check index.scopes.isScopeAncestor(ScopeId(2), ScopeId(3))
+    check not index.scopes.isScopeAncestor(ScopeId(3), ScopeId(2))
     check index.scopes.isComplete
 
   test "parents nested blocks and indexes each block's locals":
