@@ -149,8 +149,8 @@ proc reusableManifestFile(
     previousPaths: openArray[string],
     present: HashSet[string],
 ): tuple[state: ManifestReuseState, forward: seq[string]] {.gcsafe.} =
-  if entry.byteLength < 0 or stamp.size != entry.byteLength or
-      not sameFileStamp(stamp, entry.stamp):
+  if entry.byteLength < 0 or entry.byteLength > int64(high(int)) or
+      stamp.size != entry.byteLength or not sameFileStamp(stamp, entry.stamp):
     return
   var previousOrdinal = high(uint32)
   for dependencyOrdinal in entry.forwardOrdinals:
