@@ -1189,12 +1189,12 @@ proc nativeImportRemovalPlan(
     return
   for itemIndex, item in info.imports:
     let module = canonicalModule(item.module)
-    if not module.startsWith("std/") or module notin stdlib.modules:
-      return
     if item.keep:
       continue
     case item.form
     of importModule:
+      if not module.startsWith("std/") or module notin stdlib.modules:
+        return
       case nativeModuleUsed(info, index, item, stdlib)
       of nativeModuleUseFound:
         discard

@@ -159,6 +159,16 @@ suite "organize imports":
       check attempt.handled
       check applyEdits(before, attempt.edits) == expected
 
+  test "removes unused names from an external from import without compiler validation":
+    let source =
+      "from project/module import unusedName, usedName\n" & "\necho usedName()\n"
+    let index = indexSource(source)
+    let attempt =
+      tryOrganizeSourceWithIndex("/no/such/file.nim", source, index, loadStdlibMap(""))
+    check attempt.handled
+    check applyEdits(source, attempt.edits) ==
+      "from project/module import usedName\n" & "\necho usedName()\n"
+
   test "combines native additions with removals":
     let source = "import std/os\n\necho fmt(\"hi\")\n"
     let index = indexSource(source)
