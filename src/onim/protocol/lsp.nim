@@ -332,7 +332,9 @@ proc sendNativeDiagnostics(uri, source: string, diagnostics: seq[NativeDiagnosti
   message["params"] = params
   sendMessage(message)
 
-proc publishNativeDiagnostics(workspace: Workspace, snapshot: WorkspaceSnapshot) =
+proc publishNativeDiagnostics(
+    workspace: Workspace, snapshot: WorkspaceSnapshot, stdlib: StdlibMap
+) =
   let uri =
     if snapshot.uri.len > 0:
       snapshot.uri
@@ -344,8 +346,11 @@ proc publishNativeDiagnostics(workspace: Workspace, snapshot: WorkspaceSnapshot)
     if snapshot.valid and snapshot.index != nil:
       nativeDiagnostics(
         snapshot.index,
-        stdlibMap(),
-        workspace.projectSurface(),
+        stdlib,
+        if workspace.graphComplete:
+          workspace.projectSurface()
+        else:
+          nil,
         workspace.moduleForPath(snapshot.path),
         workspace.moduleCatalog(),
       )
@@ -814,10 +819,10 @@ proc scheduleBootstrap(runtime: var BootstrapRuntime, workspace: Workspace) =
   elif submitBootstrap(request):
     runtime.active = true
 
-proc publishOpenNativeDiagnostics(workspace: Workspace) =
+proc publishOpenNativeDiagnostics(workspace: Workspace, stdlib: StdlibMap) =
   for id in workspace.openDocumentIds:
     let snapshot = workspace.snapshotForFile(id)
-    publishNativeDiagnostics(workspace, snapshot)
+    publishNativeDiagnostics(workspace, snapshot, stdlib)
 
 proc finishPendingDefinitions(
     workspace: Workspace, pending: var seq[PendingDefinition]
@@ -834,6 +839,7 @@ proc handleBootstrapEvent(
     runtime: var BootstrapRuntime,
     workspace: Workspace,
     pendingDefinitions: var seq[PendingDefinition],
+    stdlib: StdlibMap,
     payload: string,
 ): bool =
   let value = decodeBootstrapResult(payload)
@@ -842,7 +848,7 @@ proc handleBootstrapEvent(
   runtime.active = false
   let accepted = workspace.applyBootstrap(value)
   if accepted:
-    publishOpenNativeDiagnostics(workspace)
+    publishOpenNativeDiagnostics(workspace, stdlib)
     finishPendingDefinitions(workspace, pendingDefinitions)
   elif value.kind == bootstrapFailed:
     finishPendingDefinitions(workspace, pendingDefinitions)
@@ -881,8 +887,9 @@ proc runLsp*() =
       break
     if event.kind == lspBootstrapEvent:
       if decodeBootstrapResult(event.payload).kind != bootstrapStopped:
-        discard
-          handleBootstrapEvent(bootstrap, workspace, pendingDefinitions, event.payload)
+        discard handleBootstrapEvent(
+          bootstrap, workspace, pendingDefinitions, stdlib, event.payload
+        )
       continue
 
     let message = parseMessage(event.payload)
@@ -950,7 +957,7 @@ proc runLsp*() =
           intOption(textDocument, "version", -1),
         )
         let snapshot = workspace.snapshotForDocument(uriText, path)
-        publishNativeDiagnostics(workspace, snapshot)
+        publishNativeDiagnostics(workspace, snapshot, stdlib)
         if not cacheIndexedAction(snapshot, options, stdlib, actionCache).handled:
           discard enqueueSemantic(snapshot, options, pending, queued)
         scheduleBootstrap(bootstrap, workspace)
@@ -975,7 +982,7 @@ proc runLsp*() =
           uriText, path, changedText, intOption(textDocument, "version", -1)
         )
         let snapshot = workspace.snapshotForDocument(uriText, path)
-        publishNativeDiagnostics(workspace, snapshot)
+        publishNativeDiagnostics(workspace, snapshot, stdlib)
         if not cacheIndexedAction(snapshot, options, stdlib, actionCache).handled:
           discard enqueueSemantic(snapshot, options, pending, queued)
         scheduleBootstrap(bootstrap, workspace)
@@ -994,7 +1001,7 @@ proc runLsp*() =
         if params.hasKey("text") and params["text"].kind == JString:
           discard workspace.changeDocument(uriText, path, params["text"].getStr, -1)
         let snapshot = workspace.snapshotForDocument(uriText, path)
-        publishNativeDiagnostics(workspace, snapshot)
+        publishNativeDiagnostics(workspace, snapshot, stdlib)
         if not cacheIndexedAction(snapshot, options, stdlib, actionCache).handled:
           discard enqueueSemantic(snapshot, options, pending, queued)
         scheduleBootstrap(bootstrap, workspace)
