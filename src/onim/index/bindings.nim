@@ -15,6 +15,10 @@ type
     state*: BindingState
     declarationToken*: uint32
 
+  ImplicitNameKind* = enum
+    implicitNone
+    implicitResult
+
 const InvalidBindingToken* = high(uint32)
 
 proc resolved(token: uint32): BindingResolution {.inline.} =
@@ -107,6 +111,21 @@ proc resolveBinding*(index: SourceIndex, tokenIndex: uint32): BindingResolution 
     if found != InvalidBindingToken:
       return resolved(found)
     scope = index.scopes.parentScope(scope)
+
+proc implicitNameKind*(index: SourceIndex, tokenIndex: uint32): ImplicitNameKind =
+  if index == nil or tokenIndex >= uint32(index.parsed.tokens.len):
+    return implicitNone
+  let token = index.parsed.tokens[int(tokenIndex)]
+  if token.kind != tkIdentifier or isStropped(token) or
+      identifierKey(token.text) != "result":
+    return implicitNone
+  var scope = index.scopes.innermostScopeAt(tokenIndex)
+  while index.scopes.localScope(scope):
+    let ordinal = int(uint32(scope)) - 1
+    if index.scopes.scopes[ordinal].kind == scopeRoutine:
+      return implicitResult
+    scope = index.scopes.parentScope(scope)
+  implicitNone
 
 proc bindingRegionContains*(
     index: SourceIndex, declarationToken, useToken: uint32

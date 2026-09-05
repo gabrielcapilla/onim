@@ -167,7 +167,8 @@ proc nativeMissingDiagnostics(
       continue
     let token = index.parsed.tokens[tokenIndex]
     let binding = index.resolveBinding(occurrence.token)
-    if binding.state != bindingUnknown:
+    if binding.state != bindingUnknown or
+        index.implicitNameKind(occurrence.token) != implicitNone:
       continue
     if providesUnqualified(index.parsed, stdlib, project, catalog, owner, token.text):
       continue

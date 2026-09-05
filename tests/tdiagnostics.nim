@@ -102,6 +102,12 @@ suite "native diagnostics":
     let diagnostics = nativeDiagnostics(indexSource(source), loadStdlibMap(""))
     check diagnostics.len == 0
 
+  test "recognizes Nim's implicit result binding":
+    let diagnostics = nativeDiagnostics(
+      indexSource("proc main(): int =\n  result = 1\n"), loadStdlibMap("")
+    )
+    check diagnostics.len == 0
+
   test "reports a missing project import from an unqualified use":
     let project = buildSurfaceIndex(
       @[projectSurfaceInput("provider", indexSource("proc provided*() = discard\n"))],
