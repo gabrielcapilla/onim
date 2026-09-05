@@ -27,11 +27,6 @@ proc resolved(token: uint32): BindingResolution {.inline.} =
 proc ambiguous(): BindingResolution {.inline.} =
   BindingResolution(state: bindingAmbiguous, declarationToken: InvalidBindingToken)
 
-proc localScope(index: ScopeIndex, scope: ScopeId): bool {.inline.} =
-  let ordinal = int(uint32(scope)) - 1
-  ordinal >= 0 and ordinal < index.scopes.len and
-    index.scopes[ordinal].kind in {scopeRoutine, scopeBlock}
-
 proc declarationName(
     index: SourceIndex, declaration: LexicalDeclaration
 ): string {.inline.} =
@@ -91,9 +86,9 @@ proc resolveBinding*(index: SourceIndex, tokenIndex: uint32): BindingResolution 
   if wanted.len == 0:
     return
   var scope = index.scopes.innermostScopeAt(tokenIndex)
-  if not index.scopes.localScope(scope):
+  if not index.scopes.isLocalScope(scope):
     return
-  while index.scopes.localScope(scope):
+  while index.scopes.isLocalScope(scope):
     var found = InvalidBindingToken
     for declaration in index.scopes.declarations:
       if declaration.scope != scope or declaration.nameToken >= tokenIndex or
@@ -114,7 +109,7 @@ proc implicitNameKind*(index: SourceIndex, tokenIndex: uint32): ImplicitNameKind
       identifierKey(token.text) != "result":
     return implicitNone
   var scope = index.scopes.innermostScopeAt(tokenIndex)
-  while index.scopes.localScope(scope):
+  while index.scopes.isLocalScope(scope):
     let ordinal = int(uint32(scope)) - 1
     if index.scopes.scopes[ordinal].kind == scopeRoutine:
       return implicitResult
@@ -132,7 +127,7 @@ proc bindingRegionContains*(
     return false
   let declarationScope = index.scopes.declarations[declarationIndex].scope
   var useScope = index.scopes.innermostScopeAt(useToken)
-  while index.scopes.localScope(useScope):
+  while index.scopes.isLocalScope(useScope):
     if useScope == declarationScope:
       return true
     useScope = index.scopes.parentScope(useScope)

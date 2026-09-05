@@ -678,6 +678,11 @@ proc parentScope*(index: ScopeIndex, scope: ScopeId): ScopeId {.inline.} =
     return index.scopes[ordinal].parent
   InvalidScopeId
 
+proc isLocalScope*(index: ScopeIndex, scope: ScopeId): bool {.inline.} =
+  let ordinal = int(uint32(scope)) - 1
+  ordinal > 0 and ordinal < index.scopes.len and
+    index.scopes[ordinal].kind in {scopeRoutine, scopeBlock}
+
 proc innermostScopeAt*(index: ScopeIndex, token: uint32): ScopeId =
   for ordinal, scope in index.scopes:
     if scope.containsToken(token):

@@ -55,6 +55,9 @@ suite "stdio LSP":
     check not initialized["result"]["capabilities"]["renameProvider"]["prepareProvider"].getBool
     check initialized["result"]["capabilities"]["referencesProvider"].getBool
     check initialized["result"]["capabilities"]["documentSymbolProvider"].getBool
+    check not initialized["result"]["capabilities"]["completionProvider"][
+      "resolveProvider"
+    ].getBool
 
     sendMessage(
       process.inputStream, %*{"jsonrpc": "2.0", "method": "initialized", "params": {}}
@@ -194,6 +197,83 @@ suite "stdio LSP":
     check declarationDefinition != nil
     check declarationDefinition["result"]["range"]["start"]["line"].getInt == 1
     check declarationDefinition["result"]["range"]["start"]["character"].getInt == 5
+
+    let completionUri = "file:///tmp/onim-completion.nim"
+    let completionText =
+      "proc show(value: int) =\n  let localValue = value\n  const constantValue = 1\n  echo 😀 loc\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": completionUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": completionText,
+          }
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 16,
+        "method": "textDocument/completion",
+        "params": {
+          "textDocument": {"uri": completionUri},
+          "position": {"line": 3, "character": 13},
+        },
+      },
+    )
+    let completionResult = readResponse(process.outputStream, 16)
+    check completionResult != nil
+    check completionResult["result"]["isIncomplete"].getBool
+    check completionResult["result"]["items"].len == 1
+    check completionResult["result"]["items"][0]["label"].getStr == "localValue"
+    check completionResult["result"]["items"][0]["kind"].getInt == 6
+    check completionResult["result"]["items"][0]["textEdit"]["range"]["start"]["line"].getInt ==
+      3
+    check completionResult["result"]["items"][0]["textEdit"]["range"]["start"][
+      "character"
+    ].getInt == 10
+    check completionResult["result"]["items"][0]["textEdit"]["range"]["end"][
+      "character"
+    ].getInt == 13
+
+    let changedCompletionText =
+      "proc show(value: int) =\n  let localValue = value\n  const constantValue = 1\n  echo con\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+          "textDocument": {"uri": completionUri, "version": 2},
+          "contentChanges": [{"text": changedCompletionText}],
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 17,
+        "method": "textDocument/completion",
+        "params": {
+          "textDocument": {"uri": completionUri},
+          "position": {"line": 3, "character": 10},
+        },
+      },
+    )
+    let changedCompletionResult = readResponse(process.outputStream, 17)
+    check changedCompletionResult != nil
+    check changedCompletionResult["result"]["items"].len == 1
+    check changedCompletionResult["result"]["items"][0]["label"].getStr ==
+      "constantValue"
+    check changedCompletionResult["result"]["items"][0]["kind"].getInt == 21
 
     let referencesUri = "file:///tmp/onim-references.nim"
     let referencesText =

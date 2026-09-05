@@ -28,6 +28,7 @@ task test, "run the organize-imports regression suite":
   exec "nim c -r --path:src --hints:off --warnings:off tests/tdefinition.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/treferences.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/tbindings.nim"
+  exec "nim c -r --path:src --hints:off --warnings:off tests/tcompletion.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/tsurfaces.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/tdiagnostics.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/tmodules.nim"
@@ -41,6 +42,8 @@ task generateStdlibMap, "regenerate the compiler-derived stdlib symbol map":
 task bench, "measure organize-imports and workspace-index latency":
   exec "nim c --path:src --hints:off --warnings:off bench/bench_organize.nim"
   exec "bench/bench_organize"
+  exec "nim c --path:src --hints:off --warnings:off bench/bench_completion.nim"
+  exec "bench/bench_completion"
   exec "nim c --path:src --hints:off --warnings:off bench/bench_incremental.nim"
   exec "bench/bench_incremental"
   exec "nim c --path:src --hints:off --warnings:off bench/bench_workspace.nim"

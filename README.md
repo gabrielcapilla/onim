@@ -26,8 +26,9 @@ The implementation is organized by responsibility under `src/onim`:
   validated disk cache.
 - `session/` owns numeric identities, document overlays, snapshots, and the
   workspace dependency graph.
-- `features/` owns user-facing language actions such as organize-imports, the
-  conservative native definition resolver, and indexed document symbols.
+- `features/` owns user-facing language actions such as organize-imports, native
+  lexical completion, the conservative native definition resolver, and indexed
+  document symbols.
 - `semantic/` owns the compiler adapter and its isolated semantic worker.
 - `protocol/` owns the LSP transport and request lifecycle.
 - `stdlib/` owns generated standard-library symbol data and lookup.
@@ -86,6 +87,12 @@ references, so cache reloads do not duplicate names or offsets. The first native
 definition request resolves one unambiguous same-file module symbol; qualified,
 imported, nested, overloaded, and otherwise uncertain references return `null`
 until the parser and resolver milestones add scope facts.
+
+Native completion is deliberately conservative: it currently returns visible
+parameters and direct `let`/`var`/`const` declarations from supported routine
+and unnamed-block scopes. Unsupported contexts return `null` without invoking
+the compiler or semantic worker; the response is marked incomplete while
+module, type, member, and keyword completion remain future native milestones.
 
 The shared surface index stores sorted module ranges, normalized identifier keys,
 overload records, and deterministic ambiguity results. Project surfaces are
