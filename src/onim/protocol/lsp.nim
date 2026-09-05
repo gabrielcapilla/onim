@@ -45,6 +45,9 @@ type
     id: JsonNode
     params: JsonNode
 
+  PositionIndex = object
+    lineStarts: seq[int]
+
 var lspEvents: Channel[LspEvent]
 var lspInputReader: Thread[void]
 var lspBootstrapBridge: Thread[void]
@@ -174,23 +177,38 @@ proc utf16Width(source: string, index, limit: int): tuple[nextIndex, units: int]
     width = 4
   (min(limit, index + width), if codepoint > 0xFFFF: 2 else: 1)
 
-proc positionAt(source: string, offset: int): JsonNode =
-  var line = 0
+proc initPositionIndex(source: string): PositionIndex =
+  result.lineStarts = @[0]
+  for offset, character in source:
+    if character == '\n':
+      result.lineStarts.add offset + 1
+
+proc lineAt(index: PositionIndex, offset: int): int {.inline.} =
+  var low = 0
+  var high = index.lineStarts.high
+  while low <= high:
+    let middle = (low + high) shr 1
+    if index.lineStarts[middle] <= offset:
+      low = middle + 1
+    else:
+      high = middle - 1
+  max(0, low - 1)
+
+proc positionAt(index: PositionIndex, source: string, offset: int): JsonNode =
   var column = 0
   let limit = max(0, min(offset, source.len))
-  var index = 0
-  while index < limit:
-    if source[index] == '\n':
-      inc line
-      column = 0
-      inc index
-    else:
-      let advance = utf16Width(source, index, limit)
-      index = advance.nextIndex
-      column += advance.units
+  let line = index.lineAt(limit)
+  var cursor = index.lineStarts[line]
+  while cursor < limit:
+    let advance = utf16Width(source, cursor, limit)
+    cursor = advance.nextIndex
+    column += advance.units
   %*{"line": line, "character": column}
 
-proc offsetAt(source: string, position: JsonNode): int =
+proc positionAt(source: string, offset: int): JsonNode =
+  positionAt(initPositionIndex(source), source, offset)
+
+proc offsetAt(index: PositionIndex, source: string, position: JsonNode): int =
   if position == nil or position.kind != JObject:
     return -1
   let lineValue = intOption(position, "line", -1)
@@ -200,28 +218,27 @@ proc offsetAt(source: string, position: JsonNode): int =
     return -1
   let wantedLine = int(lineValue)
   let wantedCharacter = int(characterValue)
-  var line = 0
-  var index = 0
-  while index < source.len and line < wantedLine:
-    if source[index] == '\n':
-      inc line
-    inc index
-  if line != wantedLine:
+  if wantedLine >= index.lineStarts.len:
     return -1
 
-  var lineEnd = index
+  let lineStart = index.lineStarts[wantedLine]
+  var lineEnd = lineStart
   while lineEnd < source.len and source[lineEnd] != '\n':
     inc lineEnd
   var character = 0
-  while index < lineEnd:
+  var cursor = lineStart
+  while cursor < lineEnd:
     if character == wantedCharacter:
-      return index
-    let advance = utf16Width(source, index, lineEnd)
+      return cursor
+    let advance = utf16Width(source, cursor, lineEnd)
     if character + advance.units > wantedCharacter:
       return -1
     character += advance.units
-    index = advance.nextIndex
-  if character == wantedCharacter: index else: -1
+    cursor = advance.nextIndex
+  if character == wantedCharacter: cursor else: -1
+
+proc offsetAt(source: string, position: JsonNode): int =
+  offsetAt(initPositionIndex(source), source, position)
 
 proc utf16Length(value: string): int =
   var index = 0
@@ -273,11 +290,12 @@ proc nativeDiagnosticMessage(diagnostic: NativeDiagnostic): string =
     "missing project import: " & diagnostic.module
 
 proc sendNativeDiagnostics(uri, source: string, diagnostics: seq[NativeDiagnostic]) =
+  let positions = initPositionIndex(source)
   var values = newJArray()
   for diagnostic in diagnostics:
     var range = newJObject()
-    range["start"] = positionAt(source, diagnostic.startOffset)
-    range["end"] = positionAt(source, diagnostic.endOffset)
+    range["start"] = positionAt(positions, source, diagnostic.startOffset)
+    range["end"] = positionAt(positions, source, diagnostic.endOffset)
     var value = newJObject()
     value["range"] = range
     value["severity"] = %1
@@ -334,6 +352,7 @@ proc definitionLocation(
     sourceUri: string,
     view: WorkspaceIndexView,
     target: DefinitionTarget,
+    positions: PositionIndex,
 ): JsonNode =
   if not view.valid or view.index == nil or view.id.value != target.snapshotId.value or
       view.contentGeneration.value != target.contentGeneration.value or
@@ -348,8 +367,8 @@ proc definitionLocation(
   var start: JsonNode
   var finish: JsonNode
   if view.fileId.value == source.fileId.value:
-    start = positionAt(source.text, token.startOffset)
-    finish = positionAt(source.text, token.endOffset)
+    start = positionAt(positions, source.text, token.startOffset)
+    finish = positionAt(positions, source.text, token.endOffset)
   else:
     let length = targetTokenLength(token)
     if token.line < 0 or token.column < 0 or length < 0:
@@ -377,13 +396,15 @@ proc definitionResponse(
   let snapshot = workspace.snapshotForDocument(uriText, path)
   if not snapshot.valid:
     return
-  let offset = offsetAt(snapshot.text, valueOrEmpty(params, "position"))
+  let positions = initPositionIndex(snapshot.text)
+  let offset = offsetAt(positions, snapshot.text, valueOrEmpty(params, "position"))
   let resolution = resolveDefinition(workspace, snapshot, offset)
   result.needsBootstrap = resolution.kind == definitionUnresolved
   if resolution.kind != definitionResolved:
     return
   let view = workspace.indexViewForFile(resolution.target.fileId)
-  result.value = definitionLocation(snapshot, uriText, view, resolution.target)
+  result.value =
+    definitionLocation(snapshot, uriText, view, resolution.target, positions)
   if result.value == nil:
     result.value = newJNull()
 
@@ -415,6 +436,7 @@ proc documentSymbols(params: JsonNode, workspace: Workspace): JsonNode =
   let snapshot = workspace.snapshotForDocument(uriText, path)
   if not snapshot.valid or snapshot.index == nil:
     return
+  let positions = initPositionIndex(snapshot.text)
   for symbol in snapshot.index.symbols:
     let tokenIndex = int(symbol.nameToken)
     if tokenIndex < 0 or tokenIndex >= snapshot.index.parsed.tokens.len:
@@ -423,8 +445,8 @@ proc documentSymbols(params: JsonNode, workspace: Workspace): JsonNode =
     if token.kind != tkIdentifier or token.startOffset < 0 or
         token.endOffset > snapshot.text.len or token.endOffset <= token.startOffset:
       continue
-    let start = positionAt(snapshot.text, token.startOffset)
-    let finish = positionAt(snapshot.text, token.endOffset)
+    let start = positionAt(positions, snapshot.text, token.startOffset)
+    let finish = positionAt(positions, snapshot.text, token.endOffset)
     result.add %*{
       "name": token.text,
       "kind": documentSymbolKind(symbol.kind),
@@ -432,11 +454,11 @@ proc documentSymbols(params: JsonNode, workspace: Workspace): JsonNode =
       "selectionRange": {"start": start, "end": finish},
     }
 
-proc editJson(source: string, edit: ImportEdit): JsonNode =
+proc editJson(source: string, positions: PositionIndex, edit: ImportEdit): JsonNode =
   %*{
     "range": {
-      "start": positionAt(source, edit.startOffset),
-      "end": positionAt(source, edit.endOffset),
+      "start": positionAt(positions, source, edit.startOffset),
+      "end": positionAt(positions, source, edit.endOffset),
     },
     "newText": edit.newText,
   }
@@ -718,10 +740,11 @@ proc codeActions(
         )
   if edits.len == 0:
     return newJArray()
+  let positions = initPositionIndex(snapshot.text)
   var workspaceEdit = newJObject()
   var uriEdits = newJArray()
   for edit in edits:
-    uriEdits.add editJson(snapshot.text, edit)
+    uriEdits.add editJson(snapshot.text, positions, edit)
   workspaceEdit["changes"] = newJObject()
   workspaceEdit["changes"][uriText] = uriEdits
   var action = newJObject()
