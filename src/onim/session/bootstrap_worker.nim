@@ -1,5 +1,6 @@
 import std/[algorithm, atomics, json, strutils, tables]
 import std/os except FileId
+import std/sets
 
 import ../index/cache
 import ../index/source_index
@@ -38,6 +39,15 @@ type
     directories*: seq[ManifestDirectory]
     discoveryValid*: bool
     files*: seq[BootstrapFile]
+
+  ManifestReuseState = enum
+    manifestNotReused
+    manifestReused
+
+  ManifestReuse = object
+    state: ManifestReuseState
+    entry: ManifestEntry
+    forward: seq[string]
 
   BootstrapWorkerState = enum
     bootstrapWorkerStopped
@@ -133,6 +143,27 @@ proc indexDiskSource(
   discard saveCachedSourceIndex(root, path, stable.source, built)
   (true, built, stable.stamp)
 
+proc reusableManifestFile(
+    stamp: FileStamp,
+    entry: ManifestEntry,
+    previousPaths: openArray[string],
+    present: HashSet[string],
+): tuple[state: ManifestReuseState, forward: seq[string]] {.gcsafe.} =
+  if entry.byteLength < 0 or stamp.size != entry.byteLength or
+      not sameFileStamp(stamp, entry.stamp):
+    return
+  var previousOrdinal = high(uint32)
+  for dependencyOrdinal in entry.forwardOrdinals:
+    if dependencyOrdinal >= uint32(previousPaths.len) or
+        (previousOrdinal != high(uint32) and dependencyOrdinal <= previousOrdinal):
+      return
+    let dependency = previousPaths[int(dependencyOrdinal)]
+    if dependency.len == 0 or not present.contains(dependency):
+      return
+    result.forward.add dependency
+    previousOrdinal = dependencyOrdinal
+  result.state = manifestReused
+
 proc referenceIsStdlib(reference: string): bool {.gcsafe.} =
   reference == "std" or reference.startsWith("std/")
 
@@ -184,15 +215,34 @@ proc buildBootstrap(request: BootstrapRequest): BootstrapResult {.gcsafe.} =
   result.directories = discovered.directories
   result.discoveryValid = true
   var previous = oldManifestEntries(previousManifest)
+  var previousPaths: seq[string] = @[]
+  if previousManifest.graphValid:
+    previousPaths = newSeqOfCap[string](previousManifest.entries.len)
+    for entry in previousManifest.entries:
+      previousPaths.add entry.path
+  var present = initHashSet[string]()
+  for path in paths:
+    present.incl path
+
   var indexes = newSeq[SourceIndex](paths.len)
   var stamps = newSeq[FileStamp](paths.len)
+  var reused = newSeq[ManifestReuse](paths.len)
   for ordinal, path in paths:
     if cancellationRequested(request.jobGeneration):
       result.kind = bootstrapCancelled
       return
-    let indexed = indexDiskSource(
-      request.root, path, fileStamp(path), previous, request.jobGeneration
-    )
+    let stamp = fileStamp(path)
+    var reusedFile: tuple[state: ManifestReuseState, forward: seq[string]]
+    if previous.hasKey(path):
+      reusedFile = reusableManifestFile(stamp, previous[path], previousPaths, present)
+    if reusedFile.state == manifestReused:
+      reused[ordinal] = ManifestReuse(
+        state: manifestReused, entry: previous[path], forward: reusedFile.forward
+      )
+      stamps[ordinal] = stamp
+      continue
+    let indexed =
+      indexDiskSource(request.root, path, stamp, previous, request.jobGeneration)
     if not indexed.valid:
       return
     indexes[ordinal] = indexed.index
@@ -209,21 +259,35 @@ proc buildBootstrap(request: BootstrapRequest): BootstrapResult {.gcsafe.} =
       result.kind = bootstrapCancelled
       result.files.setLen(0)
       return
-    let index = indexes[ordinal]
-    var file = BootstrapFile(
-      path: path,
-      sourceHash: index.contentHash,
-      byteLength: index.byteLength,
-      stamp: stamps[ordinal],
-    )
-    file.unresolved = file.addReferences(index.imports, catalog, paths)
-    if index.exports.len > 0:
-      file.unresolved =
-        file.unresolved or file.addReferences(index.exports, catalog, paths)
-    if index.includes.len > 0:
-      file.unresolved =
-        file.unresolved or file.addReferences(index.includes, catalog, paths)
-    file.forward.sort
+    var file: BootstrapFile
+    if reused[ordinal].state == manifestReused:
+      let reusedFile = reused[ordinal]
+      file = BootstrapFile(
+        path: path,
+        sourceHash: reusedFile.entry.sourceHash,
+        byteLength: int(reusedFile.entry.byteLength),
+        stamp: stamps[ordinal],
+        forward: reusedFile.forward,
+        unresolved: reusedFile.entry.unresolved,
+      )
+    else:
+      let index = indexes[ordinal]
+      if index == nil:
+        return
+      file = BootstrapFile(
+        path: path,
+        sourceHash: index.contentHash,
+        byteLength: index.byteLength,
+        stamp: stamps[ordinal],
+      )
+      file.unresolved = file.addReferences(index.imports, catalog, paths)
+      if index.exports.len > 0:
+        file.unresolved =
+          file.unresolved or file.addReferences(index.exports, catalog, paths)
+      if index.includes.len > 0:
+        file.unresolved =
+          file.unresolved or file.addReferences(index.includes, catalog, paths)
+      file.forward.sort
     result.files.add file
 
   result.kind = bootstrapComplete

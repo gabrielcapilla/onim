@@ -1,5 +1,6 @@
 import std/[os, strutils, unittest]
 
+import onim/index/cache
 import onim/session/bootstrap_worker
 import onim/session/ids
 import onim/session/workspace
@@ -51,6 +52,7 @@ suite "background workspace bootstrap":
     check roundTrip.kind == bootstrapComplete
     check roundTrip.discoveryValid
     check roundTrip.directories == value.directories
+    removeFile(cacheFilePath(root, root / "provider.nim"))
     check workspace.applyBootstrap(value)
     let provider = workspace.fileIdForPath(root / "provider.nim")
     let consumer = workspace.fileIdForPath(root / "consumer.nim")

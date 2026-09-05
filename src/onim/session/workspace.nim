@@ -270,6 +270,10 @@ proc moduleCatalog*(workspace: Workspace): ModuleCatalog =
 
 proc rebuildDependencies(workspace: Workspace)
 proc invalidateAll(workspace: Workspace)
+proc replaceDependencies(workspace: Workspace, id: FileId)
+proc stableDiskSource(
+  path: string
+): tuple[valid: bool, source: string, stamp: FileStamp]
 
 proc cloneFileRecord(file: FileRecord): FileRecord =
   result = file
@@ -393,6 +397,41 @@ proc validBootstrapResult(workspace: Workspace, value: BootstrapResult): bool =
       previousDependency = dependency
   true
 
+proc applyBootstrapDependencies(workspace: Workspace, value: BootstrapResult): bool =
+  workspace.unresolved.clear()
+  for file in workspace.files.mitems:
+    file.reverse.setLen(0)
+    if file.state != workspaceOpen:
+      file.forward.setLen(0)
+
+  for bootstrapFile in value.files:
+    if not workspace.paths.hasKey(bootstrapFile.path):
+      return false
+    let id = workspace.paths[bootstrapFile.path]
+    let index = id.recordIndex
+    if index < 0 or index >= workspace.files.len:
+      return false
+    if workspace.files[index].state == workspaceOpen:
+      workspace.replaceDependencies(id)
+      continue
+    for dependencyPath in bootstrapFile.forward:
+      if not workspace.paths.hasKey(dependencyPath):
+        return false
+      addUniqueId(workspace.files[index].forward, workspace.paths[dependencyPath])
+    workspace.files[index].forward.sortIds
+    if bootstrapFile.unresolved:
+      workspace.unresolved.incl uint32(id)
+
+  for file in workspace.files:
+    for dependency in file.forward:
+      let dependencyIndex = dependency.recordIndex
+      if dependencyIndex < 0 or dependencyIndex >= workspace.files.len:
+        return false
+      addUniqueId(workspace.files[dependencyIndex].reverse, file.id)
+  for file in workspace.files.mitems:
+    file.reverse.sortIds
+  true
+
 proc adoptWorkspaceState(destination, source: Workspace) =
   destination.root = source.root
   destination.manifest = source.manifest
@@ -441,9 +480,17 @@ proc applyBootstrap*(workspace: Workspace, value: BootstrapResult): bool =
     let index = id.recordIndex
     if candidate.files[index].state == workspaceOpen:
       continue
-    let indexed = loadCachedSourceIndexFingerprint(
+    var indexed = loadCachedSourceIndexFingerprint(
       candidate.root, path, file.sourceHash, file.byteLength
     )
+    if indexed == nil:
+      let stable = stableDiskSource(path)
+      if not stable.valid or not sameFileStamp(stable.stamp, file.stamp) or
+          stable.source.len != file.byteLength or
+          contentFingerprint(stable.source) != file.sourceHash:
+        return false
+      indexed = indexSource(stable.source)
+      discard saveCachedSourceIndex(candidate.root, path, stable.source, indexed)
     if indexed == nil:
       return false
     candidate.files[index].state = workspaceOnDisk
@@ -473,7 +520,8 @@ proc applyBootstrap*(workspace: Workspace, value: BootstrapResult): bool =
   candidate.bootstrapState = workspaceBootstrapComplete
   candidate.bootstrapAttempt = ConfigGeneration(value.configGeneration)
   try:
-    candidate.rebuildDependencies()
+    if not candidate.applyBootstrapDependencies(value):
+      return false
     candidate.invalidated.setLen(0)
     candidate.invalidateAll()
   except CatchableError:
