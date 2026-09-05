@@ -76586,7 +76586,7 @@
         "name": "loc`gensym10",
         "kind": "skConst",
         "arity": -1,
-        "signature": "loc`gensym10 = (filename: \"/home/human/.nimble/pkgs2/nim-2.2.10-17ec440fdb89f8903db29a17898af590087d2b64/lib/wrappers/openssl.nim\",\n                line: 899, column: 4)"
+        "signature": "loc`gensym10 = (filename: \"<nimlib>/wrappers/openssl.nim\",\n                line: 899, column: 4)"
       }
     ],
     "loc`gensym144": [
@@ -76595,7 +76595,7 @@
         "name": "loc`gensym144",
         "kind": "skConst",
         "arity": -1,
-        "signature": "loc`gensym144 = (filename: \"/home/human/.nimble/pkgs2/nim-2.2.10-17ec440fdb89f8903db29a17898af590087d2b64/lib/packages/docutils/highlite.nim\",\n                 line: 1041, column: 10)"
+        "signature": "loc`gensym144 = (filename: \"<nimlib>/packages/docutils/highlite.nim\",\n                 line: 1041, column: 10)"
       }
     ],
     "loc`gensym148": [
@@ -76604,7 +76604,7 @@
         "name": "loc`gensym148",
         "kind": "skConst",
         "arity": -1,
-        "signature": "loc`gensym148 = (filename: \"/home/human/.nimble/pkgs2/nim-2.2.10-17ec440fdb89f8903db29a17898af590087d2b64/lib/packages/docutils/highlite.nim\",\n                 line: 1044, column: 2)"
+        "signature": "loc`gensym148 = (filename: \"<nimlib>/packages/docutils/highlite.nim\",\n                 line: 1044, column: 2)"
       }
     ],
     "loc`gensym56": [
@@ -76613,7 +76613,7 @@
         "name": "loc`gensym56",
         "kind": "skConst",
         "arity": -1,
-        "signature": "loc`gensym56 = (filename: \"/home/human/.nimble/pkgs2/nim-2.2.10-17ec440fdb89f8903db29a17898af590087d2b64/lib/pure/net.nim\",\n                line: 554, column: 4)"
+        "signature": "loc`gensym56 = (filename: \"<nimlib>/pure/net.nim\",\n                line: 554, column: 4)"
       }
     ],
     "local": [
@@ -86447,7 +86447,7 @@
         "name": "ploc`gensym10",
         "kind": "skConst",
         "arity": -1,
-        "signature": "ploc`gensym10 = \"/home/human/.nimble/pkgs2/nim-2.2.10-17ec440fdb89f8903db29a17898af590087d2b64/lib/wrappers/openssl.nim(899, 5)\""
+        "signature": "ploc`gensym10 = \"<nimlib>/wrappers/openssl.nim(899, 5)\""
       }
     ],
     "ploc`gensym144": [
@@ -86456,7 +86456,7 @@
         "name": "ploc`gensym144",
         "kind": "skConst",
         "arity": -1,
-        "signature": "ploc`gensym144 = \"/home/human/.nimble/pkgs2/nim-2.2.10-17ec440fdb89f8903db29a17898af590087d2b64/lib/packages/docutils/highlite.nim(1041, 11)\""
+        "signature": "ploc`gensym144 = \"<nimlib>/packages/docutils/highlite.nim(1041, 11)\""
       }
     ],
     "ploc`gensym148": [
@@ -86465,7 +86465,7 @@
         "name": "ploc`gensym148",
         "kind": "skConst",
         "arity": -1,
-        "signature": "ploc`gensym148 = \"/home/human/.nimble/pkgs2/nim-2.2.10-17ec440fdb89f8903db29a17898af590087d2b64/lib/packages/docutils/highlite.nim(1044, 3)\""
+        "signature": "ploc`gensym148 = \"<nimlib>/packages/docutils/highlite.nim(1044, 3)\""
       }
     ],
     "ploc`gensym56": [
@@ -86474,7 +86474,7 @@
         "name": "ploc`gensym56",
         "kind": "skConst",
         "arity": -1,
-        "signature": "ploc`gensym56 = \"/home/human/.nimble/pkgs2/nim-2.2.10-17ec440fdb89f8903db29a17898af590087d2b64/lib/pure/net.nim(554, 5)\""
+        "signature": "ploc`gensym56 = \"<nimlib>/pure/net.nim(554, 5)\""
       }
     ],
     "pointer": [

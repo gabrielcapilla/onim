@@ -1,5 +1,6 @@
 import std/[algorithm, json, os, sets, strutils, tables]
 
+import ../index/source_index
 import ../index/surfaces
 import ../index/symbols
 import ../syntax/imports
@@ -34,7 +35,32 @@ type
     implicitModules: HashSet[string]
     metadata: StdlibMetadataState
 
-const bundledStdlibMap = staticRead("../../../stdlib_map.json")
+const
+  bundledStdlibBinary = staticRead("../../../stdlib_map.bin")
+  stdlibBinaryMagic = "ONIMBIN1"
+  stdlibBinaryVersion = 1'u32
+  stdlibBinaryHeaderSize = 32
+  maxStdlibBinaryBytes = 64 * 1024 * 1024
+  maxStdlibBinaryRecords = 1_000_000
+
+type
+  BinaryReader = object
+    data: string
+    position: int
+    valid: bool
+
+  BinarySymbol = object
+    name: string
+    firstCandidate: uint32
+    candidateCount: uint32
+
+  BinaryCandidate = object
+    module: string
+    name: string
+    kind: string
+    arity: int32
+    signature: string
+    priority: CandidatePriority
 
 proc canonicalModule*(module: string): string =
   canonicalSurfaceModule(module)
@@ -161,6 +187,225 @@ proc emptyStdlibMap*(): StdlibMap =
   result = newStdlibMap()
   result.surface = surfaceForMap(result, surfaceFallback)
 
+proc readByte(reader: var BinaryReader): uint8 =
+  if not reader.valid or reader.position < 0 or reader.position >= reader.data.len:
+    reader.valid = false
+    return
+  result = uint8(ord(reader.data[reader.position]))
+  inc reader.position
+
+proc readUint32(reader: var BinaryReader): uint32 =
+  for shift in 0 .. 3:
+    result = result or (uint32(reader.readByte()) shl (shift * 8))
+
+proc readInt32(reader: var BinaryReader): int32 =
+  cast[int32](reader.readUint32())
+
+proc readUint64(reader: var BinaryReader): uint64 =
+  for shift in 0 .. 7:
+    result = result or (uint64(reader.readByte()) shl (shift * 8))
+
+proc ensureBytes(reader: var BinaryReader, count: int): bool =
+  if not reader.valid or count < 0 or count > reader.data.len - reader.position:
+    reader.valid = false
+    return false
+  true
+
+proc ensureRecords(reader: var BinaryReader, count, width: int): bool =
+  if count < 0 or width < 0 or
+      uint64(count) * uint64(width) > uint64(max(reader.data.len - reader.position, 0)):
+    reader.valid = false
+    return false
+  true
+
+proc readCount(reader: var BinaryReader): int =
+  let count = reader.readUint32()
+  if not reader.valid or count > uint32(maxStdlibBinaryRecords):
+    reader.valid = false
+    return -1
+  int(count)
+
+proc readStringId(reader: var BinaryReader, strings: openArray[string]): string =
+  let id = reader.readUint32()
+  if not reader.valid or id >= uint32(strings.len):
+    reader.valid = false
+    return
+  strings[int(id)]
+
+proc decodeStdlibBinary(data: string): StdlibMap =
+  if data.len < stdlibBinaryHeaderSize:
+    return emptyStdlibMap()
+  var reader = BinaryReader(data: data, valid: true)
+  if reader.data[0 ..< stdlibBinaryMagic.len] != stdlibBinaryMagic:
+    return emptyStdlibMap()
+  reader.position = stdlibBinaryMagic.len
+  if reader.readUint32() != stdlibBinaryVersion or reader.readByte() != 1'u8 or
+      reader.readByte() != 0'u8 or reader.readByte() != 0'u8 or reader.readByte() != 0'u8:
+    return emptyStdlibMap()
+  let payloadLength = reader.readUint64()
+  let payloadHash = reader.readUint64()
+  if not reader.valid or payloadLength > uint64(maxStdlibBinaryBytes) or
+      payloadLength != uint64(reader.data.len - reader.position):
+    return emptyStdlibMap()
+  let payloadStart = reader.position
+  let payload =
+    if payloadLength == 0:
+      ""
+    else:
+      reader.data[payloadStart ..< payloadStart + int(payloadLength)]
+  if contentFingerprint(payload) != payloadHash:
+    return emptyStdlibMap()
+  reader.data = payload
+  reader.position = 0
+  if not reader.ensureBytes(6 * sizeof(uint32)):
+    return emptyStdlibMap()
+
+  let stringCount = reader.readCount()
+  let moduleCount = reader.readCount()
+  let symbolCount = reader.readCount()
+  let candidateCount = reader.readCount()
+  let implicitCount = reader.readCount()
+  let blobLengthValue = reader.readUint32()
+  let blobLength =
+    if reader.valid and blobLengthValue <= uint32(maxStdlibBinaryBytes):
+      int(blobLengthValue)
+    else:
+      -1
+  if stringCount < 0 or moduleCount < 0 or symbolCount < 0 or candidateCount < 0 or
+      implicitCount < 0 or blobLength < 0 or blobLength > maxStdlibBinaryBytes or
+      not reader.ensureRecords(stringCount, 8):
+    return emptyStdlibMap()
+
+  var offsets = newSeq[uint32](stringCount)
+  var lengths = newSeq[uint32](stringCount)
+  for index in 0 ..< stringCount:
+    offsets[index] = reader.readUint32()
+    lengths[index] = reader.readUint32()
+  if not reader.valid or not reader.ensureBytes(blobLength):
+    return emptyStdlibMap()
+  let blobStart = reader.position
+  reader.position += blobLength
+  var strings = newSeq[string](stringCount)
+  for index in 0 ..< stringCount:
+    if uint64(offsets[index]) + uint64(lengths[index]) > uint64(blobLength):
+      return emptyStdlibMap()
+    if lengths[index] > 0:
+      let start = blobStart + int(offsets[index])
+      strings[index] = reader.data[start ..< start + int(lengths[index])]
+
+  if not reader.ensureRecords(moduleCount, sizeof(uint32)):
+    return emptyStdlibMap()
+  result = newStdlibMap()
+  var previousModule = ""
+  for _ in 0 ..< moduleCount:
+    let module = reader.readStringId(strings)
+    if not reader.valid or module.len == 0 or canonicalModule(module) != module or
+        (previousModule.len > 0 and module <= previousModule):
+      return emptyStdlibMap()
+    result.modules.incl module
+    previousModule = module
+
+  if not reader.ensureRecords(implicitCount, sizeof(uint32)):
+    return emptyStdlibMap()
+  var previousImplicit = ""
+  for _ in 0 ..< implicitCount:
+    let module = reader.readStringId(strings)
+    if not reader.valid or module.len == 0 or canonicalModule(module) != module or
+        (previousImplicit.len > 0 and module <= previousImplicit):
+      return emptyStdlibMap()
+    result.implicitModules.incl module
+    previousImplicit = module
+  if result.implicitModules.len == 0:
+    return emptyStdlibMap()
+
+  if not reader.ensureRecords(symbolCount, 12):
+    return emptyStdlibMap()
+  var symbols = newSeq[BinarySymbol](symbolCount)
+  var previousName = ""
+  var previousCandidate = uint32(0)
+  for index in 0 ..< symbolCount:
+    let name = reader.readStringId(strings)
+    let firstCandidate = reader.readUint32()
+    let count = reader.readUint32()
+    if not reader.valid or name.len == 0 or
+        (previousName.len > 0 and name <= previousName) or
+        firstCandidate != previousCandidate or
+        uint64(firstCandidate) + uint64(count) > uint64(candidateCount):
+      return emptyStdlibMap()
+    symbols[index] =
+      BinarySymbol(name: name, firstCandidate: firstCandidate, candidateCount: count)
+    previousName = name
+    previousCandidate = firstCandidate + count
+  if previousCandidate != uint32(candidateCount) or
+      not reader.ensureRecords(candidateCount, 24):
+    return emptyStdlibMap()
+
+  var candidates = newSeq[BinaryCandidate](candidateCount)
+  for index in 0 ..< candidateCount:
+    let module = reader.readStringId(strings)
+    let name = reader.readStringId(strings)
+    let kind = reader.readStringId(strings)
+    let arity = reader.readInt32()
+    let signature = reader.readStringId(strings)
+    let priority = reader.readByte()
+    if reader.readByte() != 0'u8 or reader.readByte() != 0'u8 or
+        reader.readByte() != 0'u8 or not reader.valid or module.len == 0 or name.len == 0 or
+        kind.len == 0 or module notin result.modules or
+        priority > uint8(ord(high(CandidatePriority))):
+      return emptyStdlibMap()
+    candidates[index] = BinaryCandidate(
+      module: module,
+      name: name,
+      kind: kind,
+      arity: arity,
+      signature: signature,
+      priority: CandidatePriority(priority),
+    )
+  if reader.position != reader.data.len:
+    return emptyStdlibMap()
+
+  for symbol in symbols:
+    result.registerSymbolKey(symbol.name)
+    var values: seq[SymbolCandidate] = @[]
+    for index in int(symbol.firstCandidate) ..<
+        int(symbol.firstCandidate + symbol.candidateCount):
+      let candidate = candidates[index]
+      if not addUniqueCandidate(
+        values,
+        SymbolCandidate(
+          module: candidate.module,
+          name: candidate.name,
+          kind: candidate.kind,
+          arity: int(candidate.arity),
+          signature: candidate.signature,
+          priority: candidate.priority,
+        ),
+      ):
+        return emptyStdlibMap()
+    if values.len == 0:
+      return emptyStdlibMap()
+    result.symbols[symbol.name] = values
+  if result.symbols.len == 0:
+    return emptyStdlibMap()
+  result.metadata = metadataComplete
+  result.surface = surfaceForMap(result, surfaceStdlib)
+  if result.surface == nil or not result.surface.valid():
+    return emptyStdlibMap()
+  return result
+
+proc loadBundledStdlibMap(): StdlibMap =
+  decodeStdlibBinary(bundledStdlibBinary)
+
+proc loadStdlibBinary*(path: string): StdlibMap =
+  if path.len == 0:
+    return loadBundledStdlibMap()
+  if not fileExists(path):
+    return emptyStdlibMap()
+  try:
+    return decodeStdlibBinary(readFile(path))
+  except CatchableError:
+    return emptyStdlibMap()
+
 proc intField(node: JsonNode, name: string, fallback: int): int =
   if node != nil and node.kind == JObject and node.hasKey(name) and
       node[name].kind == JInt:
@@ -174,14 +419,14 @@ proc stringField(node: JsonNode, name: string): string =
   ""
 
 proc loadStdlibMap*(path: string): StdlibMap =
+  if path.len == 0:
+    return loadBundledStdlibMap()
   var content = ""
-  if path.len > 0 and fileExists(path):
+  if fileExists(path):
     try:
       content = readFile(path)
     except CatchableError:
       discard
-  if content.len == 0:
-    content = bundledStdlibMap
   if content.len == 0:
     return emptyStdlibMap()
   try:
@@ -361,9 +606,14 @@ var cachedMapPath = ""
 var hasCachedMap = false
 
 proc stdlibMap*(): StdlibMap =
-  let path = findStdlibMap()
-  if not hasCachedMap or path != cachedMapPath:
-    cachedMap = loadStdlibMap(path)
-    cachedMapPath = path
+  let configured = getEnv("ONIM_STDLIB_MAP")
+  let cacheKey = if configured.len > 0: configured else: "<bundled>"
+  if not hasCachedMap or cacheKey != cachedMapPath:
+    cachedMap =
+      if configured.len > 0:
+        loadStdlibMap(configured)
+      else:
+        loadStdlibMap("")
+    cachedMapPath = cacheKey
     hasCachedMap = true
   cachedMap
