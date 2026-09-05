@@ -3,6 +3,7 @@ import std/strutils
 import ../index/bindings
 import ../index/source_index
 import ../index/symbols
+import ../index/scopes
 import ../session/ids
 import ../session/workspace
 import ../syntax/imports
@@ -189,6 +190,40 @@ proc fromBindingState(
           not plainImported(source.text, symbol):
         result.uncertain = true
 
+proc localDeclarationShadows(
+    source: WorkspaceSnapshot, tokenIndex: int, name: string
+): bool =
+  if source.index == nil or not source.index.bindingsReady or tokenIndex < 0 or
+      tokenIndex >= source.index.parsed.tokens.len:
+    return true
+  let wanted = identifierKey(name)
+  if wanted.len == 0:
+    return true
+  var scope = source.index.scopes.innermostScopeAt(uint32(tokenIndex))
+  while source.index.scopes.isLocalScope(scope):
+    for declaration in source.index.scopes.declarations:
+      if declaration.scope != scope or declaration.nameToken == uint32(tokenIndex) or
+          declaration.nameToken >= uint32(source.index.parsed.tokens.len):
+        continue
+      if identifierKey(source.index.parsed.tokens[int(declaration.nameToken)].text) ==
+          wanted:
+        return true
+    scope = source.index.scopes.parentScope(scope)
+  false
+
+proc importedUseSupported(
+    source: WorkspaceSnapshot, tokenIndex: int, name: string
+): bool =
+  if source.index == nil or not source.index.bindingsReady or tokenIndex < 0 or
+      tokenIndex >= source.index.parsed.tokens.len:
+    return false
+  let binding = source.index.resolveBinding(uint32(tokenIndex))
+  if binding.state != bindingUnknown:
+    return false
+  if source.index.implicitNameKind(uint32(tokenIndex)) != implicitNone:
+    return false
+  not source.localDeclarationShadows(tokenIndex, name)
+
 proc qualifiedMember[T](tokens: T, tokenIndex: int): tuple[qualifier, member: int] =
   result = (-1, -1)
   if tokenIndex < 2 or tokens[tokenIndex - 1].text != ".":
@@ -280,14 +315,12 @@ proc resolveFrom(
     return unknownResolution()
   finishTargets(targets, unresolved)
 
-proc resolveDefinition*(
-    workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int
+proc resolveDefinitionAtToken*(
+    workspace: Workspace, source: WorkspaceSnapshot, tokenIndex: int
 ): DefinitionResolution =
   result = unknownResolution()
-  if workspace == nil or not validSource(source):
-    return
-  let tokenIndex = tokenAtOffset(source.index.parsed.tokens, byteOffset)
-  if tokenIndex < 0:
+  if workspace == nil or not validSource(source) or tokenIndex < 0 or
+      tokenIndex >= source.index.parsed.tokens.len:
     return
   let token = source.index.parsed.tokens[tokenIndex]
   if source.index.parsed.tokenInsideImport(token):
@@ -314,9 +347,11 @@ proc resolveDefinition*(
 
   let qualified = qualifiedMember(source.index.parsed.tokens, tokenIndex)
   if qualified.member >= 0:
-    if source.index.parsed.tokens[qualified.qualifier].column != 0:
-      return
     if source.index.parsed.tokens[qualified.qualifier].startOffset < 0:
+      return
+    if not source.importedUseSupported(
+      qualified.qualifier, source.index.parsed.tokens[qualified.qualifier].text
+    ):
       return
     return resolveQualified(
       workspace,
@@ -327,7 +362,7 @@ proc resolveDefinition*(
   if tokenIndex + 1 < source.index.parsed.tokens.len and
       source.index.parsed.tokens[tokenIndex + 1].text == ".":
     return
-  if token.column != 0:
+  if not source.importedUseSupported(tokenIndex, token.text):
     return
 
   let fromState = fromBindingState(source, token.text)
@@ -353,3 +388,13 @@ proc resolveDefinition*(
   if fromState.uncertain:
     return
   result = resolveFrom(workspace, source, token.text)
+
+proc resolveDefinition*(
+    workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int
+): DefinitionResolution =
+  if workspace == nil or not validSource(source):
+    return unknownResolution()
+  let tokenIndex = tokenAtOffset(source.index.parsed.tokens, byteOffset)
+  if tokenIndex < 0:
+    return unknownResolution()
+  resolveDefinitionAtToken(workspace, source, tokenIndex)

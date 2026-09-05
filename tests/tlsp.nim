@@ -560,6 +560,7 @@ suite "stdio LSP":
     let providerPath = root / "provider.nim"
     let consumerPath = root / "consumer.nim"
     writeFile(providerPath, "proc answer*() = discard\n")
+    writeFile(consumerPath, "import provider\nprovider.answer()\n")
     let providerUri = "file://" & providerPath.replace('\\', '/')
     let consumerUri = "file://" & consumerPath.replace('\\', '/')
     let process =
@@ -609,9 +610,63 @@ suite "stdio LSP":
         },
       },
     )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "textDocument/references",
+        "params": {
+          "textDocument": {"uri": consumerUri},
+          "position": {"line": 1, "character": 9},
+          "context": {"includeDeclaration": true},
+        },
+      },
+    )
     let definitionResult = readResponse(process.outputStream, 2)
     check definitionResult != nil
     check definitionResult["result"]["uri"].getStr == providerUri
+    let crossFileReferences = readResponse(process.outputStream, 4)
+    check crossFileReferences != nil
+    check crossFileReferences["result"].kind == JArray
+    check crossFileReferences["result"].len == 2
+    check crossFileReferences["result"][0]["uri"].getStr == consumerUri
+    check crossFileReferences["result"][0]["range"]["start"]["character"].getInt == 9
+    check crossFileReferences["result"][1]["uri"].getStr == providerUri
+    check crossFileReferences["result"][1]["range"]["start"]["character"].getInt == 5
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+          "textDocument": {"uri": consumerUri, "version": 2},
+          "contentChanges": [
+            {
+              "text":
+                "import provider as result\nproc use(): int =\n  result.answer()\n"
+            }
+          ],
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "textDocument/references",
+        "params": {
+          "textDocument": {"uri": consumerUri},
+          "position": {"line": 2, "character": 9},
+          "context": {"includeDeclaration": true},
+        },
+      },
+    )
+    let implicitResultReferences = readResponse(process.outputStream, 6)
+    check implicitResultReferences != nil
+    check implicitResultReferences["result"].kind == JNull
 
     sendMessage(
       process.inputStream,

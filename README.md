@@ -83,10 +83,12 @@ The native symbol and module-surface indexes are deliberately narrower than a
 compiler symbol table:
 it stores declaration kinds and exact name-token spans for module-surface
 procedures, types, values, and templates. It is persisted as numeric token
-references, so cache reloads do not duplicate names or offsets. The first native
-definition request resolves one unambiguous same-file module symbol; qualified,
-imported, nested, overloaded, and otherwise uncertain references return `null`
-until the parser and resolver milestones add scope facts.
+references, so cache reloads do not duplicate names or offsets. Native definition
+lookup resolves one unambiguous same-file module symbol and proven project
+exports through direct qualifiers, aliases, and plain `from` bindings. Native
+references preserve same-file binding identity and extend those project targets
+through the direct reverse dependency graph; unsupported, ambiguous, stale, or
+incomplete snapshots return `null` instead of guessing.
 
 Native completion is deliberately conservative: it currently returns visible
 parameters and direct `let`/`var`/`const` declarations from supported routine
@@ -104,7 +106,10 @@ It resolves an unambiguous exported declaration through a direct module
 qualifier, import alias, or plain `from` binding without calling the compiler,
 loading the target source, or walking the filesystem. Conditional, excluded,
 private, overloaded, forward, nested, aliased-symbol, and external-module
-cases intentionally return no location.
+cases intentionally return no location. Project references use the persisted
+occurrence postings as a prefilter, then hydrate only matching files for exact
+UTF-16 locations; conditional, re-exported, generated, or incomplete graphs
+return `null` rather than a partial list.
 
 The LSP also publishes document symbols directly from the current source index.
 Their names, kinds, and UTF-16 selection ranges are available without invoking
@@ -185,5 +190,19 @@ nim c -r --path:src --hints:off --warnings:off bench/bench_workspace.nim
 The warm measurement restores the validated numeric graph rows from the
 manifest and reconstructs reverse edges in memory. Any inventory, stamp, cache,
 or graph-format mismatch falls back to the normal graph rebuild.
+
+The reference benchmark generates 1,024-module workspaces and reports cold and
+warm index time, first-after-restart latency, hot native feature latency, stdio
+round-trip latency, overlay invalidation, 16- and 256-dependent fan-out, and
+same-spelling local false positives:
+
+```sh
+nim c -d:release -o:onim-release --path:src --hints:off --warnings:off src/onim.nim
+nim c -d:release -o:bench/bench_references --path:src --hints:off --warnings:off bench/bench_references.nim
+ONIM_BIN="$PWD/onim-release" ./bench/bench_references
+```
+
+Each result includes median, p95, MAD, result count, candidate count, and
+failures. Bootstrap time is reported separately from cache-ready requests.
 
 For LSP latency, measure both the first semantic prefetch and a cache-ready request. The first request can include Nim's initial module-graph build; subsequent requests for an unchanged or already-prefetched snapshot are served from the in-memory workspace/action cache.

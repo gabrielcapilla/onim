@@ -253,7 +253,20 @@ proc usageFor*[T](index: OccurrenceIndex, tokens: T, name: string): UsageSummary
   let wanted = identifierKey(name)
   if wanted.len == 0:
     return
-  for summary in index.usage:
+  var first = 0
+  var past = index.usage.len
+  while first < past:
+    let middle = (first + past) div 2
+    let summary = index.usage[middle]
+    if summary.representativeToken >= uint32(tokens.len):
+      return
+    let key = identifierKey(tokens[int(summary.representativeToken)].text)
+    if key < wanted:
+      first = middle + 1
+    else:
+      past = middle
+  if first < index.usage.len:
+    let summary = index.usage[first]
     if summary.representativeToken < uint32(tokens.len) and
         identifierKey(tokens[int(summary.representativeToken)].text) == wanted:
       return summary

@@ -53,6 +53,10 @@ type
     id: JsonNode
     params: JsonNode
 
+  PendingReference = object
+    id: JsonNode
+    params: JsonNode
+
   PositionIndex = object
     lineStarts: seq[int]
 
@@ -457,8 +461,64 @@ proc referenceLocation(
     },
   }
 
-proc referencesResponse(params: JsonNode, workspace: Workspace): JsonNode =
-  result = newJNull()
+proc appendReferenceLocations(
+    values: JsonNode,
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    sourceUri: string,
+    matches: openArray[ReferenceMatch],
+): bool =
+  var currentFile = InvalidFileId
+  var currentGeneration = InvalidContentGeneration
+  var currentSource: WorkspaceSnapshot
+  var currentUri = ""
+  var positions: PositionIndex
+  for match in matches:
+    if match.fileId.value != currentFile.value:
+      currentFile = match.fileId
+      currentSource =
+        if match.fileId.value == source.fileId.value:
+          source
+        else:
+          workspace.snapshotForFile(match.fileId)
+      if not currentSource.valid or currentSource.index == nil:
+        return false
+      currentGeneration = currentSource.contentGeneration
+      if currentGeneration.value != match.contentGeneration.value:
+        return false
+      currentUri =
+        if match.fileId.value == source.fileId.value:
+          sourceUri
+        elif currentSource.uri.len > 0:
+          currentSource.uri
+        else:
+          fileUri(currentSource.path)
+      positions = initPositionIndex(currentSource.text)
+    elif currentGeneration.value != match.contentGeneration.value:
+      return false
+    if match.tokenIndex >= uint32(currentSource.index.parsed.tokens.len):
+      return false
+    let location = referenceLocation(
+      currentUri,
+      currentSource,
+      currentSource.index.parsed.tokens[int(match.tokenIndex)],
+      positions,
+    )
+    if location == nil:
+      return false
+    values.add location
+  true
+
+proc bootstrapPending(workspace: Workspace): bool {.inline.} =
+  workspace != nil and workspace.root.len > 0 and
+    workspace.bootstrapState in {
+      workspaceBootstrapPending, workspaceBootstrapIncomplete
+    }
+
+proc referencesResponse(
+    params: JsonNode, workspace: Workspace
+): tuple[value: JsonNode, needsBootstrap: bool] =
+  result.value = newJNull()
   let textDocument = valueOrEmpty(params, "textDocument")
   if textDocument.kind != JObject or not textDocument.hasKey("uri") or
       textDocument["uri"].kind != JString:
@@ -477,22 +537,15 @@ proc referencesResponse(params: JsonNode, workspace: Workspace): JsonNode =
   let includeDeclaration =
     context.kind == JObject and context.hasKey("includeDeclaration") and
     context["includeDeclaration"].kind == JBool and context["includeDeclaration"].getBool
-  let references =
-    resolveSameFileReferences(workspace, snapshot, offset, includeDeclaration)
+  let references = resolveReferences(workspace, snapshot, offset, includeDeclaration)
   if not references.supported:
+    result.needsBootstrap = workspace.bootstrapPending
     return
-  result = newJArray()
-  for tokenIndex in references.tokens:
-    if tokenIndex >= uint32(snapshot.index.parsed.tokens.len):
-      result = newJNull()
-      return
-    let location = referenceLocation(
-      uriText, snapshot, snapshot.index.parsed.tokens[int(tokenIndex)], positions
-    )
-    if location == nil:
-      result = newJNull()
-      return
-    result.add location
+  result.value = newJArray()
+  if not appendReferenceLocations(
+    result.value, workspace, snapshot, uriText, references.matches
+  ):
+    result.value = newJNull()
 
 proc hoverResponse(
     params: JsonNode, workspace: Workspace, stdlib: StdlibMap
@@ -992,7 +1045,7 @@ proc codeActions(
   result = newJArray()
   result.add action
 
-proc scheduleBootstrap(runtime: var BootstrapRuntime, workspace: Workspace) =
+proc scheduleBootstrap(runtime: var BootstrapRuntime, workspace: Workspace): bool =
   if workspace == nil or workspace.root.len == 0:
     return
   inc runtime.nextJobGeneration
@@ -1006,8 +1059,11 @@ proc scheduleBootstrap(runtime: var BootstrapRuntime, workspace: Workspace) =
     runtime.pending = request
     runtime.hasPending = true
     cancelBootstrap(request.jobGeneration)
+    return true
   elif submitBootstrap(request):
     runtime.active = true
+    return true
+  false
 
 proc publishOpenNativeDiagnostics(workspace: Workspace, stdlib: StdlibMap) =
   for id in workspace.openDocumentIds:
@@ -1025,10 +1081,20 @@ proc finishPendingDefinitions(
       sendResponse(item.id, response.value)
   pending.setLen(0)
 
+proc finishPendingReferences(workspace: Workspace, pending: var seq[PendingReference]) =
+  for item in pending:
+    let response = referencesResponse(item.params, workspace)
+    if response.needsBootstrap:
+      sendResponse(item.id, newJNull())
+    else:
+      sendResponse(item.id, response.value)
+  pending.setLen(0)
+
 proc handleBootstrapEvent(
     runtime: var BootstrapRuntime,
     workspace: Workspace,
     pendingDefinitions: var seq[PendingDefinition],
+    pendingReferences: var seq[PendingReference],
     stdlib: StdlibMap,
     payload: string,
 ): bool =
@@ -1040,8 +1106,10 @@ proc handleBootstrapEvent(
   if accepted:
     publishOpenNativeDiagnostics(workspace, stdlib)
     finishPendingDefinitions(workspace, pendingDefinitions)
+    finishPendingReferences(workspace, pendingReferences)
   elif value.kind == bootstrapFailed:
     finishPendingDefinitions(workspace, pendingDefinitions)
+    finishPendingReferences(workspace, pendingReferences)
   if runtime.hasPending:
     let request = runtime.pending
     runtime.hasPending = false
@@ -1056,6 +1124,7 @@ proc runLsp*() =
   var pending: SemanticKey
   var queued: seq[SemanticRequest] = @[]
   var pendingDefinitions: seq[PendingDefinition] = @[]
+  var pendingReferences: seq[PendingReference] = @[]
   var bootstrap: BootstrapRuntime
   var options = defaultOrganizeOptions()
   var shutdownRequested = false
@@ -1078,7 +1147,8 @@ proc runLsp*() =
     if event.kind == lspBootstrapEvent:
       if decodeBootstrapResult(event.payload).kind != bootstrapStopped:
         discard handleBootstrapEvent(
-          bootstrap, workspace, pendingDefinitions, stdlib, event.payload
+          bootstrap, workspace, pendingDefinitions, pendingReferences, stdlib,
+          event.payload,
         )
       continue
 
@@ -1129,7 +1199,7 @@ proc runLsp*() =
       result["serverInfo"] = %*{"name": "onim", "version": "0.1.0"}
       if hasId:
         sendResponse(id, result)
-      scheduleBootstrap(bootstrap, workspace)
+      discard scheduleBootstrap(bootstrap, workspace)
     of "initialized":
       discard
     of "shutdown":
@@ -1154,7 +1224,7 @@ proc runLsp*() =
         publishNativeDiagnostics(workspace, snapshot, stdlib)
         if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled:
           discard enqueueSemantic(snapshot, options, pending, queued)
-        scheduleBootstrap(bootstrap, workspace)
+        discard scheduleBootstrap(bootstrap, workspace)
     of "textDocument/didChange":
       let textDocument = valueOrEmpty(params, "textDocument")
       let uriText =
@@ -1179,14 +1249,14 @@ proc runLsp*() =
         publishNativeDiagnostics(workspace, snapshot, stdlib)
         if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled:
           discard enqueueSemantic(snapshot, options, pending, queued)
-        scheduleBootstrap(bootstrap, workspace)
+        discard scheduleBootstrap(bootstrap, workspace)
     of "textDocument/didClose":
       let textDocument = valueOrEmpty(params, "textDocument")
       if textDocument.hasKey("uri"):
         let uriText = textDocument["uri"].getStr
         workspace.closeDocument(uriText, uriToPath(uriText))
         clearNativeDiagnostics(uriText)
-        scheduleBootstrap(bootstrap, workspace)
+        discard scheduleBootstrap(bootstrap, workspace)
     of "textDocument/didSave":
       let textDocument = valueOrEmpty(params, "textDocument")
       if textDocument.hasKey("uri"):
@@ -1198,7 +1268,7 @@ proc runLsp*() =
         publishNativeDiagnostics(workspace, snapshot, stdlib)
         if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled:
           discard enqueueSemantic(snapshot, options, pending, queued)
-        scheduleBootstrap(bootstrap, workspace)
+        discard scheduleBootstrap(bootstrap, workspace)
     of "workspace/didChangeWatchedFiles":
       let changes = valueOrEmpty(params, "changes")
       if changes.kind == JArray:
@@ -1208,7 +1278,7 @@ proc runLsp*() =
           let path = uriToPath(change["uri"].getStr)
           let changeType = intOption(change, "type", 2)
           workspace.fileChanged(path, changeType == 3)
-        scheduleBootstrap(bootstrap, workspace)
+        discard scheduleBootstrap(bootstrap, workspace)
     of "textDocument/definition":
       if hasId:
         var response = definitionResponse(params, workspace)
@@ -1223,7 +1293,15 @@ proc runLsp*() =
           sendResponse(id, response.value)
     of "textDocument/references":
       if hasId:
-        sendResponse(id, referencesResponse(params, workspace))
+        let response = referencesResponse(params, workspace)
+        if response.needsBootstrap:
+          pendingReferences.add PendingReference(id: id, params: params)
+          if not bootstrap.active:
+            if not scheduleBootstrap(bootstrap, workspace):
+              pendingReferences.setLen(pendingReferences.len - 1)
+              sendResponse(id, newJNull())
+        else:
+          sendResponse(id, response.value)
     of "textDocument/hover":
       if hasId:
         sendResponse(id, hoverResponse(params, workspace, stdlib))
