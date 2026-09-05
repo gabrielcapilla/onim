@@ -51,6 +51,7 @@ suite "stdio LSP":
     check initialized != nil
     check initialized["result"]["capabilities"]["codeActionProvider"] != nil
     check initialized["result"]["capabilities"]["definitionProvider"].getBool
+    check initialized["result"]["capabilities"]["hoverProvider"].getBool
     check initialized["result"]["capabilities"]["referencesProvider"].getBool
     check initialized["result"]["capabilities"]["documentSymbolProvider"].getBool
 
@@ -250,6 +251,52 @@ suite "stdio LSP":
     check localDefinition["result"]["uri"].getStr == referencesUri
     check localDefinition["result"]["range"]["start"]["line"].getInt == 0
     check localDefinition["result"]["range"]["start"]["character"].getInt == 9
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": "textDocument/hover",
+        "params": {
+          "textDocument": {"uri": definitionUri},
+          "position": {"line": 2, "character": 1},
+        },
+      },
+    )
+    let localHover = readResponse(process.outputStream, 13)
+    check localHover != nil
+    check localHover["result"]["contents"]["value"].getStr.contains("helper")
+
+    let hoverUri = "file:///tmp/onim-hover.nim"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": hoverUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": "import std/os\nwalkDir(\"/tmp\")\n",
+          }
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 14,
+        "method": "textDocument/hover",
+        "params":
+          {"textDocument": {"uri": hoverUri}, "position": {"line": 1, "character": 1}},
+      },
+    )
+    let stdlibHover = readResponse(process.outputStream, 14)
+    check stdlibHover != nil
+    check stdlibHover["result"]["contents"]["value"].getStr.contains("std/os")
 
     let providerUri = "file:///tmp/onim-provider/provider.nim"
     let consumerUri = "file:///tmp/onim-provider/consumer.nim"

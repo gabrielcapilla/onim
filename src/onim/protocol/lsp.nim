@@ -1,6 +1,7 @@
 import std/[json, streams, strutils, uri]
 
 import ../features/definition
+import ../features/hover
 import ../features/organize
 import ../features/references
 import ../semantic/native_diagnostics
@@ -488,6 +489,49 @@ proc referencesResponse(params: JsonNode, workspace: Workspace): JsonNode =
       result = newJNull()
       return
     result.add location
+
+proc hoverResponse(
+    params: JsonNode, workspace: Workspace, stdlib: StdlibMap
+): JsonNode =
+  result = newJNull()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let snapshot = workspace.snapshotForDocument(uriText, path)
+  if not snapshot.valid or snapshot.index == nil:
+    return
+  let positions = initPositionIndex(snapshot.text)
+  let offset = offsetAt(positions, snapshot.text, valueOrEmpty(params, "position"))
+  let info = resolveHover(workspace, snapshot, offset, stdlib)
+  if info.state != hoverAvailable:
+    return
+  let tokenIndex = tokenAtOffset(snapshot.index.parsed.tokens, offset)
+  if tokenIndex < 0 or tokenIndex >= snapshot.index.parsed.tokens.len:
+    return
+  let token = snapshot.index.parsed.tokens[tokenIndex]
+  var value = "```nim\n"
+  if info.signature.len > 0:
+    value.add info.signature
+  elif info.kind.len > 0:
+    value.add info.kind & " " & info.name
+  else:
+    value.add info.name
+  if info.module.len > 0:
+    value.add "\n# " & info.module
+  value.add "\n```"
+  result = %*{
+    "contents": {"kind": "markdown", "value": value},
+    "range": {
+      "start": positionAt(positions, snapshot.text, token.startOffset),
+      "end": positionAt(positions, snapshot.text, token.endOffset),
+    },
+  }
 
 proc documentSymbolKind(kind: SourceSymbolKind): int =
   case kind
@@ -999,6 +1043,7 @@ proc runLsp*() =
       capabilities["textDocumentSync"] = sync
       capabilities["codeActionProvider"] = provider
       capabilities["definitionProvider"] = %true
+      capabilities["hoverProvider"] = %true
       capabilities["referencesProvider"] = %true
       capabilities["documentSymbolProvider"] = %true
       capabilities["positionEncoding"] = %"utf-16"
@@ -1102,6 +1147,9 @@ proc runLsp*() =
     of "textDocument/references":
       if hasId:
         sendResponse(id, referencesResponse(params, workspace))
+    of "textDocument/hover":
+      if hasId:
+        sendResponse(id, hoverResponse(params, workspace, stdlib))
     of "textDocument/documentSymbol":
       if hasId:
         sendResponse(id, documentSymbols(params, workspace))
