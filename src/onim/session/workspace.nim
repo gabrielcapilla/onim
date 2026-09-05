@@ -344,9 +344,7 @@ proc bootstrapManifest(value: BootstrapResult): ProjectManifest =
     result.replaceManifestEntry(entry)
 
 proc validBootstrapPath(root, path: string): bool =
-  if root == "/":
-    return path.startsWith("/")
-  path.startsWith(root & "/")
+  path != root and pathWithin(root, path)
 
 proc validBootstrapDirectoryPath(root, path: string): bool =
   path == root or validBootstrapPath(root, path)

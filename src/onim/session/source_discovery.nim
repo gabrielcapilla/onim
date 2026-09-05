@@ -50,9 +50,6 @@ proc prunedDirectory(path: string): bool {.inline.} =
 proc nimSourcePath(path: string): bool {.inline.} =
   path.toLowerAscii.endsWith(".nim")
 
-proc pathWithin(root, path: string): bool {.inline.} =
-  path == root or path.startsWith(root & "/")
-
 proc markCancelled(state: var DiscoveryState) {.inline.} =
   state.cancelled = true
   state.output.status = discoveryCancelled

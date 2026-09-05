@@ -134,11 +134,6 @@ proc validStamp(stamp: FileStamp): bool {.inline.} =
 proc usableStamp*(stamp: FileStamp): bool {.inline.} =
   stamp.size >= 0 and stamp.modifiedSeconds >= 0 and stamp.modifiedNanoseconds >= 0
 
-proc pathWithin(root, path: string): bool {.inline.} =
-  if root == "/":
-    return path.startsWith("/")
-  path == root or path.startsWith(root & "/")
-
 proc writeToken(stream: Stream, token: Token) =
   stream.write(uint8(ord(token.kind)))
   writeString(stream, token.text)
