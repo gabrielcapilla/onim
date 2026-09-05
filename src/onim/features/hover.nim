@@ -3,7 +3,6 @@ import std/sets
 import ../index/occurrences
 import ../index/source_index
 import ../index/symbols
-import ../session/module_catalog
 import ../session/workspace
 import ../stdlib/map
 import ../syntax/imports
