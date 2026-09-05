@@ -8,6 +8,7 @@ import ./bootstrap_worker
 import ./ids
 import ./module_catalog
 import ./paths
+import ./source_discovery
 
 type
   WorkspaceFileState* = enum
@@ -748,18 +749,10 @@ proc indexWorkspaceImpl(workspace: Workspace): bool =
     return false
 
   let hadRecords = workspace.files.len > 0
-  var paths: seq[string] = @[]
-  try:
-    for path in walkDirRec(workspace.root):
-      let normalized = canonicalPath(path)
-      let lower = normalized.toLowerAscii
-      if not lower.endsWith(".nim") or lower.contains("/.git/") or
-          lower.contains("/nimcache/") or lower.contains("/.cache/"):
-        continue
-      paths.add normalized
-  except CatchableError:
+  let discovered = discoverSources(workspace.root)
+  if discovered.status != discoveryComplete:
     return false
-  paths.sort
+  let paths = discovered.paths
 
   var present = initTable[string, bool]()
   var topologyChanged = false

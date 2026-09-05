@@ -6,6 +6,7 @@ import ../index/source_index
 import ./ids
 import ./module_catalog
 import ./paths
+import ./source_discovery
 
 type
   BootstrapRequest* = object
@@ -75,24 +76,6 @@ proc addUniquePath(paths: var seq[string], path: string) {.gcsafe.} =
     if existing == path:
       return
   paths.add path
-
-proc ignoredSourcePath(path: string): bool {.gcsafe.} =
-  let lower = path.toLowerAscii
-  not lower.endsWith(".nim") or lower.contains("/.git/") or lower.contains("/nimcache/") or
-    lower.contains("/.cache/")
-
-proc discoverSourcePaths(root: string, jobGeneration: uint64): seq[string] {.gcsafe.} =
-  try:
-    for path in walkDirRec(root):
-      if cancellationRequested(jobGeneration):
-        return
-      let normalized = canonicalPath(path)
-      if normalized.len > 0 and not ignoredSourcePath(normalized):
-        result.add normalized
-  except CatchableError:
-    result.setLen(0)
-    return
-  result.sort
 
 proc stableDiskSource(
     path: string
@@ -177,12 +160,21 @@ proc buildBootstrap(request: BootstrapRequest): BootstrapResult {.gcsafe.} =
     result.kind = bootstrapCancelled
     return
 
-  let paths = discoverSourcePaths(request.root, request.jobGeneration)
-  if cancellationRequested(request.jobGeneration):
+  let generation = request.jobGeneration
+  let discovered = discoverSources(
+    request.root,
+    proc(): bool {.gcsafe.} =
+      cancellationRequested(generation),
+  )
+  case discovered.status
+  of discoveryCancelled:
     result.kind = bootstrapCancelled
     return
-  if paths.len == 0 and not dirExists(request.root):
+  of discoveryFailed:
     return
+  of discoveryComplete:
+    discard
+  let paths = discovered.paths
 
   var previous = oldManifestEntries(request.root)
   var indexes = newSeq[SourceIndex](paths.len)
