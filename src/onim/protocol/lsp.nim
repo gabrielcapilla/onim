@@ -4,6 +4,7 @@ import ../features/definition
 import ../features/hover
 import ../features/organize
 import ../features/references
+import ../features/rename
 import ../semantic/native_diagnostics
 import ../semantic/worker
 import ../session/bootstrap_worker
@@ -533,6 +534,42 @@ proc hoverResponse(
     },
   }
 
+proc renameResponse(params: JsonNode, workspace: Workspace): JsonNode =
+  result = newJNull()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString or not params.hasKey("newName") or
+      params["newName"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let snapshot = workspace.snapshotForDocument(uriText, path)
+  if not snapshot.valid or snapshot.index == nil:
+    return
+  let positions = initPositionIndex(snapshot.text)
+  let offset = offsetAt(positions, snapshot.text, valueOrEmpty(params, "position"))
+  let info = renameLocal(workspace, snapshot, offset, params["newName"].getStr)
+  if info.state != renameAvailable:
+    return
+  var edits = newJArray()
+  for tokenIndex in info.tokens:
+    if tokenIndex >= uint32(snapshot.index.parsed.tokens.len):
+      return
+    let token = snapshot.index.parsed.tokens[int(tokenIndex)]
+    edits.add %*{
+      "range": {
+        "start": positionAt(positions, snapshot.text, token.startOffset),
+        "end": positionAt(positions, snapshot.text, token.endOffset),
+      },
+      "newText": params["newName"].getStr,
+    }
+  var changes = newJObject()
+  changes[uriText] = edits
+  result = %*{"changes": changes}
+
 proc documentSymbolKind(kind: SourceSymbolKind): int =
   case kind
   of symbolMethod:
@@ -1044,6 +1081,7 @@ proc runLsp*() =
       capabilities["codeActionProvider"] = provider
       capabilities["definitionProvider"] = %true
       capabilities["hoverProvider"] = %true
+      capabilities["renameProvider"] = %*{"prepareProvider": false}
       capabilities["referencesProvider"] = %true
       capabilities["documentSymbolProvider"] = %true
       capabilities["positionEncoding"] = %"utf-16"
@@ -1150,6 +1188,9 @@ proc runLsp*() =
     of "textDocument/hover":
       if hasId:
         sendResponse(id, hoverResponse(params, workspace, stdlib))
+    of "textDocument/rename":
+      if hasId:
+        sendResponse(id, renameResponse(params, workspace))
     of "textDocument/documentSymbol":
       if hasId:
         sendResponse(id, documentSymbols(params, workspace))

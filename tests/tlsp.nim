@@ -52,6 +52,7 @@ suite "stdio LSP":
     check initialized["result"]["capabilities"]["codeActionProvider"] != nil
     check initialized["result"]["capabilities"]["definitionProvider"].getBool
     check initialized["result"]["capabilities"]["hoverProvider"].getBool
+    check not initialized["result"]["capabilities"]["renameProvider"]["prepareProvider"].getBool
     check initialized["result"]["capabilities"]["referencesProvider"].getBool
     check initialized["result"]["capabilities"]["documentSymbolProvider"].getBool
 
@@ -297,6 +298,26 @@ suite "stdio LSP":
     let stdlibHover = readResponse(process.outputStream, 14)
     check stdlibHover != nil
     check stdlibHover["result"]["contents"]["value"].getStr.contains("std/os")
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 15,
+        "method": "textDocument/rename",
+        "params": {
+          "textDocument": {"uri": referencesUri},
+          "position": {"line": 1, "character": 16},
+          "newName": "scaled",
+        },
+      },
+    )
+    let renameResult = readResponse(process.outputStream, 15)
+    check renameResult != nil
+    check renameResult["result"]["changes"][referencesUri].kind == JArray
+    check renameResult["result"]["changes"][referencesUri].len == 2
+    check renameResult["result"]["changes"][referencesUri][0]["newText"].getStr ==
+      "scaled"
 
     let providerUri = "file:///tmp/onim-provider/provider.nim"
     let consumerUri = "file:///tmp/onim-provider/consumer.nim"
