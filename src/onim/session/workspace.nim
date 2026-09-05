@@ -188,10 +188,20 @@ proc persistManifest(workspace: Workspace) =
       if not graphValid:
         break
       entries[ordinal].forwardOrdinals.sort
+  let directories = workspace.manifest.directories
+  let discoveryValid = workspace.manifest.discoveryValid
   workspace.adoptManifest(
-    ProjectManifest(root: workspace.root, entries: entries, graphValid: graphValid)
+    ProjectManifest(
+      root: workspace.root,
+      entries: entries,
+      graphValid: graphValid,
+      directories: directories,
+      discoveryValid: discoveryValid,
+    )
   )
-  discard saveProjectManifest(workspace.root, entries, graphValid)
+  discard saveProjectManifestWithDiscovery(
+    workspace.root, entries, graphValid, directories, discoveryValid
+  )
 
 proc ensureRecord(
     workspace: Workspace, path: string
@@ -274,6 +284,10 @@ proc cloneWorkspaceState(workspace: Workspace): Workspace =
   new(result)
   result.root = workspace.root
   result.manifest = workspace.manifest
+  result.manifest.directories =
+    newSeqOfCap[ManifestDirectory](workspace.manifest.directories.len)
+  for directory in workspace.manifest.directories:
+    result.manifest.directories.add directory
   result.manifest.entries = newSeqOfCap[ManifestEntry](workspace.manifest.entries.len)
   for entry in workspace.manifest.entries:
     var copied = entry
@@ -310,6 +324,8 @@ proc replaceManifestEntry(value: var ProjectManifest, entry: ManifestEntry) =
 proc bootstrapManifest(value: BootstrapResult): ProjectManifest =
   result.root = canonicalPath(value.root)
   result.graphValid = true
+  result.directories = value.directories
+  result.discoveryValid = value.discoveryValid
   var ordinals = initTable[string, uint32]()
   for ordinal, file in value.files:
     ordinals[file.path] = uint32(ordinal)
@@ -332,11 +348,32 @@ proc validBootstrapPath(root, path: string): bool =
     return path.startsWith("/")
   path.startsWith(root & "/")
 
+proc validBootstrapDirectoryPath(root, path: string): bool =
+  path == root or validBootstrapPath(root, path)
+
 proc validBootstrapResult(workspace: Workspace, value: BootstrapResult): bool =
   if value.kind != bootstrapComplete or canonicalPath(value.root) != workspace.root or
       value.workspaceGeneration != workspace.workspaceGeneration or
       value.configGeneration != uint64(workspace.configGeneration):
     return false
+  if value.discoveryValid:
+    if value.directories.len == 0:
+      return false
+    var directoryPaths = initHashSet[string]()
+    var previousDirectory = ""
+    var hasRoot = false
+    for directory in value.directories:
+      let path = canonicalPath(directory.path)
+      if path != directory.path or not validBootstrapDirectoryPath(workspace.root, path) or
+          path in directoryPaths or
+          (previousDirectory.len > 0 and path <= previousDirectory) or
+          not usableStamp(directory.stamp):
+        return false
+      directoryPaths.incl path
+      previousDirectory = path
+      hasRoot = hasRoot or path == workspace.root
+    if not hasRoot:
+      return false
   var paths = initHashSet[string]()
   var previousPath = ""
   for file in value.files:
@@ -749,7 +786,7 @@ proc indexWorkspaceImpl(workspace: Workspace): bool =
     return false
 
   let hadRecords = workspace.files.len > 0
-  let discovered = discoverSources(workspace.root)
+  let discovered = discoverSources(workspace.root, workspace.manifest)
   if discovered.status != discoveryComplete:
     return false
   let paths = discovered.paths
@@ -829,6 +866,8 @@ proc indexWorkspaceImpl(workspace: Workspace): bool =
     workspace.bumpSnapshot()
   workspace.invalidateProjectSurface()
   workspace.bootstrapState = workspaceBootstrapComplete
+  workspace.manifest.directories = discovered.directories
+  workspace.manifest.discoveryValid = true
   workspace.persistManifest()
   true
 

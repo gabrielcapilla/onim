@@ -35,6 +35,8 @@ type
     workspaceGeneration*: uint64
     configGeneration*: uint64
     root*: string
+    directories*: seq[ManifestDirectory]
+    discoveryValid*: bool
     files*: seq[BootstrapFile]
 
   BootstrapWorkerState = enum
@@ -92,9 +94,10 @@ proc stableDiskSource(
     except CatchableError:
       return
 
-proc oldManifestEntries(root: string): Table[string, ManifestEntry] {.gcsafe.} =
+proc oldManifestEntries(
+    manifest: ProjectManifest
+): Table[string, ManifestEntry] {.gcsafe.} =
   result = initTable[string, ManifestEntry]()
-  let manifest = loadProjectManifest(root)
   if not manifest.graphValid:
     return
   for entry in manifest.entries:
@@ -161,8 +164,10 @@ proc buildBootstrap(request: BootstrapRequest): BootstrapResult {.gcsafe.} =
     return
 
   let generation = request.jobGeneration
+  let previousManifest = loadProjectManifest(request.root)
   let discovered = discoverSources(
     request.root,
+    previousManifest,
     proc(): bool {.gcsafe.} =
       cancellationRequested(generation),
   )
@@ -176,7 +181,9 @@ proc buildBootstrap(request: BootstrapRequest): BootstrapResult {.gcsafe.} =
     discard
   let paths = discovered.paths
 
-  var previous = oldManifestEntries(request.root)
+  result.directories = discovered.directories
+  result.discoveryValid = true
+  var previous = oldManifestEntries(previousManifest)
   var indexes = newSeq[SourceIndex](paths.len)
   var stamps = newSeq[FileStamp](paths.len)
   for ordinal, path in paths:
@@ -229,6 +236,18 @@ proc encodeBootstrapResult*(value: BootstrapResult): string =
   node["workspaceGeneration"] = %value.workspaceGeneration
   node["configGeneration"] = %value.configGeneration
   node["root"] = %value.root
+  node["discoveryValid"] = %value.discoveryValid
+  var directories = newJArray()
+  for directory in value.directories:
+    directories.add %*{
+      "path": directory.path,
+      "stamp": {
+        "size": directory.stamp.size,
+        "modifiedSeconds": directory.stamp.modifiedSeconds,
+        "modifiedNanoseconds": directory.stamp.modifiedNanoseconds,
+      },
+    }
+  node["directories"] = directories
   var files = newJArray()
   for file in value.files:
     var forward = newJArray()
@@ -266,6 +285,27 @@ proc decodeBootstrapResult*(line: string): BootstrapResult =
       uint64(max(workerInteger(node, "workspaceGeneration"), 0))
     result.configGeneration = uint64(max(workerInteger(node, "configGeneration"), 0))
     result.root = workerString(node, "root")
+    result.discoveryValid =
+      node.hasKey("discoveryValid") and node["discoveryValid"].kind == JBool and
+      node["discoveryValid"].getBool
+    if node.hasKey("directories"):
+      if node["directories"].kind != JArray:
+        return
+      for item in node["directories"].items:
+        if item.kind != JObject or not item.hasKey("stamp") or
+            item["stamp"].kind != JObject:
+          result.kind = bootstrapFailed
+          return
+        var directory = ManifestDirectory(path: workerString(item, "path"))
+        directory.stamp.size = workerInteger(item["stamp"], "size")
+        directory.stamp.modifiedSeconds =
+          workerInteger(item["stamp"], "modifiedSeconds")
+        directory.stamp.modifiedNanoseconds =
+          int32(workerInteger(item["stamp"], "modifiedNanoseconds"))
+        result.directories.add directory
+    elif result.discoveryValid:
+      result.kind = bootstrapFailed
+      return
     if not node.hasKey("files") or node["files"].kind != JArray:
       return
     for item in node["files"].items:

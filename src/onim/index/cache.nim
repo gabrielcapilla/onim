@@ -1,4 +1,4 @@
-import std/[algorithm, os, sets, streams, times]
+import std/[algorithm, os, sets, streams, strutils, times]
 
 import ../syntax/imports
 import ../syntax/lexer
@@ -12,8 +12,9 @@ const
   cacheMagic = "ONIMIDX1"
   manifestMagic = "ONIMMAN1"
   cacheVersion = 2'u32
-  manifestVersion = 2'u32
+  manifestVersion = 3'u32
   manifestGraphVersion = 2'u32
+  manifestDiscoveryVersion = 1'u32
   cacheEndian = 1'u8
   maxCacheBytes = 64 * 1024 * 1024
   maxStringBytes = 4 * 1024 * 1024
@@ -33,10 +34,16 @@ type
     forwardOrdinals*: seq[uint32]
     unresolved*: bool
 
+  ManifestDirectory* = object
+    path*: string
+    stamp*: FileStamp
+
   ProjectManifest* = object
     root*: string
     entries*: seq[ManifestEntry]
     graphValid*: bool
+    directories*: seq[ManifestDirectory]
+    discoveryValid*: bool
 
 proc invalidCache(message: string) {.noreturn.} =
   raise newException(IOError, message)
@@ -109,6 +116,28 @@ proc readStringSet(stream: Stream): HashSet[string] =
   let values = readStrings(stream)
   for value in values:
     result.incl value
+
+proc writeStamp(stream: Stream, stamp: FileStamp) =
+  stream.write(stamp.size)
+  stream.write(stamp.modifiedSeconds)
+  stream.write(stamp.modifiedNanoseconds)
+
+proc readStamp(stream: Stream): FileStamp =
+  result.size = stream.readInt64()
+  result.modifiedSeconds = stream.readInt64()
+  result.modifiedNanoseconds = stream.readInt32()
+
+proc validStamp(stamp: FileStamp): bool {.inline.} =
+  stamp.size >= -1 and stamp.modifiedNanoseconds >= -1 and
+    stamp.modifiedNanoseconds < 1_000_000_000
+
+proc usableStamp*(stamp: FileStamp): bool {.inline.} =
+  stamp.size >= 0 and stamp.modifiedSeconds >= 0 and stamp.modifiedNanoseconds >= 0
+
+proc pathWithin(root, path: string): bool {.inline.} =
+  if root == "/":
+    return path.startsWith("/")
+  path == root or path.startsWith(root & "/")
 
 proc writeToken(stream: Stream, token: Token) =
   stream.write(uint8(ord(token.kind)))
@@ -358,18 +387,26 @@ proc sameFileStamp*(left, right: FileStamp): bool {.gcsafe.} =
     left.modifiedNanoseconds == right.modifiedNanoseconds
 
 proc writeManifestPayload(
-    stream: Stream, entries: openArray[ManifestEntry], graphValid: bool
+    stream: Stream,
+    entries: openArray[ManifestEntry],
+    graphValid: bool,
+    directories: openArray[ManifestDirectory],
+    discoveryValid: bool,
 ) =
   stream.write(manifestGraphVersion)
   writeFlag(stream, graphValid)
+  stream.write(manifestDiscoveryVersion)
+  writeFlag(stream, discoveryValid)
+  writeCount(stream, directories.len, maxRecordCount)
+  for directory in directories:
+    writeString(stream, canonicalPath(directory.path))
+    writeStamp(stream, directory.stamp)
   writeCount(stream, entries.len, maxRecordCount)
   for entry in entries:
     writeString(stream, canonicalPath(entry.path))
     stream.write(entry.sourceHash)
     stream.write(entry.byteLength)
-    stream.write(entry.stamp.size)
-    stream.write(entry.stamp.modifiedSeconds)
-    stream.write(entry.stamp.modifiedNanoseconds)
+    writeStamp(stream, entry.stamp)
     writeCount(stream, entry.forwardOrdinals.len, maxRecordCount)
     for ordinal in entry.forwardOrdinals:
       stream.write(ordinal)
@@ -380,13 +417,33 @@ proc readManifestPayload(stream: Stream, root: string): ProjectManifest =
   if stream.readUint32() != manifestGraphVersion:
     invalidCache("manifest graph version does not match")
   result.graphValid = readFlag(stream)
+  if stream.readUint32() != manifestDiscoveryVersion:
+    invalidCache("manifest discovery version does not match")
+  result.discoveryValid = readFlag(stream)
+  let directoryCount = readCount(stream, maxRecordCount)
+  result.directories = newSeqOfCap[ManifestDirectory](directoryCount)
+  var directoryPaths = initHashSet[string]()
+  var previousDirectoryPath = ""
+  for _ in 0 ..< directoryCount:
+    let path = canonicalPath(readString(stream))
+    let stamp = readStamp(stream)
+    if path.len == 0 or not pathWithin(root, path) or path in directoryPaths or
+        (previousDirectoryPath.len > 0 and path <= previousDirectoryPath) or
+        not validStamp(stamp):
+      invalidCache("manifest directory is invalid or duplicated")
+    directoryPaths.incl path
+    previousDirectoryPath = path
+    result.directories.add ManifestDirectory(path: path, stamp: stamp)
+  if result.discoveryValid and
+      (result.directories.len == 0 or not directoryPaths.contains(root)):
+    invalidCache("manifest discovery is empty")
   let count = readCount(stream, maxRecordCount)
   result.entries = newSeqOfCap[ManifestEntry](count)
   var paths = initHashSet[string]()
   var previousEntryPath = ""
   for _ in 0 ..< count:
     let path = canonicalPath(readString(stream))
-    if path.len == 0 or path in paths or
+    if path.len == 0 or not pathWithin(root, path) or path in paths or
         (previousEntryPath.len > 0 and path <= previousEntryPath):
       invalidCache("manifest path is invalid or duplicated")
     paths.incl path
@@ -394,12 +451,8 @@ proc readManifestPayload(stream: Stream, root: string): ProjectManifest =
     var entry = ManifestEntry(path: path)
     entry.sourceHash = stream.readUint64()
     entry.byteLength = stream.readInt64()
-    entry.stamp.size = stream.readInt64()
-    entry.stamp.modifiedSeconds = stream.readInt64()
-    entry.stamp.modifiedNanoseconds = stream.readInt32()
-    if entry.byteLength < 0 or entry.stamp.size < -1 or
-        entry.stamp.modifiedNanoseconds < -1 or
-        entry.stamp.modifiedNanoseconds >= 1_000_000_000:
+    entry.stamp = readStamp(stream)
+    if entry.byteLength < 0 or not validStamp(entry.stamp):
       invalidCache("manifest file stamp is invalid")
     let forwardCount = readCount(stream, maxRecordCount)
     entry.forwardOrdinals = newSeqOfCap[uint32](forwardCount)
@@ -457,18 +510,42 @@ proc loadProjectManifest*(projectRoot: string): ProjectManifest {.gcsafe.} =
       except CatchableError:
         discard
 
-proc saveProjectManifest*(
-    projectRoot: string, entries: openArray[ManifestEntry], graphValid = false
+proc saveProjectManifestWithDiscovery*(
+    projectRoot: string,
+    entries: openArray[ManifestEntry],
+    graphValid: bool,
+    directories: openArray[ManifestDirectory],
+    discoveryValid: bool,
 ): bool =
   let root = canonicalPath(projectRoot)
   if root.len == 0:
     return false
+
+  var orderedDirectories: seq[ManifestDirectory] = @[]
+  if discoveryValid:
+    for directory in directories:
+      let path = canonicalPath(directory.path)
+      if path.len == 0 or not pathWithin(root, path) or not usableStamp(directory.stamp):
+        return false
+      orderedDirectories.add ManifestDirectory(path: path, stamp: directory.stamp)
+    orderedDirectories.sort(
+      proc(left, right: ManifestDirectory): int =
+        cmp(left.path, right.path)
+    )
+    for index in 1 ..< orderedDirectories.len:
+      if orderedDirectories[index - 1].path == orderedDirectories[index].path:
+        return false
+    if orderedDirectories.len == 0 or orderedDirectories[0].path != root:
+      return false
+
   var ordered: seq[ManifestEntry] = @[]
   for entry in entries:
     if entry.path.len == 0 or entry.byteLength < 0:
       return false
     var copied = entry
     copied.path = canonicalPath(entry.path)
+    if not pathWithin(root, copied.path):
+      return false
     for index, ordinal in copied.forwardOrdinals:
       if ordinal >= uint32(entries.len) or
           (index > 0 and ordinal <= copied.forwardOrdinals[index - 1]):
@@ -491,7 +568,9 @@ proc saveProjectManifest*(
   var payloadStream = newStringStream()
   var stream: FileStream
   try:
-    writeManifestPayload(payloadStream, ordered, graphValid)
+    writeManifestPayload(
+      payloadStream, ordered, graphValid, orderedDirectories, discoveryValid
+    )
     payloadStream.flush()
     let payload = payloadStream.data
     if payload.len > maxCacheBytes:
@@ -521,11 +600,18 @@ proc saveProjectManifest*(
         stream.close()
       except CatchableError:
         discard
+
     if not result and fileExists(temporary):
       try:
         removeFile(temporary)
       except CatchableError:
         discard
+
+proc saveProjectManifest*(
+    projectRoot: string, entries: openArray[ManifestEntry], graphValid = false
+): bool =
+  let directories: seq[ManifestDirectory] = @[]
+  saveProjectManifestWithDiscovery(projectRoot, entries, graphValid, directories, false)
 
 proc encodeSourceIndex(index: SourceIndex): string =
   let payload = newStringStream()

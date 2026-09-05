@@ -142,6 +142,8 @@ suite "workspace index":
     check fileExists(manifestPath)
     check firstWorkspace.manifest.root == absolutePath(root)
     check firstWorkspace.manifest.entries.len == 1
+    check firstWorkspace.manifest.discoveryValid
+    check firstWorkspace.manifest.directories.len > 0
     check firstWorkspace.manifest.entries[0].path == absolutePath(filePath)
     check firstSnapshot.index != nil
     check loadCachedSourceIndex(root, filePath, source) != nil
@@ -158,6 +160,9 @@ suite "workspace index":
     let secondSnapshot =
       secondWorkspace.snapshotForFile(secondWorkspace.fileIdForPath(filePath))
     check secondWorkspace.manifest.entries.len == 1
+    check secondWorkspace.manifest.discoveryValid
+    check secondWorkspace.manifest.directories.len ==
+      firstWorkspace.manifest.directories.len
     check secondWorkspace.manifest.entries[0].sourceHash ==
       firstWorkspace.manifest.entries[0].sourceHash
     check secondSnapshot.index != nil

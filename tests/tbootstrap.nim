@@ -45,6 +45,12 @@ suite "background workspace bootstrap":
     let value = receiveBootstrap()
     check value.kind == bootstrapComplete
     check value.files.len == 2
+    check value.discoveryValid
+    check value.directories.len > 0
+    let roundTrip = decodeBootstrapResult(encodeBootstrapResult(value))
+    check roundTrip.kind == bootstrapComplete
+    check roundTrip.discoveryValid
+    check roundTrip.directories == value.directories
     check workspace.applyBootstrap(value)
     let provider = workspace.fileIdForPath(root / "provider.nim")
     let consumer = workspace.fileIdForPath(root / "consumer.nim")
