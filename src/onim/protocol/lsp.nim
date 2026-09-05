@@ -855,7 +855,7 @@ proc handleBootstrapEvent(
 
 proc runLsp*() =
   let workspace = initWorkspace()
-  var stdlib: StdlibMap
+  var stdlib = stdlibMap()
   var actionCache: seq[CachedAction] = @[]
   var pending: seq[SemanticKey] = @[]
   var queued: seq[SemanticRequest] = @[]
