@@ -1,4 +1,4 @@
-import std/[algorithm, os, strutils, tables]
+import std/[algorithm, os, sets, strutils, tables]
 
 import ../index/cache
 import ./paths
@@ -21,19 +21,23 @@ type
     entriesExamined*: uint32
     errorPath*: string
 
+  DiscoveryAttemptState = enum
+    discoveryAttemptRunning
+    discoveryAttemptCancelled
+    discoveryAttemptFailed
+    discoveryAttemptUnstable
+
   DiscoveryState = object
     root: string
     cancellation: DiscoveryCancellation
     oldDirectories: Table[string, ManifestDirectory]
-    oldFiles: Table[string, bool]
+    oldFiles: HashSet[string]
     currentStamps: Table[string, FileStamp]
     changedDirectories: seq[string]
     outputDirectories: Table[string, FileStamp]
-    outputFiles: Table[string, bool]
+    outputFiles: HashSet[string]
     output: DiscoveryResult
-    cancelled: bool
-    failed: bool
-    unstable: bool
+    attempt: DiscoveryAttemptState
 
 const prunedDirectoryNames = [".git", ".cache", "nimcache"]
 
@@ -51,20 +55,18 @@ proc nimSourcePath(path: string): bool {.inline.} =
   path.toLowerAscii.endsWith(".nim")
 
 proc markCancelled(state: var DiscoveryState) {.inline.} =
-  state.cancelled = true
-  state.output.status = discoveryCancelled
+  state.attempt = discoveryAttemptCancelled
   state.output.errorPath = state.root
 
 proc markFailed(state: var DiscoveryState, path: string) {.inline.} =
-  state.failed = true
-  state.output.status = discoveryFailed
+  state.attempt = discoveryAttemptFailed
   state.output.errorPath = path
 
 proc addDirectory(state: var DiscoveryState, path: string, stamp: FileStamp) =
   state.outputDirectories[path] = stamp
 
 proc addFile(state: var DiscoveryState, path: string) =
-  state.outputFiles[path] = true
+  state.outputFiles.incl path
 
 proc subtreeChanged(state: DiscoveryState, directory: string): bool {.inline.} =
   for changed in state.changedDirectories:
@@ -92,7 +94,7 @@ proc restoreSubtree(state: var DiscoveryState, directory: string): bool {.gcsafe
       return false
     state.addDirectory(path, state.currentStamps[path])
     inc state.output.directoriesReused
-  for path, _ in state.oldFiles:
+  for path in state.oldFiles:
     if pathWithin(directory, path):
       state.addFile(path)
   true
@@ -100,7 +102,7 @@ proc restoreSubtree(state: var DiscoveryState, directory: string): bool {.gcsafe
 proc scanDirectory(state: var DiscoveryState, directory: string): bool {.gcsafe.}
 
 proc rebuildSubtree(state: var DiscoveryState, directory: string): bool {.gcsafe.} =
-  if state.cancelled or state.failed:
+  if state.attempt != discoveryAttemptRunning:
     return false
   if shouldCancel(state.cancellation):
     state.markCancelled()
@@ -124,13 +126,13 @@ proc rebuildSubtree(state: var DiscoveryState, directory: string): bool {.gcsafe
         return false
     elif not state.restoreSubtree(path):
       return false
-  for path, _ in state.oldFiles:
+  for path in state.oldFiles:
     if parentDir(path) == directory:
       state.addFile(path)
   true
 
 proc scanDirectory(state: var DiscoveryState, directory: string): bool {.gcsafe.} =
-  if state.cancelled or state.failed:
+  if state.attempt != discoveryAttemptRunning:
     return false
   if shouldCancel(state.cancellation):
     state.markCancelled()
@@ -173,25 +175,25 @@ proc scanDirectory(state: var DiscoveryState, directory: string): bool {.gcsafe.
     state.markFailed(directory)
     return false
   if not sameFileStamp(before, after):
-    state.unstable = true
+    state.attempt = discoveryAttemptUnstable
     return false
   state.outputDirectories[directory] = after
   true
 
 proc finish(state: DiscoveryState): DiscoveryResult {.gcsafe.} =
   result = state.output
-  if state.cancelled:
+  if state.attempt == discoveryAttemptCancelled:
     result.status = discoveryCancelled
     result.paths.setLen(0)
     result.directories.setLen(0)
     return
-  if state.failed or state.unstable:
+  if state.attempt != discoveryAttemptRunning:
     result.status = discoveryFailed
     result.paths.setLen(0)
     result.directories.setLen(0)
     return
   var paths = newSeqOfCap[string](state.outputFiles.len)
-  for path, _ in state.outputFiles:
+  for path in state.outputFiles:
     paths.add path
   paths.sort
   result.paths = paths
@@ -211,11 +213,11 @@ proc initState(
   result.root = root
   result.cancellation = cancellation
   result.oldDirectories = initTable[string, ManifestDirectory]()
-  result.oldFiles = initTable[string, bool]()
+  result.oldFiles = initHashSet[string]()
   result.currentStamps = initTable[string, FileStamp]()
   result.outputDirectories = initTable[string, FileStamp]()
-  result.outputFiles = initTable[string, bool]()
-  result.output.status = discoveryFailed
+  result.outputFiles = initHashSet[string]()
+  result.attempt = discoveryAttemptRunning
   result.output.errorPath = root
 
 proc fullDiscovery(
@@ -225,9 +227,9 @@ proc fullDiscovery(
     var state = initState(root, cancellation)
     if state.scanDirectory(root):
       return state.finish()
-    if state.cancelled:
+    if state.attempt == discoveryAttemptCancelled:
       return state.finish()
-    if not state.unstable:
+    if state.attempt != discoveryAttemptUnstable:
       return state.finish()
   result.status = discoveryFailed
   result.errorPath = root
@@ -253,9 +255,9 @@ proc prepareWarmState(
   for entry in previous.entries:
     let path = canonicalPath(entry.path)
     if path.len == 0 or path != entry.path or not pathWithin(root, path) or
-        not nimSourcePath(path) or result.state.oldFiles.hasKey(path):
+        not nimSourcePath(path) or path in result.state.oldFiles:
       return
-    result.state.oldFiles[path] = true
+    result.state.oldFiles.incl path
     if not fileExists(path):
       return
   for path, directory in result.state.oldDirectories:
@@ -276,7 +278,7 @@ proc incrementalDiscovery(
   let prepared = prepareWarmState(root, previous, cancellation)
   if not prepared.available:
     return
-  if prepared.state.cancelled:
+  if prepared.state.attempt == discoveryAttemptCancelled:
     result.available = true
     result.value = prepared.state.finish()
     return
@@ -289,7 +291,7 @@ proc incrementalDiscovery(
   if state.rebuildSubtree(root):
     result.available = true
     result.value = state.finish()
-  elif state.cancelled:
+  elif state.attempt == discoveryAttemptCancelled:
     result.available = true
     result.value = state.finish()
 
