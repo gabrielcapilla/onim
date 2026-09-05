@@ -58,6 +58,9 @@ suite "background workspace bootstrap":
     let consumer = workspace.fileIdForPath(root / "consumer.nim")
     check value(provider) != 0'u32
     check value(consumer) != 0'u32
+    let providerView = workspace.indexViewForFile(provider)
+    check providerView.valid
+    check providerView.index != nil
     check workspace.dependencies(consumer).len == 1
     check workspace.dependencies(consumer)[0].value == provider.value
     check workspace.graphComplete
