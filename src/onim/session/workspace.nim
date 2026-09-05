@@ -480,25 +480,12 @@ proc applyBootstrap*(workspace: Workspace, value: BootstrapResult): bool =
     let index = id.recordIndex
     if candidate.files[index].state == workspaceOpen:
       continue
-    var indexed = loadCachedSourceIndexFingerprint(
-      candidate.root, path, file.sourceHash, file.byteLength
-    )
-    if indexed == nil:
-      let stable = stableDiskSource(path)
-      if not stable.valid or not sameFileStamp(stable.stamp, file.stamp) or
-          stable.source.len != file.byteLength or
-          contentFingerprint(stable.source) != file.sourceHash:
-        return false
-      indexed = indexSource(stable.source)
-      discard saveCachedSourceIndex(candidate.root, path, stable.source, indexed)
-    if indexed == nil:
-      return false
     candidate.files[index].state = workspaceOnDisk
     candidate.files[index].version = -1
     candidate.files[index].text = ""
     candidate.files[index].textLoaded = false
     candidate.files[index].stamp = file.stamp
-    candidate.files[index].index = indexed
+    candidate.files[index].index = nil
     candidate.files[index].contentGeneration = candidate.nextContent()
 
   for index in 0 ..< candidate.files.len:
@@ -827,6 +814,50 @@ proc ensureText(workspace: Workspace, id: FileId, invalidate = true): bool =
   workspace.persistManifest()
   true
 
+proc ensureIndex(workspace: Workspace, id: FileId): bool =
+  let index = id.recordIndex
+  if index < 0 or index >= workspace.files.len:
+    return false
+  if workspace.files[index].state == workspaceMissing:
+    return false
+  if workspace.files[index].index != nil:
+    return true
+  if workspace.files[index].state == workspaceOpen:
+    discard workspace.ensureText(id)
+    return workspace.files[index].index != nil
+
+  let path = workspace.files[index].path
+  let currentStamp = fileStamp(path)
+  if currentStamp.size < 0:
+    discard workspace.ensureText(id)
+    return false
+  if workspace.files[index].state != workspaceOnDisk or
+      not sameFileStamp(currentStamp, workspace.files[index].stamp):
+    discard workspace.ensureText(id)
+    return workspace.files[index].index != nil
+
+  if workspace.manifestByPath.hasKey(path):
+    let entry = workspace.manifestByPath[path]
+    if entry.byteLength == currentStamp.size and entry.byteLength <= int64(high(int)):
+      let cached = loadCachedSourceIndexFingerprint(
+        workspace.root, path, entry.sourceHash, int(entry.byteLength)
+      )
+      if cached != nil:
+        workspace.files[index].index = cached
+        return true
+      let stable = stableDiskSource(path)
+      if stable.valid and sameFileStamp(stable.stamp, currentStamp) and
+          stable.source.len == int(entry.byteLength) and
+          contentFingerprint(stable.source) == entry.sourceHash:
+        workspace.files[index].index = indexSource(stable.source)
+        discard saveCachedSourceIndex(
+          workspace.root, path, stable.source, workspace.files[index].index
+        )
+        return true
+
+  discard workspace.ensureText(id)
+  workspace.files[index].index != nil
+
 proc indexWorkspaceImpl(workspace: Workspace): bool =
   if workspace.root.len == 0 or not dirExists(workspace.root):
     return false
@@ -1131,6 +1162,7 @@ proc indexViewForFile*(workspace: Workspace, id: FileId): WorkspaceIndexView =
   let index = id.recordIndex
   if index < 0 or index >= workspace.files.len:
     return
+  discard workspace.ensureIndex(id)
   result.valid = workspace.files[index].state != workspaceMissing
   result.id = workspace.snapshotId
   result.fileId = id
@@ -1149,12 +1181,12 @@ proc projectSurface*(workspace: Workspace): SurfaceIndex =
     return workspace.projectSurfaceCache
   var inputs = newSeqOfCap[SurfaceInput](workspace.files.len)
   for file in workspace.files:
-    if file.state == workspaceMissing or file.index == nil:
+    if file.state == workspaceMissing or not workspace.ensureIndex(file.id):
       continue
     let module = workspace.moduleForPath(file.path)
     if module.len == 0:
       continue
-    var input = projectSurfaceInput(module, file.index)
+    var input = projectSurfaceInput(module, workspace.files[file.id.recordIndex].index)
     if workspace.moduleCatalog().candidateCount(module) > 1:
       input.uncertainty.incl surfaceUnsupported
     inputs.add input
