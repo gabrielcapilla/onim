@@ -393,8 +393,12 @@ proc decodeStdlibBinary(data: string): StdlibMap =
     return emptyStdlibMap()
   return result
 
+var cachedBundledMap: StdlibMap
+
 proc loadBundledStdlibMap(): StdlibMap =
-  decodeStdlibBinary(bundledStdlibBinary)
+  if cachedBundledMap == nil:
+    cachedBundledMap = decodeStdlibBinary(bundledStdlibBinary)
+  cachedBundledMap
 
 proc loadStdlibBinary*(path: string): StdlibMap =
   if path.len == 0:
