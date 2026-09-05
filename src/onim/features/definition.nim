@@ -58,7 +58,7 @@ proc routineScopeOrdinal(index: ScopeIndex, scope: ScopeId): int {.inline.} =
       index.scopes[ordinal].kind == scopeRoutine: ordinal else: -1
 
 proc localDeclarationIndex(source: WorkspaceSnapshot, tokenIndex: int): int =
-  if not localResolutionReady(source) or tokenIndex < 0:
+  if tokenIndex < 0:
     return -1
   for declarationIndex, declaration in source.index.scopes.declarations:
     if int(declaration.nameToken) != tokenIndex:
@@ -68,8 +68,7 @@ proc localDeclarationIndex(source: WorkspaceSnapshot, tokenIndex: int): int =
   -1
 
 proc localDeclarationForUse(source: WorkspaceSnapshot, tokenIndex: int): int =
-  if not localResolutionReady(source) or tokenIndex < 0 or
-      tokenIndex >= source.index.parsed.tokens.len:
+  if tokenIndex < 0 or tokenIndex >= source.index.parsed.tokens.len:
     return -1
   let scope = source.index.scopes.innermostScopeAt(uint32(tokenIndex))
   if source.index.scopes.routineScopeOrdinal(scope) < 0:
@@ -106,6 +105,23 @@ proc localTarget(
     contentGeneration: source.contentGeneration,
     nameToken: declaration.nameToken,
   )
+
+proc localTargetHasCompetingDeclaration*(
+    source: WorkspaceSnapshot, target: DefinitionTarget
+): bool =
+  if source.index == nil or target.nameToken >= uint32(source.index.parsed.tokens.len):
+    return true
+  let scope = source.index.scopes.innermostScopeAt(target.nameToken)
+  if source.index.scopes.routineScopeOrdinal(scope) < 0:
+    return true
+  let wanted = identifierKey(source.index.parsed.tokens[int(target.nameToken)].text)
+  for declaration in source.index.scopes.declarations:
+    if declaration.scope == scope and declaration.nameToken != target.nameToken and
+        declaration.nameToken < uint32(source.index.parsed.tokens.len) and
+        identifierKey(source.index.parsed.tokens[int(declaration.nameToken)].text) ==
+        wanted:
+      return true
+  false
 
 proc resolveLocalDefinitionAtToken*(
     source: WorkspaceSnapshot, tokenIndex: int

@@ -145,6 +145,17 @@ proc second(value: int) =
       initWorkspace(), ordered, ordered.text.find("value"), true
     ).supported
 
+    let duplicate = snapshotFor(
+      """proc duplicate() =
+  let value = 1
+  let value = 2
+  echo value
+"""
+    )
+    check not resolveSameFileReferences(
+      initWorkspace(), duplicate, duplicate.text.rfind("value"), true
+    ).supported
+
     var stale = snapshotFor(
       """proc stale(value: int) =
   echo value

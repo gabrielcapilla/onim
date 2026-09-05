@@ -10,12 +10,6 @@ type SameFileReferences* = object
   supported*: bool
   tokens*: seq[uint32]
 
-proc sameTarget(left, right: DefinitionTarget): bool {.inline.} =
-  left.snapshotId.value == right.snapshotId.value and
-    left.fileId.value == right.fileId.value and
-    left.contentGeneration.value == right.contentGeneration.value and
-    left.nameToken == right.nameToken
-
 proc sameScope(source: WorkspaceSnapshot, left, right: uint32): bool {.inline.} =
   source.index.scopes.innermostScopeAt(left) ==
     source.index.scopes.innermostScopeAt(right)
@@ -42,7 +36,8 @@ proc resolveSameFileReferences*(
       return
 
   let targetScope = source.index.scopes.innermostScopeAt(selected.target.nameToken)
-  if targetScope == InvalidScopeId:
+  if targetScope == InvalidScopeId or
+      localTargetHasCompetingDeclaration(source, selected.target):
     return
   result.supported = true
   if includeDeclaration:
@@ -56,9 +51,7 @@ proc resolveSameFileReferences*(
         not sameScope(source, selected.target.nameToken, occurrence.token) or
         occurrenceMember in occurrence.roles:
       continue
-    let candidate = resolveLocalDefinitionAtToken(source, occurrenceIndex)
-    if candidate.kind != definitionResolved or
-        not sameTarget(candidate.target, selected.target):
+    if occurrenceIndex < int(selected.target.nameToken):
       result = SameFileReferences()
       return
     result.tokens.add occurrence.token
