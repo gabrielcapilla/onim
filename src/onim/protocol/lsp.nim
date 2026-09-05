@@ -554,11 +554,9 @@ proc sameSemanticKey(left, right: SemanticKey): bool =
     left.configGeneration.value == right.configGeneration.value and
     left.useStdPrefix == right.useStdPrefix
 
-proc removePending(pending: var seq[SemanticKey], key: SemanticKey) =
-  for index, existing in pending:
-    if sameSemanticKey(existing, key):
-      pending.delete(index)
-      return
+proc removePending(pending: var SemanticKey, key: SemanticKey) =
+  if pending.fileId.valid and sameSemanticKey(pending, key):
+    pending = SemanticKey()
 
 proc removeQueued(queued: var seq[SemanticRequest], fileId: FileId) =
   var writeIndex = 0
@@ -573,15 +571,15 @@ proc queueSemantic(queued: var seq[SemanticRequest], request: SemanticRequest) =
   queued.add request
 
 proc dispatchSemantic(
-    queued: var seq[SemanticRequest], pending: var seq[SemanticKey]
+    queued: var seq[SemanticRequest], pending: var SemanticKey
 ): bool =
-  if pending.len > 0 or queued.len == 0:
+  if pending.fileId.valid or queued.len == 0:
     return false
   let request = queued[0]
   queued.delete(0)
   if not submitSemantic(request):
     return false
-  pending.add semanticKey(request)
+  pending = semanticKey(request)
   true
 
 proc actionIsCurrent(
@@ -595,7 +593,7 @@ proc actionIsCurrent(
 proc enqueueSemantic(
     snapshot: WorkspaceSnapshot,
     options: OrganizeOptions,
-    pending: var seq[SemanticKey],
+    pending: var SemanticKey,
     queued: var seq[SemanticRequest],
 ): bool =
   if not snapshot.valid:
@@ -611,11 +609,10 @@ proc enqueueSemantic(
     useStdPrefix: options.useStdPrefix,
   )
   let key = semanticKey(request)
-  for existing in pending:
-    if sameSemanticKey(existing, key):
-      return true
+  if pending.fileId.valid and sameSemanticKey(pending, key):
+    return true
   queueSemantic(queued, request)
-  if pending.len == 0 and not dispatchSemantic(queued, pending):
+  if not pending.fileId.valid and not dispatchSemantic(queued, pending):
     removeQueued(queued, request.fileId)
     return false
   true
@@ -653,7 +650,7 @@ proc acceptSemantic(
     value: SemanticResult,
     workspace: Workspace,
     actionCache: var seq[CachedAction],
-    pending: var seq[SemanticKey],
+    pending: var SemanticKey,
     queued: var seq[SemanticRequest],
 ) =
   if value.failed:
@@ -661,11 +658,11 @@ proc acceptSemantic(
       removePending(pending, semanticKey(value))
       discard dispatchSemantic(queued, pending)
     else:
-      pending.setLen(0)
+      pending = SemanticKey()
       queued.setLen(0)
     return
   if not value.fileId.valid:
-    pending.setLen(0)
+    pending = SemanticKey()
     queued.setLen(0)
     return
   let key = semanticKey(value)
@@ -691,7 +688,7 @@ proc acceptSemantic(
 proc drainSemantic(
     workspace: Workspace,
     actionCache: var seq[CachedAction],
-    pending: var seq[SemanticKey],
+    pending: var SemanticKey,
     queued: var seq[SemanticRequest],
 ) =
   var result: SemanticResult
@@ -702,7 +699,7 @@ proc waitForSemantic(
     key: SemanticKey,
     workspace: Workspace,
     actionCache: var seq[CachedAction],
-    pending: var seq[SemanticKey],
+    pending: var SemanticKey,
     queued: var seq[SemanticRequest],
 ): bool =
   while true:
@@ -717,7 +714,7 @@ proc waitForSemantic(
     let semanticResult = receiveSemantic()
     if semanticResult.failed:
       if not semanticResult.fileId.valid:
-        pending.setLen(0)
+        pending = SemanticKey()
         queued.setLen(0)
       else:
         acceptSemantic(semanticResult, workspace, actionCache, pending, queued)
@@ -729,7 +726,7 @@ proc codeActions(
     workspace: Workspace,
     stdlib: var StdlibMap,
     actionCache: var seq[CachedAction],
-    pending: var seq[SemanticKey],
+    pending: var SemanticKey,
     queued: var seq[SemanticRequest],
     options: OrganizeOptions,
 ): JsonNode =
@@ -863,7 +860,7 @@ proc runLsp*() =
   let workspace = initWorkspace()
   var stdlib = stdlibMap()
   var actionCache: seq[CachedAction] = @[]
-  var pending: seq[SemanticKey] = @[]
+  var pending: SemanticKey
   var queued: seq[SemanticRequest] = @[]
   var pendingDefinitions: seq[PendingDefinition] = @[]
   var bootstrap: BootstrapRuntime
