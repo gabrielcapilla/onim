@@ -48,6 +48,26 @@ type
   PositionIndex = object
     lineStarts: seq[int]
 
+proc hasCachedAction(cache: seq[CachedAction], id: FileId): bool {.inline.} =
+  let slot = id.slot
+  slot >= 0 and slot < cache.len and
+    cache[slot].contentGeneration != InvalidContentGeneration
+
+proc cachedActionFor(cache: seq[CachedAction], id: FileId): CachedAction {.inline.} =
+  let slot = id.slot
+  if slot >= 0 and slot < cache.len:
+    cache[slot]
+
+proc storeCachedAction(
+    cache: var seq[CachedAction], id: FileId, action: CachedAction
+) {.inline.} =
+  let slot = id.slot
+  if slot < 0:
+    return
+  if slot >= cache.len:
+    cache.setLen(slot + 1)
+  cache[slot] = action
+
 var lspEvents: Channel[LspEvent]
 var lspInputReader: Thread[void]
 var lspBootstrapBridge: Thread[void]
@@ -599,7 +619,7 @@ proc cacheIndexedAction(
     snapshot: WorkspaceSnapshot,
     options: OrganizeOptions,
     stdlib: var StdlibMap,
-    actionCache: var Table[uint32, CachedAction],
+    actionCache: var seq[CachedAction],
 ): tuple[handled: bool, edits: seq[ImportEdit]] =
   if not snapshot.valid:
     return
@@ -612,18 +632,22 @@ proc cacheIndexedAction(
     return
   result.handled = true
   result.edits = attempt.edits
-  actionCache[uint32(snapshot.fileId)] = CachedAction(
-    contentGeneration: snapshot.contentGeneration,
-    dependencyGeneration: snapshot.dependencyGeneration,
-    configGeneration: snapshot.configGeneration,
-    useStdPrefix: options.useStdPrefix,
-    edits: result.edits,
+  storeCachedAction(
+    actionCache,
+    snapshot.fileId,
+    CachedAction(
+      contentGeneration: snapshot.contentGeneration,
+      dependencyGeneration: snapshot.dependencyGeneration,
+      configGeneration: snapshot.configGeneration,
+      useStdPrefix: options.useStdPrefix,
+      edits: result.edits,
+    ),
   )
 
 proc acceptSemantic(
     value: SemanticResult,
     workspace: Workspace,
-    actionCache: var Table[uint32, CachedAction],
+    actionCache: var seq[CachedAction],
     pending: var seq[SemanticKey],
     queued: var seq[SemanticRequest],
 ) =
@@ -638,18 +662,22 @@ proc acceptSemantic(
       sameSemanticKey(
         semanticKey(snapshot, OrganizeOptions(useStdPrefix: value.useStdPrefix)), key
       ):
-    actionCache[uint32(value.fileId)] = CachedAction(
-      contentGeneration: value.contentGeneration,
-      dependencyGeneration: value.dependencyGeneration,
-      configGeneration: value.configGeneration,
-      useStdPrefix: value.useStdPrefix,
-      edits: value.edits,
+    storeCachedAction(
+      actionCache,
+      value.fileId,
+      CachedAction(
+        contentGeneration: value.contentGeneration,
+        dependencyGeneration: value.dependencyGeneration,
+        configGeneration: value.configGeneration,
+        useStdPrefix: value.useStdPrefix,
+        edits: value.edits,
+      ),
     )
   discard dispatchSemantic(queued, pending)
 
 proc drainSemantic(
     workspace: Workspace,
-    actionCache: var Table[uint32, CachedAction],
+    actionCache: var seq[CachedAction],
     pending: var seq[SemanticKey],
     queued: var seq[SemanticRequest],
 ) =
@@ -660,15 +688,15 @@ proc drainSemantic(
 proc waitForSemantic(
     key: SemanticKey,
     workspace: Workspace,
-    actionCache: var Table[uint32, CachedAction],
+    actionCache: var seq[CachedAction],
     pending: var seq[SemanticKey],
     queued: var seq[SemanticRequest],
 ): bool =
   while true:
     let snapshot = workspace.snapshotForFile(key.fileId)
-    if snapshot.valid and actionCache.hasKey(uint32(key.fileId)) and
+    if snapshot.valid and hasCachedAction(actionCache, key.fileId) and
         actionIsCurrent(
-          actionCache[uint32(key.fileId)],
+          cachedActionFor(actionCache, key.fileId),
           snapshot,
           OrganizeOptions(useStdPrefix: key.useStdPrefix),
         ):
@@ -684,7 +712,7 @@ proc codeActions(
     params: JsonNode,
     workspace: Workspace,
     stdlib: var StdlibMap,
-    actionCache: var Table[uint32, CachedAction],
+    actionCache: var seq[CachedAction],
     pending: var seq[SemanticKey],
     queued: var seq[SemanticRequest],
     options: OrganizeOptions,
@@ -704,11 +732,11 @@ proc codeActions(
   let snapshot = workspace.snapshotForDocument(uriText, path)
   if not snapshot.valid:
     return newJArray()
-  let cacheKey = uint32(snapshot.fileId)
+  let cacheKey = snapshot.fileId
   var edits: seq[ImportEdit] = @[]
   var cacheHit = false
-  if actionCache.hasKey(cacheKey):
-    let cached = actionCache[cacheKey]
+  if hasCachedAction(actionCache, cacheKey):
+    let cached = cachedActionFor(actionCache, cacheKey)
     if actionIsCurrent(cached, snapshot, options):
       edits = cached.edits
       cacheHit = true
@@ -721,9 +749,9 @@ proc codeActions(
       if enqueueSemantic(snapshot, options, pending, queued):
         discard waitForSemantic(key, workspace, actionCache, pending, queued)
         drainSemantic(workspace, actionCache, pending, queued)
-        if actionCache.hasKey(cacheKey) and
-            actionIsCurrent(actionCache[cacheKey], snapshot, options):
-          edits = actionCache[cacheKey].edits
+        if hasCachedAction(actionCache, cacheKey) and
+            actionIsCurrent(cachedActionFor(actionCache, cacheKey), snapshot, options):
+          edits = cachedActionFor(actionCache, cacheKey).edits
       else:
         if snapshot.index != nil:
           edits = organizeSourceWithIndex(
@@ -731,12 +759,16 @@ proc codeActions(
           )
         else:
           edits = organizeSource(snapshot.path, snapshot.text, options)
-        actionCache[cacheKey] = CachedAction(
-          contentGeneration: snapshot.contentGeneration,
-          dependencyGeneration: snapshot.dependencyGeneration,
-          configGeneration: snapshot.configGeneration,
-          useStdPrefix: options.useStdPrefix,
-          edits: edits,
+        storeCachedAction(
+          actionCache,
+          snapshot.fileId,
+          CachedAction(
+            contentGeneration: snapshot.contentGeneration,
+            dependencyGeneration: snapshot.dependencyGeneration,
+            configGeneration: snapshot.configGeneration,
+            useStdPrefix: options.useStdPrefix,
+            edits: edits,
+          ),
         )
   if edits.len == 0:
     return newJArray()
@@ -813,7 +845,7 @@ proc handleBootstrapEvent(
 proc runLsp*() =
   let workspace = initWorkspace()
   var stdlib: StdlibMap
-  var actionCache = initTable[uint32, CachedAction]()
+  var actionCache: seq[CachedAction] = @[]
   var pending: seq[SemanticKey] = @[]
   var queued: seq[SemanticRequest] = @[]
   var pendingDefinitions: seq[PendingDefinition] = @[]
