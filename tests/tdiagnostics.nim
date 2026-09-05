@@ -84,6 +84,24 @@ suite "native diagnostics":
     check diagnostics.len == 1
     check diagnostics[0].module == "std/strutils"
 
+  test "reports an unknown unqualified identifier natively":
+    let diagnostics = nativeDiagnostics(
+      indexSource("proc main() =\n  discard definitelyMissing\n"), loadStdlibMap("")
+    )
+    check diagnostics.len == 1
+    check diagnostics[0].kind == nativeUndeclaredIdentifier
+    check diagnostics[0].name == "definitelyMissing"
+
+  test "does not report local bindings or lexical text as undeclared":
+    let source = """proc main() =
+  block:
+    let localValue = 1
+    discard localValue
+  discard "definitelyMissing"
+"""
+    let diagnostics = nativeDiagnostics(indexSource(source), loadStdlibMap(""))
+    check diagnostics.len == 0
+
   test "reports a missing project import from an unqualified use":
     let project = buildSurfaceIndex(
       @[projectSurfaceInput("provider", indexSource("proc provided*() = discard\n"))],

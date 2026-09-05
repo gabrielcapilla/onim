@@ -311,6 +311,8 @@ proc nativeDiagnosticMessage(diagnostic: NativeDiagnostic): string =
     "unexpected closing delimiter"
   of nativeUnclosedDelimiter:
     "unclosed delimiter"
+  of nativeUndeclaredIdentifier:
+    "undeclared identifier: " & diagnostic.name
   of nativeMissingStdlibImport:
     "missing import: " & diagnostic.module
   of nativeMissingProjectImport:

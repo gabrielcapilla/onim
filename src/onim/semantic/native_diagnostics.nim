@@ -1,5 +1,6 @@
 import std/[sets, strutils]
 
+import ../index/bindings
 import ../index/occurrences
 import ../index/source_index
 import ../index/symbols
@@ -15,13 +16,19 @@ type
     nativeUnclosedString
     nativeUnexpectedDelimiter
     nativeUnclosedDelimiter
+    nativeUndeclaredIdentifier
     nativeMissingStdlibImport
     nativeMissingProjectImport
+
+  NativeDiagnosticMode = enum
+    nativeImportsOnly
+    nativeImportsAndNames
 
   NativeDiagnostic* = object
     kind*: NativeDiagnosticKind
     startOffset*: int
     endOffset*: int
+    name*: string
     module*: string
 
 proc nativeSyntaxDiagnostics*(index: SourceIndex): seq[NativeDiagnostic]
@@ -126,12 +133,28 @@ proc addMissingDiagnostic(
     module: module,
   )
 
+proc addUndeclaredDiagnostic(
+    diagnostics: var seq[NativeDiagnostic], seen: var HashSet[string], token: Token
+): bool =
+  let key = identifierKey(token.text)
+  if key.len == 0 or key in seen:
+    return false
+  seen.incl key
+  diagnostics.add NativeDiagnostic(
+    kind: nativeUndeclaredIdentifier,
+    startOffset: token.startOffset,
+    endOffset: token.endOffset,
+    name: token.text,
+  )
+  true
+
 proc nativeMissingDiagnostics(
     index: SourceIndex,
     stdlib: StdlibMap,
     project: SurfaceIndex,
     catalog: ModuleCatalog,
     owner: string,
+    mode: NativeDiagnosticMode,
 ): seq[NativeDiagnostic] =
   if not nativeNamesSafe(index, stdlib, project, catalog, owner):
     return
@@ -143,6 +166,9 @@ proc nativeMissingDiagnostics(
         occurrence.roles.contains(occurrenceQualifier):
       continue
     let token = index.parsed.tokens[tokenIndex]
+    let binding = index.resolveBinding(occurrence.token)
+    if binding.state != bindingUnknown:
+      continue
     if providesUnqualified(index.parsed, stdlib, project, catalog, owner, token.text):
       continue
     let resolved = stdlib.resolveUniqueCandidate(token.text, "", -1)
@@ -172,6 +198,9 @@ proc nativeMissingDiagnostics(
         )
     of candidateResolutionAmbiguous:
       discard
+    if mode == nativeImportsAndNames and resolved.state == candidateResolutionMissing and
+        projectResolved.kind == surfaceUnknown:
+      discard addUndeclaredDiagnostic(result, seen, token)
 
   for qualified in index.occurrences.qualified:
     let qualifierIndex = int(qualified.qualifierToken)
@@ -215,7 +244,7 @@ proc nativeMissingDiagnostics(
 proc nativeMissingStdlibDiagnostics*(
     index: SourceIndex, stdlib: StdlibMap
 ): seq[NativeDiagnostic] =
-  nativeMissingDiagnostics(index, stdlib, nil, nil, "")
+  nativeMissingDiagnostics(index, stdlib, nil, nil, "", nativeImportsOnly)
 
 proc nativeDiagnostics*(
     index: SourceIndex,
@@ -225,7 +254,9 @@ proc nativeDiagnostics*(
     catalog: ModuleCatalog = nil,
 ): seq[NativeDiagnostic] =
   result = nativeSyntaxDiagnostics(index)
-  result.add nativeMissingDiagnostics(index, stdlib, project, catalog, owner)
+  result.add nativeMissingDiagnostics(
+    index, stdlib, project, catalog, owner, nativeImportsAndNames
+  )
 
 proc nativeSyntaxDiagnostics*(index: SourceIndex): seq[NativeDiagnostic] =
   if index == nil:
