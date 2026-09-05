@@ -3,7 +3,10 @@ import std/[os, strutils, unittest]
 import onim/features/organize
 import onim/index/occurrences
 import onim/index/source_index
+import onim/index/surfaces
 import onim/semantic/compiler_api
+import onim/session/ids
+import onim/session/module_catalog
 import onim/stdlib/map
 
 const cases = [
@@ -184,6 +187,153 @@ suite "organize imports":
     let attempt =
       tryOrganizeSourceWithIndex("/no/such/file.nim", source, index, loadStdlibMap(""))
     check attempt.handled
+    check attempt.edits.len == 0
+
+  test "uses a complete project surface for native additions":
+    let source = "proc main() =\n  discard provided()\n"
+    let index = indexSource(source)
+    let project = buildSurfaceIndex(
+      @[projectSurfaceInput("provider", indexSource("proc provided*() = discard\n"))],
+      universeComplete = true,
+    )
+    let attempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim",
+      source,
+      index,
+      loadStdlibMap(""),
+      defaultOrganizeOptions(),
+      project,
+      nil,
+      "",
+    )
+    check attempt.handled
+    check applyEdits(source, attempt.edits) == "import provider\n\n" & source
+
+  test "uses the owner-relative project module for qualified additions":
+    let source = "provider.provided()\n"
+    let index = indexSource(source)
+    let project = buildSurfaceIndex(
+      @[
+        projectSurfaceInput("pkg/provider", indexSource("proc provided*() = discard\n"))
+      ],
+      universeComplete = true,
+    )
+    let attempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim",
+      source,
+      index,
+      loadStdlibMap(""),
+      defaultOrganizeOptions(),
+      project,
+      nil,
+      "pkg/consumer",
+    )
+    check attempt.handled
+    check applyEdits(source, attempt.edits) == "import pkg/provider\n\n" & source
+
+  test "uses a complete module catalog for project additions":
+    let root = getTempDir() / ("onim-organize-project-" & $getCurrentProcessId())
+    createDir(root)
+    let providerPath = root / "provider.nim"
+    let consumerPath = root / "consumer.nim"
+    writeFile(providerPath, "proc provided*() = discard\n")
+    defer:
+      if fileExists(providerPath):
+        removeFile(providerPath)
+      if fileExists(consumerPath):
+        removeFile(consumerPath)
+      if dirExists(root):
+        removeDir(root)
+    let project = buildSurfaceIndex(
+      @[projectSurfaceInput("provider", indexSource(readFile(providerPath)))],
+      universeComplete = true,
+    )
+    let catalog = buildModuleCatalog(
+      root,
+      @[
+        ModuleFile(id: ids.FileId(1), path: providerPath),
+        ModuleFile(id: ids.FileId(2), path: consumerPath),
+      ],
+    )
+    check catalog.complete
+    check catalog.resolveModuleName("consumer", "provider").kind == moduleResolved
+    check project.resolveSurfaceReference(catalog, "provided", "provider", "consumer").kind ==
+      surfaceResolved
+    let source = "provider.provided()\n"
+    let attempt = tryOrganizeSourceWithIndex(
+      consumerPath,
+      source,
+      indexSource(source),
+      loadStdlibMap(""),
+      defaultOrganizeOptions(),
+      project,
+      catalog,
+      "consumer",
+    )
+    check attempt.handled
+    check applyEdits(source, attempt.edits) == "import provider\n\n" & source
+
+  test "removes an unused complete project import natively":
+    let source = "import provider\n\nproc main() =\n  discard\n"
+    let index = indexSource(source)
+    let project = buildSurfaceIndex(
+      @[projectSurfaceInput("provider", indexSource("proc provided*() = discard\n"))],
+      universeComplete = true,
+    )
+    let attempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim",
+      source,
+      index,
+      loadStdlibMap(""),
+      defaultOrganizeOptions(),
+      project,
+      nil,
+      "",
+    )
+    check attempt.handled
+    check applyEdits(source, attempt.edits) == "proc main() =\n  discard\n"
+
+  test "falls back for ambiguous project providers":
+    let source = "discard provided()\n"
+    let index = indexSource(source)
+    let project = buildSurfaceIndex(
+      @[
+        projectSurfaceInput("first", indexSource("proc provided*() = discard\n")),
+        projectSurfaceInput("second", indexSource("proc provided*() = discard\n")),
+      ],
+      universeComplete = true,
+    )
+    let attempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim",
+      source,
+      index,
+      loadStdlibMap(""),
+      defaultOrganizeOptions(),
+      project,
+      nil,
+      "",
+    )
+    check not attempt.handled
+    check attempt.edits.len == 0
+
+  test "falls back for project and stdlib name collisions":
+    let source = "discard split(\"a b\")\n"
+    let index = indexSource(source)
+    let project = buildSurfaceIndex(
+      @[projectSurfaceInput("provider", indexSource("proc split*() = discard\n"))],
+      universeComplete = true,
+    )
+    let attempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim",
+      source,
+      index,
+      loadStdlibMap(""),
+      defaultOrganizeOptions(),
+      project,
+      nil,
+      "",
+    )
+    check not attempt.handled
     check attempt.edits.len == 0
 
   test "keeps diagnostic locations when paths contain parentheses":

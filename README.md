@@ -2,7 +2,7 @@
 
 `onim` is a standalone Nim 2.0+ language server and indexed organize-imports provider. It is an independent implementation; it does not fork `nimlangserver` or `nimsuggest`.
 
-When Zed requests `source.organizeImports`, onim first uses the in-memory source index and generated standard-library map to resolve the safe stdlib-only case without starting a compiler process. Ambiguous or unsupported cases use the isolated Nim compiler/nimsuggest boundary for authoritative diagnostics. Onim returns a minimal `WorkspaceEdit`, removes unused imports and names, then sorts and groups remaining `std/*` imports. The LSP never writes the document. The CLI applies the same edit to a file.
+When Zed requests `source.organizeImports`, onim first uses the in-memory source index, generated standard-library map, and complete project-module surface to resolve safe cases without starting a compiler process. Ambiguous or unsupported cases use the isolated Nim compiler/nimsuggest boundary for authoritative diagnostics. Onim returns a minimal `WorkspaceEdit`, removes unused imports and names, then sorts and groups remaining `std/*` imports. The LSP never writes the document. The CLI applies the same edit to a file.
 
 ## Build and run
 
@@ -62,8 +62,10 @@ so a proven same-length identifier edit does not clone the complete token
 array. These structures are reconstructed from the already-cached tokens,
 imports, and symbols, so the cache format stays compatible while a warm LSP
 request can inspect the preflight data without reparsing. Complete conservative
-stdlib-only files can organize imports from the native index without invoking
-the compiler; uncertain semantic cases remain compiler-authoritative.
+files can organize stdlib and project imports from the native index without
+invoking the compiler; uncertain semantic cases remain compiler-authoritative.
+Project action keys include a surface generation, so provider-module edits
+cannot leave a stale organize result cached for a consumer.
 The scope index adds one module interval plus conservative routine intervals,
 parameter declarations, direct local declarations, and source order without
 duplicating identifier strings. Nested blocks, complex headers, and binding
@@ -73,7 +75,7 @@ semantics remain explicitly uncertain.
 
 The stdio server also keeps semantic organization in a persistent helper process. The helper owns the embedded compiler graph on one thread, while the LSP process remains free to receive edits. `didOpen` and `didChange` prefetch the current snapshot; at most one compiler request is in flight and intermediate edits are coalesced to the newest snapshot for each file. A code action returns from the generation cache when prefetch has completed, without placing compiler work on the LSP request path. The standalone CLI remains synchronous because its process lifetime ends after one file operation.
 
-The index is an orchestration layer, not yet a complete semantic replacement for Nim. The native indexed organizer handles the proven stdlib-only path; the embedded compiler/nimsuggest boundary remains a fallback for `undeclared identifier`, complex imports, and other unsupported semantic cases. Native syntax diagnostics are published independently of that fallback. Field-layout analysis and a future `onim --compact` opt-in remain separate from `source.organizeImports`.
+The index is an orchestration layer, not yet a complete semantic replacement for Nim. The native indexed organizer handles complete, certain stdlib and project-module surfaces; the embedded compiler/nimsuggest boundary remains a fallback for `undeclared identifier`, incomplete project graphs, complex imports, and other unsupported semantic cases. Native syntax and missing-import diagnostics are published independently of that fallback. Field-layout analysis and a future `onim --compact` opt-in remain separate from `source.organizeImports`.
 
 The native symbol and module-surface indexes are deliberately narrower than a
 compiler symbol table:

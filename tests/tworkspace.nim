@@ -263,17 +263,26 @@ suite "workspace index":
     check first.universeIsComplete
     check first.lookupInModule("provider", "provided").kind == surfaceResolved
     check workspace.projectSurface() == first
+    let initialSurfaceGeneration = workspace.snapshotForFile(
+      workspace.fileIdForPath(providerPath)
+    ).surfaceGeneration.value
 
     workspace.configurationChanged()
     let configured = workspace.projectSurface()
     check configured != first
     check configured.lookupInModule("provider", "provided").kind == surfaceResolved
+    let configuredSurfaceGeneration = workspace.snapshotForFile(
+      workspace.fileIdForPath(providerPath)
+    ).surfaceGeneration.value
+    check configuredSurfaceGeneration != initialSurfaceGeneration
 
     writeFile(providerPath, "proc changed*() = discard\n")
     workspace.fileChanged(providerPath)
     let second = workspace.projectSurface()
     check second.lookupInModule("provider", "provided").kind == surfaceUnresolved
     check second.lookupInModule("provider", "changed").kind == surfaceResolved
+    check workspace.snapshotForFile(workspace.fileIdForPath(providerPath)).surfaceGeneration.value !=
+      configuredSurfaceGeneration
 
   test "resolves conventional and Nimble import roots":
     let root = getTempDir() / ("onim-import-roots-" & $getCurrentProcessId())

@@ -37,6 +37,7 @@ type
     contentGeneration*: ContentGeneration
     dependencyGeneration*: DependencyGeneration
     configGeneration*: ConfigGeneration
+    surfaceGeneration*: SurfaceGeneration
     index*: SourceIndex
 
   WorkspaceIndexView* = object
@@ -73,6 +74,7 @@ type
     workspaceGeneration: uint64
     nextFileId: uint32
     nextContentGeneration: uint64
+    surfaceGeneration: SurfaceGeneration
     files: seq[FileRecord]
     paths: Table[string, FileId]
     manifestByPath: Table[string, ManifestEntry]
@@ -84,9 +86,11 @@ type
 proc unknownStamp(): FileStamp =
   FileStamp(size: -1, modifiedSeconds: -1, modifiedNanoseconds: -1)
 
+proc invalidateProjectSurface(workspace: Workspace)
+
 proc adoptManifest(workspace: Workspace, manifest: ProjectManifest) =
   workspace.manifest = manifest
-  workspace.projectSurfaceCache = nil
+  workspace.invalidateProjectSurface()
   workspace.manifestByPath.clear()
   for entry in manifest.entries:
     workspace.manifestByPath[entry.path] = entry
@@ -144,6 +148,8 @@ proc indexDiskSource(workspace: Workspace, path, source: string): SourceIndex =
 
 proc invalidateProjectSurface(workspace: Workspace) =
   workspace.projectSurfaceCache = nil
+  workspace.surfaceGeneration =
+    SurfaceGeneration(uint64(workspace.surfaceGeneration) + 1'u64)
 
 proc persistManifest(workspace: Workspace) =
   if workspace.bootstrapState != workspaceBootstrapComplete:
@@ -325,6 +331,7 @@ proc cloneWorkspaceState(workspace: Workspace): Workspace =
   result.workspaceGeneration = workspace.workspaceGeneration
   result.nextFileId = workspace.nextFileId
   result.nextContentGeneration = workspace.nextContentGeneration
+  result.surfaceGeneration = workspace.surfaceGeneration
   result.files = newSeqOfCap[FileRecord](workspace.files.len)
   for file in workspace.files:
     result.files.add cloneFileRecord(file)
@@ -461,6 +468,7 @@ proc adoptWorkspaceState(destination, source: Workspace) =
   destination.workspaceGeneration = source.workspaceGeneration
   destination.nextFileId = source.nextFileId
   destination.nextContentGeneration = source.nextContentGeneration
+  destination.surfaceGeneration = source.surfaceGeneration
   destination.files = source.files
   destination.paths = source.paths
   destination.manifestByPath = source.manifestByPath
@@ -518,7 +526,7 @@ proc applyBootstrap*(workspace: Workspace, value: BootstrapResult): bool =
       candidate.files[index].contentGeneration = candidate.nextContent()
 
   candidate.moduleCatalogCache = nil
-  candidate.projectSurfaceCache = nil
+  candidate.invalidateProjectSurface()
   candidate.manifest = bootstrapManifest(value)
   candidate.manifestByPath.clear()
   for entry in candidate.manifest.entries:
@@ -752,6 +760,7 @@ proc installText(
   if not changed:
     if stateChanged:
       workspace.moduleCatalogCache = nil
+      workspace.invalidateProjectSurface()
     return true
 
   if stateChanged:
@@ -1221,6 +1230,7 @@ proc snapshotForDocument*(workspace: Workspace, uri, path: string): WorkspaceSna
   result.contentGeneration = workspace.files[index].contentGeneration
   result.dependencyGeneration = workspace.files[index].dependencyGeneration
   result.configGeneration = workspace.configGeneration
+  result.surfaceGeneration = workspace.surfaceGeneration
   result.index = workspace.files[index].index
 
 proc snapshotForFile*(workspace: Workspace, id: FileId): WorkspaceSnapshot =
@@ -1238,6 +1248,7 @@ proc snapshotForFile*(workspace: Workspace, id: FileId): WorkspaceSnapshot =
   result.contentGeneration = workspace.files[index].contentGeneration
   result.dependencyGeneration = workspace.files[index].dependencyGeneration
   result.configGeneration = workspace.configGeneration
+  result.surfaceGeneration = workspace.surfaceGeneration
   result.index = workspace.files[index].index
 
 proc indexViewForFile*(workspace: Workspace, id: FileId): WorkspaceIndexView =

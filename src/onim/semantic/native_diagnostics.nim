@@ -130,34 +130,6 @@ proc addMissingDiagnostic(
     module: module,
   )
 
-proc projectResolution(
-    project: SurfaceIndex, catalog: ModuleCatalog, name, qualifier, owner: string
-): BindingResolution =
-  if project == nil:
-    return
-  if qualifier.len == 0:
-    return project.lookup(name)
-  if catalog != nil:
-    let module = catalog.resolveModuleName(owner, qualifier)
-    case module.kind
-    of moduleResolved:
-      return project.lookupInModule(module.module, name)
-    of moduleAmbiguous:
-      result.kind = surfaceAmbiguous
-    of moduleUnknown:
-      result.kind = surfaceUnknown
-    of moduleMissing:
-      discard
-  else:
-    let module = project.moduleForReference(qualifier, owner)
-    if module.len > 0:
-      return project.lookupInModule(module, name)
-
-proc projectModuleFor(project: SurfaceIndex, resolution: BindingResolution): string =
-  if resolution.kind != surfaceResolved or resolution.candidates.len != 1:
-    return
-  project.moduleAt(resolution.candidates[0].surface).module
-
 proc nativeMissingDiagnostics(
     index: SourceIndex,
     stdlib: StdlibMap,
@@ -178,7 +150,8 @@ proc nativeMissingDiagnostics(
     if providesUnqualified(index.parsed, stdlib, project, catalog, owner, token.text):
       continue
     let resolved = stdlib.resolveUniqueCandidate(token.text, "", -1)
-    let projectResolved = projectResolution(project, catalog, token.text, "", owner)
+    let projectResolved =
+      project.resolveSurfaceReference(catalog, token.text, "", owner)
     if project != nil and projectResolved.candidates.len > 0 and
         projectResolved.kind in {surfaceUnknown, surfaceAmbiguous}:
       continue
@@ -189,14 +162,14 @@ proc nativeMissingDiagnostics(
       let module = canonicalModule(resolved.candidate.module)
       if not module.startsWith("std/") or module notin stdlib.modules:
         continue
-      let projectModule = projectModuleFor(project, projectResolved)
+      let projectModule = project.moduleForResolution(projectResolved)
       if projectModule.len > 0 and not sameModule(projectModule, module):
         continue
       addMissingDiagnostic(
         result, seen, token, token.text, module, nativeMissingStdlibImport
       )
     of candidateResolutionMissing:
-      let module = projectModuleFor(project, projectResolved)
+      let module = project.moduleForResolution(projectResolved)
       if module.len > 0:
         addMissingDiagnostic(
           result, seen, token, token.text, module, nativeMissingProjectImport
@@ -218,7 +191,7 @@ proc nativeMissingDiagnostics(
       continue
     let resolved = stdlib.resolveUniqueCandidate(member.text, qualifier.text, -1)
     let projectResolved =
-      projectResolution(project, catalog, member.text, qualifier.text, owner)
+      project.resolveSurfaceReference(catalog, member.text, qualifier.text, owner)
     if project != nil and projectResolved.kind in {surfaceUnknown, surfaceAmbiguous}:
       continue
     case resolved.state
@@ -228,14 +201,14 @@ proc nativeMissingDiagnostics(
       let module = canonicalModule(resolved.candidate.module)
       if not module.startsWith("std/") or module notin stdlib.modules:
         continue
-      let projectModule = projectModuleFor(project, projectResolved)
+      let projectModule = project.moduleForResolution(projectResolved)
       if projectModule.len > 0 and not sameModule(projectModule, module):
         continue
       addMissingDiagnostic(
         result, seen, qualifier, member.text, module, nativeMissingStdlibImport
       )
     of candidateResolutionMissing:
-      let module = projectModuleFor(project, projectResolved)
+      let module = project.moduleForResolution(projectResolved)
       if module.len > 0:
         addMissingDiagnostic(
           result, seen, qualifier, member.text, module, nativeMissingProjectImport

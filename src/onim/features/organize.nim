@@ -5,7 +5,9 @@ import ../index/scopes
 import ../index/cache
 import ../index/source_index
 import ../index/symbols
+import ../index/surfaces
 import ../semantic/compiler_api
+import ../session/module_catalog
 import ../stdlib/map
 import ../syntax/imports
 import ../syntax/lexer
@@ -40,6 +42,16 @@ type
   NativeRemovalState = enum
     nativeRemovalUnsupported
     nativeRemovalReady
+
+  NativeCandidateState = enum
+    nativeCandidateNone
+    nativeCandidateResolved
+    nativeCandidateAmbiguous
+    nativeCandidateUnknown
+
+  NativeCandidateSource = enum
+    nativeCandidateStdlibSource
+    nativeCandidateProjectSource
 
   IncludedImportCacheEntry = object
     stamp: FileStamp
@@ -1155,8 +1167,73 @@ proc nativeUnqualifiedUse(stdlib: StdlibMap, name, module: string): NativeModule
     else:
       nativeModuleUseNone
 
+proc projectModuleResolution(
+    project: SurfaceIndex, catalog: ModuleCatalog, owner, reference: string
+): ModuleResolution =
+  if project == nil:
+    result.kind = moduleUnknown
+    return
+  if catalog != nil:
+    return catalog.resolveModuleName(owner, reference)
+  let module = project.moduleForReference(reference, owner)
+  if module.len == 0:
+    result.kind = if project.universeIsComplete: moduleMissing else: moduleUnknown
+    return
+  result.kind = moduleResolved
+  result.module = module
+
+proc nativeProjectModuleUse(
+    project: SurfaceIndex, catalog: ModuleCatalog, owner, name, module: string
+): NativeModuleUse =
+  let resolved = projectModuleResolution(project, catalog, owner, module)
+  case resolved.kind
+  of moduleResolved:
+    let binding = project.lookupInModule(resolved.module, name)
+    case binding.kind
+    of surfaceResolved: nativeModuleUseFound
+    of surfaceUnresolved: nativeModuleUseNone
+    of surfaceAmbiguous, surfaceUnknown: nativeModuleUseUnknown
+  of moduleMissing:
+    nativeModuleUseNone
+  of moduleAmbiguous, moduleUnknown:
+    nativeModuleUseUnknown
+
+proc projectCandidate(
+    project: SurfaceIndex, catalog: ModuleCatalog, owner, name, qualifier: string
+): tuple[state: NativeCandidateState, candidate: SymbolCandidate] =
+  if project == nil:
+    return
+  let resolution = project.resolveSurfaceReference(catalog, name, qualifier, owner)
+  case resolution.kind
+  of surfaceResolved:
+    let module = project.moduleForResolution(resolution)
+    if module.len == 0:
+      result.state = nativeCandidateUnknown
+      return
+    result.state = nativeCandidateResolved
+    result.candidate = SymbolCandidate(
+      module: module,
+      name: name,
+      kind: "",
+      arity: -1,
+      signature: "",
+      priority: candidateDefault,
+    )
+  of surfaceUnresolved:
+    result.state = nativeCandidateNone
+  of surfaceAmbiguous:
+    result.state = nativeCandidateAmbiguous
+  of surfaceUnknown:
+    result.state = nativeCandidateUnknown
+
 proc nativeModuleUsed(
-    info: SourceImports, index: SourceIndex, item: ImportInfo, stdlib: StdlibMap
+    info: SourceImports,
+    index: SourceIndex,
+    item: ImportInfo,
+    stdlib: StdlibMap,
+    project: SurfaceIndex,
+    catalog: ModuleCatalog,
+    owner: string,
 ): NativeModuleUse =
   let module = canonicalModule(item.module)
   let qualifier =
@@ -1202,13 +1279,22 @@ proc nativeModuleUsed(
       if binding == nativeUnknown:
         return nativeModuleUseUnknown
       if binding == nativeNoBinding:
-        let use = nativeUnqualifiedUse(stdlib, token.text, module)
+        let use =
+          if module.startsWith("std/"):
+            nativeUnqualifiedUse(stdlib, token.text, module)
+          else:
+            nativeProjectModuleUse(project, catalog, owner, token.text, module)
         if use != nativeModuleUseNone:
           return use
   nativeModuleUseNone
 
 proc nativeImportRemovalPlan(
-    info: SourceImports, index: SourceIndex, stdlib: StdlibMap
+    info: SourceImports,
+    index: SourceIndex,
+    stdlib: StdlibMap,
+    project: SurfaceIndex,
+    catalog: ModuleCatalog,
+    owner: string,
 ): tuple[state: NativeRemovalState, plan: ImportRemovalPlan] =
   result.plan = initImportRemovalPlan(info)
   if not info.nativeIndexSafe(index):
@@ -1219,9 +1305,16 @@ proc nativeImportRemovalPlan(
       continue
     case item.form
     of importModule:
-      if not module.startsWith("std/") or module notin stdlib.modules:
+      if module.startsWith("std/"):
+        if module notin stdlib.modules:
+          return
+      elif project == nil or not project.universeIsComplete:
         return
-      case nativeModuleUsed(info, index, item, stdlib)
+      else:
+        let resolution = projectModuleResolution(project, catalog, owner, item.module)
+        if resolution.kind != moduleResolved:
+          return
+      case nativeModuleUsed(info, index, item, stdlib, project, catalog, owner)
       of nativeModuleUseFound:
         discard
       of nativeModuleUseNone:
@@ -1251,7 +1344,13 @@ proc nativeProvidesName(info: SourceImports, name: string): bool =
         return true
 
 proc nativeImportAdditions(
-    source: string, info: SourceImports, index: SourceIndex, stdlib: StdlibMap
+    source: string,
+    info: SourceImports,
+    index: SourceIndex,
+    stdlib: StdlibMap,
+    project: SurfaceIndex,
+    catalog: ModuleCatalog,
+    owner: string,
 ): tuple[safe: bool, candidates: seq[PlannedImport]] =
   result.safe = true
   for occurrence in index.occurrences.identifiers:
@@ -1282,8 +1381,6 @@ proc nativeImportAdditions(
     let resolved = stdlib.resolveUniqueCandidate(
       name, qualifier, callArity(info, source, tokenIndex)
     )
-    if resolved.state == candidateResolutionMissing:
-      continue
     if qualifier.len == 0:
       let binding = nativeBinding(info, index, token.text, tokenIndex)
       if binding == nativeBound:
@@ -1291,17 +1388,50 @@ proc nativeImportAdditions(
       if binding == nativeUnknown:
         result.safe = false
         return
-    if resolved.state == candidateResolutionAmbiguous:
+    let projectResult = projectCandidate(project, catalog, owner, name, qualifier)
+    var candidate: SymbolCandidate
+    var candidateSource = nativeCandidateStdlibSource
+    case projectResult.state
+    of nativeCandidateResolved:
+      if resolved.state != candidateResolutionMissing:
+        result.safe = false
+        return
+      candidate = projectResult.candidate
+      candidateSource = nativeCandidateProjectSource
+    of nativeCandidateNone:
+      case resolved.state
+      of candidateResolutionMissing:
+        continue
+      of candidateResolutionAmbiguous:
+        result.safe = false
+        return
+      of candidateResolutionResolved:
+        candidate = resolved.candidate
+    of nativeCandidateAmbiguous, nativeCandidateUnknown:
       result.safe = false
       return
-    let candidate = resolved.candidate
-    if stdlib.implicitModule(candidate.module):
-      continue
-    if candidate.module.len == 0 or
-        not canonicalModule(candidate.module).startsWith("std/") or
-        canonicalModule(candidate.module) notin stdlib.modules:
-      result.safe = false
-      return
+
+    case candidateSource
+    of nativeCandidateStdlibSource:
+      if stdlib.implicitModule(candidate.module):
+        continue
+      if candidate.module.len == 0 or
+          not canonicalModule(candidate.module).startsWith("std/") or
+          canonicalModule(candidate.module) notin stdlib.modules:
+        result.safe = false
+        return
+    of nativeCandidateProjectSource:
+      if project == nil or not project.universeIsComplete:
+        result.safe = false
+        return
+      let module = projectModuleResolution(project, catalog, owner, candidate.module)
+      if module.kind != moduleResolved or not sameModule(
+        module.module, candidate.module
+      ):
+        result.safe = false
+        return
+      if owner.len > 0 and sameModule(candidate.module, owner):
+        continue
     if nativeProvidesName(info, name) or
         (qualifier.len > 0 and info.providesQualifier(qualifier)) or
         findExistingModule(info, candidate.module).plain >= 0:
@@ -1313,6 +1443,9 @@ proc tryOrganizeSourceWithIndex*(
     index: SourceIndex,
     stdlib: StdlibMap,
     options = defaultOrganizeOptions(),
+    project: SurfaceIndex = nil,
+    catalog: ModuleCatalog = nil,
+    owner: string = "",
 ): tuple[handled: bool, edits: seq[ImportEdit]] =
   if filePath.toLowerAscii.endsWith(".nimble") or filePath.toLowerAscii.endsWith(".cfg") or
       index == nil or index.contentHash != contentFingerprint(source) or
@@ -1323,13 +1456,15 @@ proc tryOrganizeSourceWithIndex*(
       not stdlib.surfaceIsComplete:
     return
   let info = index.parsed
-  let nativeRemovals = nativeImportRemovalPlan(info, index, stdlib)
+  let nativeRemovals =
+    nativeImportRemovalPlan(info, index, stdlib, project, catalog, owner)
   if nativeRemovals.state != nativeRemovalReady:
     return
   result.handled = true
   let activeInfo = activeImportInfo(info, nativeRemovals.plan)
   let newline = if source.contains("\r\n"): "\r\n" else: "\n"
-  let additions = nativeImportAdditions(source, activeInfo, index, stdlib)
+  let additions =
+    nativeImportAdditions(source, activeInfo, index, stdlib, project, catalog, owner)
   if not additions.safe:
     result.handled = false
     return

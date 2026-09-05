@@ -1,4 +1,4 @@
-import std/[algorithm, os, sets, streams, strutils, times]
+import std/[algorithm, os, sets, streams, times]
 
 import ../syntax/imports
 import ../syntax/lexer

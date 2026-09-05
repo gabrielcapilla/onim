@@ -432,6 +432,25 @@ suite "stdio LSP":
       process.inputStream,
       %*{
         "jsonrpc": "2.0",
+        "id": 4,
+        "method": "textDocument/codeAction",
+        "params": {
+          "textDocument": {"uri": consumerUri},
+          "context": {"only": ["source.organizeImports"]},
+        },
+      },
+    )
+    let projectAction = readResponse(process.outputStream, 4)
+    check projectAction != nil
+    check projectAction["result"].len == 1
+    check projectAction["result"][0]["edit"]["changes"][consumerUri][0]["newText"].getStr.contains(
+      "import provider"
+    )
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
         "method": "textDocument/didChange",
         "params": {
           "textDocument": {"uri": consumerUri, "version": 2},

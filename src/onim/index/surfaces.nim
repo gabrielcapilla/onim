@@ -343,6 +343,37 @@ proc lookupInModule*(index: SurfaceIndex, module, name: string): BindingResoluti
       ids.add BindingId(uint32(ordinal + 1))
   index.resolution(ids)
 
+proc resolveSurfaceReference*(
+    index: SurfaceIndex, catalog: ModuleCatalog, name, qualifier, owner: string
+): BindingResolution =
+  if index == nil:
+    result.kind = surfaceUnknown
+    return
+  if qualifier.len == 0:
+    return index.lookup(name)
+
+  if catalog != nil:
+    let module = catalog.resolveModuleName(owner, qualifier)
+    case module.kind
+    of moduleResolved:
+      return index.lookupInModule(module.module, name)
+    of moduleAmbiguous, moduleUnknown:
+      result.kind = surfaceUnknown
+    of moduleMissing:
+      result.kind = surfaceUnresolved
+    return
+
+  let module = index.moduleForReference(qualifier, owner)
+  if module.len == 0:
+    result.kind = if index.universeIsComplete: surfaceUnresolved else: surfaceUnknown
+    return
+  index.lookupInModule(module, name)
+
+proc moduleForResolution*(index: SurfaceIndex, resolution: BindingResolution): string =
+  if index == nil or resolution.kind != surfaceResolved or resolution.candidates.len != 1:
+    return
+  index.moduleAt(resolution.candidates[0].surface).module
+
 proc addSourceUncertainty(
     target: var set[SurfaceUncertainty], reason: ScopeUncertainty
 ) =

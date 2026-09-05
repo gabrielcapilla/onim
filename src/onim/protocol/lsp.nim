@@ -1,4 +1,4 @@
-import std/[json, streams, strutils, tables, uri]
+import std/[json, streams, strutils, uri]
 
 import ../features/definition
 import ../features/organize
@@ -6,7 +6,9 @@ import ../semantic/native_diagnostics
 import ../semantic/worker
 import ../session/bootstrap_worker
 import ../session/ids
+import ../session/module_catalog
 import ../session/workspace
+import ../index/surfaces
 import ../index/symbols
 import ../stdlib/map
 import ../syntax/lexer
@@ -16,6 +18,7 @@ type
     contentGeneration: ContentGeneration
     dependencyGeneration: DependencyGeneration
     configGeneration: ConfigGeneration
+    surfaceGeneration: SurfaceGeneration
     useStdPrefix: bool
     edits: seq[ImportEdit]
 
@@ -24,6 +27,7 @@ type
     contentGeneration: ContentGeneration
     dependencyGeneration: DependencyGeneration
     configGeneration: ConfigGeneration
+    surfaceGeneration: SurfaceGeneration
     useStdPrefix: bool
 
   LspEventKind = enum
@@ -526,6 +530,7 @@ proc semanticKey(snapshot: WorkspaceSnapshot, options: OrganizeOptions): Semanti
     contentGeneration: snapshot.contentGeneration,
     dependencyGeneration: snapshot.dependencyGeneration,
     configGeneration: snapshot.configGeneration,
+    surfaceGeneration: snapshot.surfaceGeneration,
     useStdPrefix: options.useStdPrefix,
   )
 
@@ -535,6 +540,7 @@ proc semanticKey(value: SemanticResult): SemanticKey =
     contentGeneration: value.contentGeneration,
     dependencyGeneration: value.dependencyGeneration,
     configGeneration: value.configGeneration,
+    surfaceGeneration: value.surfaceGeneration,
     useStdPrefix: value.useStdPrefix,
   )
 
@@ -544,6 +550,7 @@ proc semanticKey(value: SemanticRequest): SemanticKey =
     contentGeneration: value.contentGeneration,
     dependencyGeneration: value.dependencyGeneration,
     configGeneration: value.configGeneration,
+    surfaceGeneration: value.surfaceGeneration,
     useStdPrefix: value.useStdPrefix,
   )
 
@@ -552,6 +559,7 @@ proc sameSemanticKey(left, right: SemanticKey): bool =
     left.contentGeneration.value == right.contentGeneration.value and
     left.dependencyGeneration.value == right.dependencyGeneration.value and
     left.configGeneration.value == right.configGeneration.value and
+    left.surfaceGeneration.value == right.surfaceGeneration.value and
     left.useStdPrefix == right.useStdPrefix
 
 proc removePending(pending: var SemanticKey, key: SemanticKey) =
@@ -588,6 +596,7 @@ proc actionIsCurrent(
   action.contentGeneration.value == snapshot.contentGeneration.value and
     action.dependencyGeneration.value == snapshot.dependencyGeneration.value and
     action.configGeneration.value == snapshot.configGeneration.value and
+    action.surfaceGeneration.value == snapshot.surfaceGeneration.value and
     action.useStdPrefix == options.useStdPrefix
 
 proc enqueueSemantic(
@@ -606,6 +615,7 @@ proc enqueueSemantic(
     contentGeneration: snapshot.contentGeneration,
     dependencyGeneration: snapshot.dependencyGeneration,
     configGeneration: snapshot.configGeneration,
+    surfaceGeneration: snapshot.surfaceGeneration,
     useStdPrefix: options.useStdPrefix,
   )
   let key = semanticKey(request)
@@ -618,6 +628,7 @@ proc enqueueSemantic(
   true
 
 proc cacheIndexedAction(
+    workspace: Workspace,
     snapshot: WorkspaceSnapshot,
     options: OrganizeOptions,
     stdlib: var StdlibMap,
@@ -627,8 +638,16 @@ proc cacheIndexedAction(
     return
   if stdlib == nil:
     stdlib = stdlibMap()
+  var project: SurfaceIndex
+  var catalog: ModuleCatalog
+  var owner = ""
+  if workspace.graphComplete:
+    project = workspace.projectSurface()
+    catalog = workspace.moduleCatalog()
+    owner = workspace.moduleForPath(snapshot.path)
   let attempt = tryOrganizeSourceWithIndex(
-    snapshot.path, snapshot.text, snapshot.index, stdlib, options
+    snapshot.path, snapshot.text, snapshot.index, stdlib, options, project, catalog,
+    owner,
   )
   if not attempt.handled:
     return
@@ -641,6 +660,7 @@ proc cacheIndexedAction(
       contentGeneration: snapshot.contentGeneration,
       dependencyGeneration: snapshot.dependencyGeneration,
       configGeneration: snapshot.configGeneration,
+      surfaceGeneration: snapshot.surfaceGeneration,
       useStdPrefix: options.useStdPrefix,
       edits: result.edits,
     ),
@@ -679,6 +699,7 @@ proc acceptSemantic(
         contentGeneration: value.contentGeneration,
         dependencyGeneration: value.dependencyGeneration,
         configGeneration: value.configGeneration,
+        surfaceGeneration: value.surfaceGeneration,
         useStdPrefix: value.useStdPrefix,
         edits: value.edits,
       ),
@@ -754,7 +775,7 @@ proc codeActions(
       edits = cached.edits
       cacheHit = true
   if not cacheHit:
-    let indexed = cacheIndexedAction(snapshot, options, stdlib, actionCache)
+    let indexed = cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache)
     if indexed.handled:
       edits = indexed.edits
     else:
@@ -779,6 +800,7 @@ proc codeActions(
             contentGeneration: snapshot.contentGeneration,
             dependencyGeneration: snapshot.dependencyGeneration,
             configGeneration: snapshot.configGeneration,
+            surfaceGeneration: snapshot.surfaceGeneration,
             useStdPrefix: options.useStdPrefix,
             edits: edits,
           ),
@@ -955,7 +977,7 @@ proc runLsp*() =
         )
         let snapshot = workspace.snapshotForDocument(uriText, path)
         publishNativeDiagnostics(workspace, snapshot, stdlib)
-        if not cacheIndexedAction(snapshot, options, stdlib, actionCache).handled:
+        if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled:
           discard enqueueSemantic(snapshot, options, pending, queued)
         scheduleBootstrap(bootstrap, workspace)
     of "textDocument/didChange":
@@ -980,7 +1002,7 @@ proc runLsp*() =
         )
         let snapshot = workspace.snapshotForDocument(uriText, path)
         publishNativeDiagnostics(workspace, snapshot, stdlib)
-        if not cacheIndexedAction(snapshot, options, stdlib, actionCache).handled:
+        if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled:
           discard enqueueSemantic(snapshot, options, pending, queued)
         scheduleBootstrap(bootstrap, workspace)
     of "textDocument/didClose":
@@ -999,7 +1021,7 @@ proc runLsp*() =
           discard workspace.changeDocument(uriText, path, params["text"].getStr, -1)
         let snapshot = workspace.snapshotForDocument(uriText, path)
         publishNativeDiagnostics(workspace, snapshot, stdlib)
-        if not cacheIndexedAction(snapshot, options, stdlib, actionCache).handled:
+        if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled:
           discard enqueueSemantic(snapshot, options, pending, queued)
         scheduleBootstrap(bootstrap, workspace)
     of "workspace/didChangeWatchedFiles":

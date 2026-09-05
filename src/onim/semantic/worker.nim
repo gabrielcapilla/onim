@@ -17,6 +17,7 @@ type
     contentGeneration*: ContentGeneration
     dependencyGeneration*: DependencyGeneration
     configGeneration*: ConfigGeneration
+    surfaceGeneration*: SurfaceGeneration
     useStdPrefix*: bool
 
   SemanticResult* = object
@@ -25,6 +26,7 @@ type
     contentGeneration*: ContentGeneration
     dependencyGeneration*: DependencyGeneration
     configGeneration*: ConfigGeneration
+    surfaceGeneration*: SurfaceGeneration
     useStdPrefix*: bool
     edits*: seq[ImportEdit]
 
@@ -79,6 +81,8 @@ proc decodeResult(line: string): SemanticResult =
       DependencyGeneration(uint64(workerInteger(node, "dependencyGeneration")))
     result.configGeneration =
       ConfigGeneration(uint64(workerInteger(node, "configGeneration")))
+    result.surfaceGeneration =
+      SurfaceGeneration(uint64(workerInteger(node, "surfaceGeneration")))
     result.useStdPrefix =
       node.hasKey("useStdPrefix") and node["useStdPrefix"].kind == JBool and
       node["useStdPrefix"].getBool
@@ -143,6 +147,7 @@ proc submitSemantic*(request: SemanticRequest): bool =
     "contentGeneration": uint64(request.contentGeneration),
     "dependencyGeneration": uint64(request.dependencyGeneration),
     "configGeneration": uint64(request.configGeneration),
+    "surfaceGeneration": uint64(request.surfaceGeneration),
     "useStdPrefix": request.useStdPrefix,
   }
 
@@ -212,6 +217,7 @@ proc runSemanticWorkerProcess*() =
     response["contentGeneration"] = %workerInteger(request, "contentGeneration")
     response["dependencyGeneration"] = %workerInteger(request, "dependencyGeneration")
     response["configGeneration"] = %workerInteger(request, "configGeneration")
+    response["surfaceGeneration"] = %workerInteger(request, "surfaceGeneration")
     response["failed"] = %failed
     response["useStdPrefix"] =
       if request.hasKey("useStdPrefix") and request["useStdPrefix"].kind == JBool:
