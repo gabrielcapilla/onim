@@ -27,7 +27,7 @@ proc checkMalformed(content: string, suffix: string) =
   try:
     writeFile(path, content)
     let fallback = loadStdlibBinary(path)
-    check fallback.surface.valid
+    check fallback.surfaceIndex().valid
     check not fallback.surfaceIsComplete
   finally:
     if fileExists(path):
@@ -40,8 +40,10 @@ suite "packed stdlib map":
     check expected.surfaceIsComplete
     assertSameMap(expected, actual)
     check actual.implicitModule("std/system")
-    check actual.surface.lookupInModule("std/os", "walkDir").candidates.len == 1
-    check actual.surface.lookupInModule("std/tables", "Table").candidates.len == 1
+    let surface = actual.surfaceIndex()
+    check surface.valid
+    check surface.lookupInModule("std/os", "walkDir").candidates.len == 1
+    check surface.lookupInModule("std/tables", "Table").candidates.len == 1
 
   test "rejects malformed binary envelopes":
     let source = readFile(getCurrentDir() / "stdlib_map.bin")

@@ -179,13 +179,21 @@ proc registerSymbolKey(stdlib: StdlibMap, name: string) =
       return
   stdlib.symbolKeys[key].add name
 
+proc surfaceIndex*(stdlib: StdlibMap): SurfaceIndex =
+  if stdlib == nil:
+    return
+  if stdlib.surface == nil:
+    let origin =
+      if stdlib.metadata == metadataComplete: surfaceStdlib else: surfaceFallback
+    stdlib.surface = surfaceForMap(stdlib, origin)
+  result = stdlib.surface
+
 proc surfaceIsComplete*(stdlib: StdlibMap): bool =
-  stdlib != nil and stdlib.surface != nil and stdlib.surface.valid() and
-    stdlib.surface.universeIsComplete() and stdlib.metadata == metadataComplete
+  stdlib != nil and stdlib.metadata == metadataComplete and stdlib.modules.card > 0 and
+    stdlib.symbols.len > 0
 
 proc emptyStdlibMap*(): StdlibMap =
   result = newStdlibMap()
-  result.surface = surfaceForMap(result, surfaceFallback)
 
 proc readByte(reader: var BinaryReader): uint8 =
   if not reader.valid or reader.position < 0 or reader.position >= reader.data.len:
@@ -388,9 +396,6 @@ proc decodeStdlibBinary(data: string): StdlibMap =
   if result.symbols.len == 0:
     return emptyStdlibMap()
   result.metadata = metadataComplete
-  result.surface = surfaceForMap(result, surfaceStdlib)
-  if result.surface == nil or not result.surface.valid():
-    return emptyStdlibMap()
   return result
 
 var cachedBundledMap: StdlibMap
@@ -492,9 +497,6 @@ proc loadStdlibMap*(path: string): StdlibMap =
         for candidate in candidates:
           discard addUniqueCandidate(result.symbols.mgetOrPut(name, @[]), candidate)
     if result.symbols.len == 0:
-      return emptyStdlibMap()
-    result.surface = surfaceForMap(result, surfaceStdlib)
-    if result.surface == nil or not result.surface.valid():
       return emptyStdlibMap()
   except CatchableError:
     return emptyStdlibMap()

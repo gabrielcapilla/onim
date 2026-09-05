@@ -100,28 +100,31 @@ suite "native module surfaces":
 
   test "uses the complete generated map without fallback rows":
     let stdlib = loadStdlibMap("")
-    check stdlib.surface.valid
-    check stdlib.surface.universeIsComplete
     check stdlib.surfaceIsComplete
+    let surface = stdlib.surfaceIndex()
+    check surface.valid
+    check surface.universeIsComplete
     check stdlib.implicitModule("std/system")
-    let walkDir = stdlib.surface.lookupInModule("std/os", "walkDir")
+    let walkDir = surface.lookupInModule("std/os", "walkDir")
     check walkDir.kind == surfaceResolved
     check walkDir.candidates.len == 1
-    check stdlib.surface.exportsFor(walkDir.candidates[0]).len >= 2
+    check surface.exportsFor(walkDir.candidates[0]).len >= 2
     for candidate in stdlib.symbols["walkDir"]:
       check not (candidate.module == "std/os" and candidate.signature.len == 0)
 
   test "keeps fallback data conservative":
     let fallback = emptyStdlibMap()
-    check fallback.surface.valid
-    check not fallback.surface.universeIsComplete
-    check fallback.surface.lookup("walkDir").kind == surfaceUnknown
+    let surface = fallback.surfaceIndex()
+    check surface.valid
+    check not surface.universeIsComplete
+    check surface.lookup("walkDir").kind == surfaceUnknown
 
   test "rejects malformed generated data as incomplete fallback":
     let invalidPath = getTempDir() / "onim-invalid-stdlib-map.json"
     writeFile(invalidPath, "{")
     let fallback = loadStdlibMap(invalidPath)
     removeFile(invalidPath)
-    check fallback.surface.valid
-    check not fallback.surface.universeIsComplete
-    check fallback.surface.lookup("walkDir").kind == surfaceUnknown
+    let surface = fallback.surfaceIndex()
+    check surface.valid
+    check not surface.universeIsComplete
+    check surface.lookup("walkDir").kind == surfaceUnknown
