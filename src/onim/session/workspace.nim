@@ -82,6 +82,10 @@ type
     unresolved: HashSet[uint32]
     moduleCatalogCache: ModuleCatalog
     projectSurfaceCache: SurfaceIndex
+    projectSurfaceBuiltGeneration: SurfaceGeneration
+    projectSurfaceInputs: seq[SurfaceInput]
+    projectSurfaceInputGenerations: seq[uint64]
+    projectSurfaceInputCandidateCounts: seq[uint32]
 
 proc unknownStamp(): FileStamp =
   FileStamp(size: -1, modifiedSeconds: -1, modifiedNanoseconds: -1)
@@ -147,7 +151,6 @@ proc indexDiskSource(workspace: Workspace, path, source: string): SourceIndex =
     discard saveCachedSourceIndex(workspace.root, path, source, result)
 
 proc invalidateProjectSurface(workspace: Workspace) =
-  workspace.projectSurfaceCache = nil
   workspace.surfaceGeneration =
     SurfaceGeneration(uint64(workspace.surfaceGeneration) + 1'u64)
 
@@ -476,6 +479,11 @@ proc adoptWorkspaceState(destination, source: Workspace) =
   destination.unresolved = source.unresolved
   destination.moduleCatalogCache = source.moduleCatalogCache
   destination.projectSurfaceCache = source.projectSurfaceCache
+  destination.projectSurfaceBuiltGeneration = source.projectSurfaceBuiltGeneration
+  destination.projectSurfaceInputs = source.projectSurfaceInputs
+  destination.projectSurfaceInputGenerations = source.projectSurfaceInputGenerations
+  destination.projectSurfaceInputCandidateCounts =
+    source.projectSurfaceInputCandidateCounts
 
 proc applyBootstrap*(workspace: Workspace, value: BootstrapResult): bool =
   if workspace == nil or not workspace.validBootstrapResult(value):
@@ -1270,18 +1278,49 @@ proc moduleForPath*(workspace: Workspace, path: string): string =
 proc projectSurface*(workspace: Workspace): SurfaceIndex =
   if workspace == nil:
     return
-  if workspace.projectSurfaceCache != nil:
+  if workspace.projectSurfaceCache != nil and
+      workspace.projectSurfaceBuiltGeneration.value == workspace.surfaceGeneration.value:
     return workspace.projectSurfaceCache
-  var inputs = newSeqOfCap[SurfaceInput](workspace.files.len)
+  let catalog = workspace.moduleCatalog()
+  let universeComplete = workspace.graphComplete()
+  workspace.projectSurfaceInputs.setLen(workspace.files.len)
+  workspace.projectSurfaceInputGenerations.setLen(workspace.files.len)
+  workspace.projectSurfaceInputCandidateCounts.setLen(workspace.files.len)
+  var contributors = newSeqOfCap[SurfaceContributor](workspace.files.len)
   for file in workspace.files:
-    if file.state == workspaceMissing or not workspace.ensureIndex(file.id):
+    let fileIndex = file.id.recordIndex
+    if fileIndex < 0 or fileIndex >= workspace.files.len or
+        file.state == workspaceMissing or not workspace.ensureIndex(file.id):
+      if fileIndex >= 0 and fileIndex < workspace.projectSurfaceInputs.len:
+        workspace.projectSurfaceInputs[fileIndex] = SurfaceInput()
+        workspace.projectSurfaceInputGenerations[fileIndex] = 0
+        workspace.projectSurfaceInputCandidateCounts[fileIndex] = 0
       continue
-    let module = workspace.moduleForPath(file.path)
+    let module = catalog.moduleForPath(file.path)
     if module.len == 0:
+      workspace.projectSurfaceInputs[fileIndex] = SurfaceInput()
+      workspace.projectSurfaceInputGenerations[fileIndex] = 0
+      workspace.projectSurfaceInputCandidateCounts[fileIndex] = 0
       continue
-    var input = projectSurfaceInput(module, workspace.files[file.id.recordIndex].index)
-    if workspace.moduleCatalog().candidateCount(module) > 1:
+    let candidateCount = uint32(catalog.candidateCount(module))
+    let contentGeneration = uint64(workspace.files[fileIndex].contentGeneration)
+    var input = workspace.projectSurfaceInputs[fileIndex]
+    if contentGeneration != workspace.projectSurfaceInputGenerations[fileIndex] or
+        input.module != module or
+        candidateCount != workspace.projectSurfaceInputCandidateCounts[fileIndex]:
+      input = projectSurfaceInput(module, workspace.files[fileIndex].index)
+      workspace.projectSurfaceInputs[fileIndex] = input
+      workspace.projectSurfaceInputGenerations[fileIndex] = contentGeneration
+      workspace.projectSurfaceInputCandidateCounts[fileIndex] = candidateCount
+    if candidateCount > 1:
       input.uncertainty.incl surfaceUnsupported
-    inputs.add input
-  workspace.projectSurfaceCache = buildSurfaceIndex(inputs, workspace.graphComplete())
+    contributors.add SurfaceContributor(
+      fileId: file.id,
+      contentGeneration: workspace.files[fileIndex].contentGeneration,
+      input: input,
+    )
+  workspace.projectSurfaceCache = buildProjectSurfaceIndex(
+    contributors, universeComplete, workspace.projectSurfaceCache
+  )
+  workspace.projectSurfaceBuiltGeneration = workspace.surfaceGeneration
   workspace.projectSurfaceCache

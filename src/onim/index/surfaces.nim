@@ -1,6 +1,7 @@
 import std/[algorithm, strutils, tables]
 
 import ../syntax/lexer
+import ../session/ids
 import ../session/module_catalog
 import ./occurrences
 import ./scopes
@@ -42,6 +43,11 @@ type
     uncertainty*: set[SurfaceUncertainty]
     exports*: seq[SurfaceExportInput]
 
+  SurfaceContributor* = object
+    fileId*: FileId
+    contentGeneration*: ContentGeneration
+    input*: SurfaceInput
+
   ExportRecord* = object
     kind*: SourceSymbolKind
     declaredArity*: int32
@@ -73,20 +79,41 @@ type
     kind*: SurfaceResolutionKind
     candidates*: seq[BindingCandidate]
 
+type
+  SurfaceContributorIdentity = object
+    fileId: FileId
+    contentGeneration: ContentGeneration
+
+  SurfaceBindingRecord = object
+    name: string
+    key: string
+    firstExport: uint32
+    pastExport: uint32
+
+  SurfaceModuleRecord = ref object
+    module: string
+    origin: SurfaceOrigin
+    uncertainty: set[SurfaceUncertainty]
+    contributors: seq[SurfaceContributorIdentity]
+    bindings: seq[SurfaceBindingRecord]
+    exports: seq[ExportRecord]
+
+  SurfaceAccumulator = object
+    module: string
+    origin: SurfaceOrigin
+    uncertainty: set[SurfaceUncertainty]
+    contributors: seq[SurfaceContributorIdentity]
+    exports: seq[SurfaceExportInput]
+
   SurfaceIndex* = ref object
     modules: seq[ModuleSurface]
     bindings: seq[BindingCandidate]
     exports: seq[ExportRecord]
+    records: seq[SurfaceModuleRecord]
     byName: Table[string, seq[BindingId]]
     byModule: Table[string, SurfaceId]
     valid: bool
     universeComplete: bool
-
-type SurfaceAccumulator = object
-  module: string
-  origin: SurfaceOrigin
-  uncertainty: set[SurfaceUncertainty]
-  exports: seq[SurfaceExportInput]
 
 const invalidSurfaceToken = high(uint32)
 
@@ -158,6 +185,108 @@ proc validExportInput(exported: SurfaceExportInput): bool =
 proc moduleUncertain(surface: ModuleSurface): bool {.inline.} =
   surface.uncertainty != {}
 
+proc sameContributorSequence(left, right: openArray[SurfaceContributorIdentity]): bool =
+  if left.len != right.len:
+    return false
+  for index in 0 ..< left.len:
+    if uint32(left[index].fileId) != uint32(right[index].fileId) or
+        left[index].contentGeneration.value != right[index].contentGeneration.value:
+      return false
+  true
+
+proc buildSurfaceModuleRecord(accumulator: SurfaceAccumulator): SurfaceModuleRecord =
+  new(result)
+  result.module = accumulator.module
+  result.origin = accumulator.origin
+  result.uncertainty = accumulator.uncertainty
+  result.contributors = accumulator.contributors
+
+  var exports = accumulator.exports
+  exports.sort(compareExports)
+  var cursor = 0
+  while cursor < exports.len:
+    let firstExport = uint32(result.exports.len)
+    let key = surfaceKey(exports[cursor].name)
+    let name = exports[cursor].name
+    while cursor < exports.len and surfaceKey(exports[cursor].name) == key:
+      let exported = exports[cursor]
+      result.exports.add ExportRecord(
+        kind: exported.kind,
+        declaredArity: exported.declaredArity,
+        signature: exported.signature,
+        shapeKnown: exported.shapeKnown,
+        nameToken: exported.nameToken,
+      )
+      inc cursor
+    result.bindings.add SurfaceBindingRecord(
+      name: name,
+      key: key,
+      firstExport: firstExport,
+      pastExport: uint32(result.exports.len),
+    )
+
+proc materializeSurfaceIndex(
+    records: seq[SurfaceModuleRecord], universeComplete: bool
+): SurfaceIndex =
+  new(result)
+  result.valid = true
+  result.universeComplete = universeComplete
+  for record in records:
+    if record != nil and record.uncertainty != {}:
+      result.universeComplete = false
+  result.records = records
+  for record in records:
+    let surface = SurfaceId(uint32(result.modules.len + 1))
+    let firstBinding = uint32(result.bindings.len)
+    let firstExport = uint32(result.exports.len)
+    for exported in record.exports:
+      result.exports.add exported
+    for binding in record.bindings:
+      result.bindings.add BindingCandidate(
+        surface: surface,
+        name: binding.name,
+        key: binding.key,
+        firstExport: firstExport + binding.firstExport,
+        pastExport: firstExport + binding.pastExport,
+      )
+      result.byName.mgetOrPut(binding.key, @[]).add(
+        BindingId(uint32(result.bindings.len))
+      )
+    result.modules.add ModuleSurface(
+      module: record.module,
+      origin: record.origin,
+      firstBinding: firstBinding,
+      pastBinding: uint32(result.bindings.len),
+      uncertainty:
+        if result.universeComplete:
+          record.uncertainty
+        else:
+          record.uncertainty + {surfaceUniverseIncomplete},
+    )
+    result.byModule[record.module] = surface
+
+proc addSurfaceInput(
+    accumulators: var seq[SurfaceAccumulator],
+    byModule: var Table[string, int],
+    input: SurfaceInput,
+    contributor: SurfaceContributorIdentity,
+): bool =
+  let accumulator = findOrAdd(accumulators, byModule, input)
+  if accumulator < 0:
+    return false
+  if contributor.fileId.valid:
+    accumulators[accumulator].contributors.add contributor
+  result = true
+  for exported in input.exports:
+    if not validExportInput(exported):
+      result = false
+      continue
+    for existing in accumulators[accumulator].exports:
+      if sameExport(existing, exported) and existing.nameToken == invalidSurfaceToken and
+          exported.nameToken == invalidSurfaceToken:
+        result = false
+    accumulators[accumulator].exports.add exported
+
 proc buildSurfaceIndex*(
     inputs: openArray[SurfaceInput], universeComplete = true
 ): SurfaceIndex =
@@ -168,19 +297,8 @@ proc buildSurfaceIndex*(
   var byModule = initTable[string, int]()
 
   for input in inputs:
-    let accumulator = findOrAdd(accumulators, byModule, input)
-    if accumulator < 0:
+    if not addSurfaceInput(accumulators, byModule, input, SurfaceContributorIdentity()):
       result.valid = false
-      continue
-    for exported in input.exports:
-      if not validExportInput(exported):
-        result.valid = false
-        continue
-      for existing in accumulators[accumulator].exports:
-        if sameExport(existing, exported) and existing.nameToken == invalidSurfaceToken and
-            exported.nameToken == invalidSurfaceToken:
-          result.valid = false
-      accumulators[accumulator].exports.add exported
 
   if not result.valid:
     result.universeComplete = false
@@ -190,50 +308,56 @@ proc buildSurfaceIndex*(
     proc(left, right: SurfaceAccumulator): int =
       cmp(left.module, right.module)
   )
-  for accumulatorIndex in 0 ..< accumulators.len:
-    var accumulator = accumulators[accumulatorIndex]
-    accumulator.exports.sort(compareExports)
-    let surface = SurfaceId(uint32(result.modules.len + 1))
-    let firstBinding = uint32(result.bindings.len)
-    var cursor = 0
-    while cursor < accumulator.exports.len:
-      let firstExport = uint32(result.exports.len)
-      let key = surfaceKey(accumulator.exports[cursor].name)
-      let name = accumulator.exports[cursor].name
-      while cursor < accumulator.exports.len and
-          surfaceKey(accumulator.exports[cursor].name) == key:
-        let exported = accumulator.exports[cursor]
-        result.exports.add ExportRecord(
-          kind: exported.kind,
-          declaredArity: exported.declaredArity,
-          signature: exported.signature,
-          shapeKnown: exported.shapeKnown,
-          nameToken: exported.nameToken,
-        )
-        inc cursor
-      let binding = BindingId(uint32(result.bindings.len + 1))
-      result.bindings.add BindingCandidate(
-        surface: surface,
-        name: name,
-        key: key,
-        firstExport: firstExport,
-        pastExport: uint32(result.exports.len),
-      )
-      result.byName.mgetOrPut(key, @[]).add binding
-    result.modules.add ModuleSurface(
-      module: accumulator.module,
-      origin: accumulator.origin,
-      firstBinding: firstBinding,
-      pastBinding: uint32(result.bindings.len),
-      uncertainty: accumulator.uncertainty,
-    )
-    result.byModule[accumulator.module] = surface
+  var records = newSeqOfCap[SurfaceModuleRecord](accumulators.len)
+  for accumulator in accumulators:
+    records.add buildSurfaceModuleRecord(accumulator)
     if accumulator.uncertainty != {}:
       result.universeComplete = false
+  result = materializeSurfaceIndex(records, result.universeComplete)
 
-  if not result.universeComplete:
-    for index in 0 ..< result.modules.len:
-      result.modules[index].uncertainty.incl surfaceUniverseIncomplete
+proc buildProjectSurfaceIndex*(
+    contributors: openArray[SurfaceContributor],
+    universeComplete = true,
+    previous: SurfaceIndex = nil,
+): SurfaceIndex =
+  var accumulators: seq[SurfaceAccumulator] = @[]
+  var byModule = initTable[string, int]()
+  var valid = true
+  for contributor in contributors:
+    let identity = SurfaceContributorIdentity(
+      fileId: contributor.fileId, contentGeneration: contributor.contentGeneration
+    )
+    if not addSurfaceInput(accumulators, byModule, contributor.input, identity):
+      valid = false
+  if not valid:
+    new(result)
+    result.valid = false
+    result.universeComplete = false
+    return
+
+  accumulators.sort(
+    proc(left, right: SurfaceAccumulator): int =
+      cmp(left.module, right.module)
+  )
+  var records = newSeqOfCap[SurfaceModuleRecord](accumulators.len)
+  for accumulator in accumulators:
+    var record: SurfaceModuleRecord
+    if previous != nil and previous.valid and
+        previous.byModule.hasKey(accumulator.module):
+      let surface = previous.byModule[accumulator.module]
+      let ordinal = int(uint32(surface)) - 1
+      if ordinal >= 0 and ordinal < previous.records.len:
+        let candidate = previous.records[ordinal]
+        if candidate != nil and candidate.module == accumulator.module and
+            candidate.origin == accumulator.origin and
+            candidate.uncertainty == accumulator.uncertainty and
+            sameContributorSequence(candidate.contributors, accumulator.contributors):
+          record = candidate
+    if record == nil:
+      record = buildSurfaceModuleRecord(accumulator)
+    records.add record
+
+  result = materializeSurfaceIndex(records, universeComplete)
 
 proc valid*(index: SurfaceIndex): bool =
   index != nil and index.valid

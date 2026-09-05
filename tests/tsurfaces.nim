@@ -4,6 +4,7 @@ import onim/index/source_index
 import onim/index/surfaces
 import onim/index/symbols
 import onim/stdlib/map
+import onim/session/ids as onimIds
 
 proc exported(
     name: string, kind: SourceSymbolKind, arity: int32 = -1, signature = ""
@@ -97,6 +98,62 @@ suite "native module surfaces":
     check index.universeIsComplete
     check index.lookup("answer").kind == surfaceResolved
     check index.lookup("private").kind == surfaceUnresolved
+
+  test "rebuilds project generations without mutating predecessors":
+    let first = buildProjectSurfaceIndex(
+      @[
+        SurfaceContributor(
+          fileId: onimIds.FileId(1),
+          contentGeneration: onimIds.ContentGeneration(1),
+          input: SurfaceInput(
+            module: "project/first",
+            origin: surfaceProject,
+            exports: @[exported("answer", symbolProc)],
+          ),
+        ),
+        SurfaceContributor(
+          fileId: onimIds.FileId(2),
+          contentGeneration: onimIds.ContentGeneration(1),
+          input: SurfaceInput(
+            module: "project/second",
+            origin: surfaceProject,
+            exports: @[exported("other", symbolProc)],
+          ),
+        ),
+      ],
+      universeComplete = true,
+    )
+    let second = buildProjectSurfaceIndex(
+      @[
+        SurfaceContributor(
+          fileId: onimIds.FileId(1),
+          contentGeneration: onimIds.ContentGeneration(1),
+          input: SurfaceInput(
+            module: "project/first",
+            origin: surfaceProject,
+            exports: @[exported("answer", symbolProc)],
+          ),
+        ),
+        SurfaceContributor(
+          fileId: onimIds.FileId(2),
+          contentGeneration: onimIds.ContentGeneration(2),
+          input: SurfaceInput(
+            module: "project/second",
+            origin: surfaceProject,
+            exports: @[exported("changed", symbolProc)],
+          ),
+        ),
+      ],
+      universeComplete = true,
+      previous = first,
+    )
+    check first.validateSurfaceIndex
+    check second.validateSurfaceIndex
+    check first.lookup("other").kind == surfaceResolved
+    check first.lookup("changed").kind == surfaceUnresolved
+    check second.lookup("other").kind == surfaceUnresolved
+    check second.lookup("changed").kind == surfaceResolved
+    check second.lookup("answer").kind == surfaceResolved
 
   test "uses the complete generated map without fallback rows":
     let stdlib = loadStdlibMap("")

@@ -49,6 +49,20 @@ let warmWorkspace = initWorkspace(root)
 let warmStarted = getMonoTime()
 warmWorkspace.indexWorkspace()
 let warmNanoseconds = (getMonoTime() - warmStarted).inNanoseconds
+let surfaceStarted = getMonoTime()
+discard warmWorkspace.projectSurface()
+let surfaceNanoseconds = (getMonoTime() - surfaceStarted).inNanoseconds
+let cachedSurfaceStarted = getMonoTime()
+discard warmWorkspace.projectSurface()
+let cachedSurfaceNanoseconds = (getMonoTime() - cachedSurfaceStarted).inNanoseconds
+let editPath = root / "module127.nim"
+let editSource = readFile(editPath) & "proc extra*() = discard\n"
+let editStarted = getMonoTime()
+discard warmWorkspace.changeDocument("", editPath, editSource, 1)
+let editNanoseconds = (getMonoTime() - editStarted).inNanoseconds
+let rebuildStarted = getMonoTime()
+discard warmWorkspace.projectSurface()
+let rebuildNanoseconds = (getMonoTime() - rebuildStarted).inNanoseconds
 
 let lazyWorkspace = initWorkspace()
 let prepareStarted = getMonoTime()
@@ -64,6 +78,14 @@ echo "modules=",
   coldNanoseconds.float / 1_000_000,
   " warm_ms=",
   warmNanoseconds.float / 1_000_000,
+  " surface_ms=",
+  surfaceNanoseconds.float / 1_000_000,
+  " cached_surface_ms=",
+  cachedSurfaceNanoseconds.float / 1_000_000,
+  " edit_ms=",
+  editNanoseconds.float / 1_000_000,
+  " rebuild_ms=",
+  rebuildNanoseconds.float / 1_000_000,
   " prepare_ms=",
   prepareNanoseconds.float / 1_000_000,
   " bootstrap_ms=",
