@@ -51,12 +51,12 @@ type
 proc hasCachedAction(cache: seq[CachedAction], id: FileId): bool {.inline.} =
   let slot = id.slot
   slot >= 0 and slot < cache.len and
-    cache[slot].contentGeneration != InvalidContentGeneration
+    cache[slot].contentGeneration.value != InvalidContentGeneration.value
 
 proc cachedActionFor(cache: seq[CachedAction], id: FileId): CachedAction {.inline.} =
   let slot = id.slot
   if slot >= 0 and slot < cache.len:
-    cache[slot]
+    result = cache[slot]
 
 proc storeCachedAction(
     cache: var seq[CachedAction], id: FileId, action: CachedAction
@@ -651,7 +651,15 @@ proc acceptSemantic(
     pending: var seq[SemanticKey],
     queued: var seq[SemanticRequest],
 ) =
-  if value.failed or not value.fileId.valid:
+  if value.failed:
+    if value.fileId.valid:
+      removePending(pending, semanticKey(value))
+      discard dispatchSemantic(queued, pending)
+    else:
+      pending.setLen(0)
+      queued.setLen(0)
+    return
+  if not value.fileId.valid:
     pending.setLen(0)
     queued.setLen(0)
     return
@@ -703,8 +711,11 @@ proc waitForSemantic(
       return true
     let semanticResult = receiveSemantic()
     if semanticResult.failed:
-      pending.setLen(0)
-      queued.setLen(0)
+      if not semanticResult.fileId.valid:
+        pending.setLen(0)
+        queued.setLen(0)
+      else:
+        acceptSemantic(semanticResult, workspace, actionCache, pending, queued)
       return false
     acceptSemantic(semanticResult, workspace, actionCache, pending, queued)
 

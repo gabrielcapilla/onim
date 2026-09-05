@@ -72,9 +72,6 @@ proc decodeResult(line: string): SemanticResult =
         node["kind"].getStr != "result":
       result.failed = true
       return
-    if node.hasKey("failed") and node["failed"].kind == JBool and node["failed"].getBool:
-      result.failed = true
-      return
     result.fileId = FileId(uint32(workerInteger(node, "fileId")))
     result.contentGeneration =
       ContentGeneration(uint64(workerInteger(node, "contentGeneration")))
@@ -85,6 +82,9 @@ proc decodeResult(line: string): SemanticResult =
     result.useStdPrefix =
       node.hasKey("useStdPrefix") and node["useStdPrefix"].kind == JBool and
       node["useStdPrefix"].getBool
+    if node.hasKey("failed") and node["failed"].kind == JBool and node["failed"].getBool:
+      result.failed = true
+      return
     if node.hasKey("edits") and node["edits"].kind == JArray:
       for item in node["edits"].items:
         if item.kind != JObject:
