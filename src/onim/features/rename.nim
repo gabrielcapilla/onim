@@ -110,8 +110,7 @@ proc addFromImportMatches(
   for dependentId in workspace.dependents(target.fileId):
     let dependent = workspace.snapshotForFile(dependentId)
     if not dependent.valid or dependent.id.value != source.id.value or
-        dependent.index == nil or
-        not dependent.index.parsed.nativeIndexSafe(dependent.index):
+        dependent.index == nil or not dependent.index.nativeIndexSafe():
       return false
     for item in dependent.index.parsed.imports:
       if item.form != fromModule or
@@ -195,8 +194,7 @@ proc importedModuleCollision(
       if moduleId.value == target.fileId.value:
         continue
       let view = workspace.indexViewForFile(moduleId)
-      if not view.valid or view.index == nil or
-          not view.index.parsed.nativeIndexSafe(view.index):
+      if not view.valid or view.index == nil or not view.index.nativeIndexSafe():
         return true
       for symbol in view.index.symbols:
         if not symbol.exported or
@@ -236,7 +234,7 @@ proc validateMatches(
       targetView.id.value != source.id.value or
       targetView.contentGeneration.value != target.contentGeneration.value or
       target.nameToken >= uint32(targetView.index.parsed.tokens.len) or
-      not targetView.index.parsed.nativeIndexSafe(targetView.index):
+      not targetView.index.nativeIndexSafe():
     return false
   let targetToken = targetView.index.parsed.tokens[int(target.nameToken)]
   if targetToken.kind != tkIdentifier or not validIdentifier(targetToken) or
@@ -264,7 +262,7 @@ proc validateMatches(
         workspace.snapshotForFile(match.fileId)
     if not current.valid or current.id.value != source.id.value or
         current.contentGeneration.value != match.contentGeneration.value or
-        current.index == nil or not current.index.parsed.nativeIndexSafe(current.index) or
+        current.index == nil or not current.index.nativeIndexSafe() or
         match.tokenIndex >= uint32(current.index.parsed.tokens.len):
       return false
     let token = current.index.parsed.tokens[int(match.tokenIndex)]

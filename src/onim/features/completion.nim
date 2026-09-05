@@ -65,6 +65,10 @@ type
     state: ImportMatchState
     item: ImportInfo
 
+  FieldVisibility = enum
+    fieldsAll
+    fieldsExported
+
 proc scopeOrdinal(scope: ScopeId): int {.inline.} =
   int(uint32(scope)) - 1
 
@@ -116,8 +120,10 @@ proc memberContext(index: SourceIndex, byteOffset: int): MemberContext =
       not index.parsed.tokens[qualifierToken].validIdentifier or
       index.parsed.tokens[qualifierToken].isStropped or
       isNimKeyword(index.parsed.tokens[qualifierToken].text) or
-      index.parsed.tokens[qualifierToken].endOffset != dot.startOffset or
-      (qualifierToken > 0 and index.parsed.tokens[qualifierToken - 1].text == "."):
+      index.parsed.tokens[qualifierToken].endOffset != dot.startOffset or (
+    qualifierToken > 0 and index.parsed.tokens[qualifierToken - 1].text == "." and
+    index.parsed.tokens[qualifierToken - 1].line == dot.line
+  ):
     result.state = memberContextInvalid
     return
   if memberToken >= 0:
@@ -384,37 +390,81 @@ proc appendVisible(
       candidates[candidateByName[key]] = visible
   true
 
+proc appendObjectFields(
+    index: SourceIndex,
+    objectType: ObjectTypeRecord,
+    prefixKey: string,
+    visibility: FieldVisibility,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+): bool =
+  if index == nil or objectType.firstField > objectType.pastField or
+      objectType.pastField > uint32(index.types.fields.len):
+    return false
+  for fieldIndex in objectType.firstField ..< objectType.pastField:
+    let tokenIndex = int(index.types.fields[int(fieldIndex)].nameToken)
+    if tokenIndex < 0 or tokenIndex >= index.parsed.tokens.len:
+      return false
+    if visibility == fieldsExported and
+        index.types.fields[int(fieldIndex)].visibility != objectFieldExported:
+      continue
+    let token = index.parsed.tokens[tokenIndex]
+    if not appendCompletionCandidate(
+      token.text, completionField, prefixKey, candidates, candidateByName
+    ):
+      return false
+  true
+
 proc completeLocalMembers(
-    source: WorkspaceSnapshot, context: MemberContext, declarationToken: uint32
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    context: MemberContext,
+    declarationToken: uint32,
 ): CompletionResult =
-  if not source.valid or source.index == nil or not source.index.bindingsReady or
-      not source.index.parsed.nativeIndexSafe(source.index):
+  if workspace == nil or not source.valid or source.index == nil or
+      not source.index.bindingsReady or not source.index.nativeIndexSafe():
     return
   let declarationOrdinal = source.index.scopes.declarationOrdinalAt(declarationToken)
   if declarationOrdinal < 0 or declarationOrdinal >= source.index.types.localTypeUses.len:
     return
   let typeToken = source.index.types.localTypeUses[declarationOrdinal]
-  let objectOrdinal = source.index.types.objectOrdinalForType(
-    source.index.parsed.tokens, source.index.symbols, typeToken
-  )
-  if objectOrdinal < 0 or objectOrdinal >= source.index.types.objects.len:
+  if typeToken == InvalidTypeToken:
     return
-  let objectType = source.index.types.objects[objectOrdinal]
+  let typeResolution = resolveDefinitionAtToken(workspace, source, int(typeToken))
+  if typeResolution.kind != definitionResolved or
+      typeResolution.target.snapshotId.value != source.id.value or
+      not typeResolution.target.fileId.valid:
+    return
+
+  var provider = source.index
+  var visibility = fieldsAll
+  if typeResolution.target.fileId.value == source.fileId.value:
+    if typeResolution.target.contentGeneration.value != source.contentGeneration.value:
+      return
+  else:
+    let view = workspace.indexViewForFile(typeResolution.target.fileId)
+    if not view.valid or view.index == nil or view.id.value != source.id.value or
+        view.contentGeneration.value != typeResolution.target.contentGeneration.value or
+        not view.index.nativeIndexSafe():
+      return
+    provider = view.index
+    visibility = fieldsExported
+
+  let objectOrdinal = provider.types.objectOrdinal(typeResolution.target.nameToken)
+  if objectOrdinal < 0 or objectOrdinal >= provider.types.objects.len:
+    return
+  let objectType = provider.types.objects[objectOrdinal]
   var candidates: seq[VisibleCompletion] = @[]
   var candidateByName = initTable[string, int]()
-  for fieldIndex in objectType.firstField ..< objectType.pastField:
-    let tokenIndex = int(source.index.types.fields[int(fieldIndex)].nameToken)
-    if tokenIndex < 0 or tokenIndex >= source.index.parsed.tokens.len:
-      return
-    let token = source.index.parsed.tokens[tokenIndex]
-    if not appendCompletionCandidate(
-      token.text,
-      completionField,
-      identifierKey(context.prefix),
-      candidates,
-      candidateByName,
-    ):
-      return
+  if not appendObjectFields(
+    provider,
+    objectType,
+    identifierKey(context.prefix),
+    visibility,
+    candidates,
+    candidateByName,
+  ):
+    return
   if candidates.len == 0:
     return
   candidates.sort(compareCompletion)
@@ -480,7 +530,7 @@ proc completeModuleMembers(
       source.path.toLowerAscii.endsWith(".cfg"):
     return
   if context.state != memberContextReady or not source.index.bindingsReady or
-      not source.index.parsed.nativeIndexSafe(source.index):
+      not source.index.nativeIndexSafe():
     return
   let qualifier = source.index.parsed.tokens[context.qualifierToken].text
   if not source.importedUseSupported(context.qualifierToken, qualifier):
@@ -509,7 +559,7 @@ proc completeModuleMembers(
       return
     let view = workspace.indexViewForFile(project.id)
     if not view.valid or view.index == nil or view.id.value != source.id.value or
-        not view.index.parsed.nativeIndexSafe(view.index):
+        not view.index.nativeIndexSafe():
       return
     let input = projectSurfaceInput(project.module, view.index)
     if not appendProjectMembers(
@@ -541,7 +591,7 @@ proc completeAt*(
     let binding = source.index.resolveBinding(uint32(context.qualifierToken))
     case binding.state
     of bindingResolved:
-      completeLocalMembers(source, context, binding.declarationToken)
+      completeLocalMembers(workspace, source, context, binding.declarationToken)
     of bindingAmbiguous:
       CompletionResult()
     of bindingUnknown:

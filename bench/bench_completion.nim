@@ -67,6 +67,8 @@ proc moduleSource(prefix: string): string =
 
 proc completionOffset(source: string, prefix: string): int =
   let start = source.rfind(prefix)
+  if start < 0:
+    return -1
   start + prefix.len
 
 proc measureFeature(
@@ -235,8 +237,22 @@ proc projectProviderSource(memberCount: int): string =
   for memberIndex in 0 ..< memberCount:
     result.add "proc member" & $memberIndex & "*() = discard\n"
 
-proc measureProjectMembers(
-    name: string, memberCount, unrelatedCount: int, stdlib: StdlibMap
+proc projectObjectProviderSource(fieldCount: int): string =
+  result = "type\n  Measured* = object\n"
+  for fieldIndex in 0 ..< fieldCount:
+    result.add "    field" & $fieldIndex & "*: int\n"
+
+proc projectObjectSource(mode: ObjectCompletionMode): string =
+  result = "import provider as model\n"
+  if mode == objectAnnotation:
+    result.add "proc measure(value: model.Measured) =\n  value.field\n"
+  else:
+    result.add "proc measure() =\n  let value = model.Measured()\n  value.field\n"
+
+proc measureProjectSource(
+    name, provider, source: string,
+    expectedCount, unrelatedCount: int,
+    stdlib: StdlibMap,
 ) =
   let root = getTempDir() / ("onim-completion-bench-" & $getCurrentProcessId())
   let cacheRoot =
@@ -247,8 +263,7 @@ proc measureProjectMembers(
   createDir(cacheRoot)
   let providerPath = root / "provider.nim"
   let consumerPath = root / "consumer.nim"
-  writeFile(providerPath, projectProviderSource(memberCount))
-  let source = "import provider\nproc measure() =\n  provider.member\n"
+  writeFile(providerPath, provider)
   writeFile(consumerPath, source)
   for unrelatedIndex in 0 ..< unrelatedCount:
     writeFile(
@@ -267,35 +282,80 @@ proc measureProjectMembers(
 
   let workspace = initWorkspace(root)
   workspace.indexWorkspace()
+  doAssert workspace.graphComplete
   let consumerId = workspace.fileIdForPath(consumerPath)
   let snapshot = workspace.snapshotForFile(consumerId)
   let offset = source.completionOffset("member")
+  if offset < 0:
+    doAssert source.contains("value.field")
+  let completionOffset =
+    if offset >= 0:
+      offset
+    else:
+      source.completionOffset("field")
   for _ in 0 ..< warmupCount:
-    let warm = completeAt(workspace, snapshot, offset, stdlib)
-    doAssert warm.state == completionAvailable and warm.items.len == memberCount
+    let warm = completeAt(workspace, snapshot, completionOffset, stdlib)
+    doAssert warm.state == completionAvailable and warm.items.len == expectedCount
   var samples: seq[float] = @[]
   var checksum = 0
+  var failures = 0
   for _ in 0 ..< sampleCount:
     let started = getMonoTime()
     for _ in 0 ..< queriesPerSample:
-      let completion = completeAt(workspace, snapshot, offset, stdlib)
-      doAssert completion.state == completionAvailable
-      inc checksum, completion.items.len
+      let completion = completeAt(workspace, snapshot, completionOffset, stdlib)
+      if completion.state != completionAvailable:
+        inc failures
+      else:
+        inc checksum, completion.items.len
     samples.add (getMonoTime() - started).inNanoseconds.float /
       (1_000_000 * queriesPerSample)
   let middle = samples.median()
   let upper = samples.percentile(0.95)
+  let deviation = samples.mad(middle)
   echo name,
     " members=",
-    memberCount,
+    expectedCount,
     " unrelated=",
     unrelatedCount,
     " median_us=",
     middle * 1_000,
     " p95_us=",
     upper * 1_000,
+    " mad_us=",
+    deviation * 1_000,
     " candidates=",
-    checksum div (sampleCount * queriesPerSample)
+    checksum div (sampleCount * queriesPerSample),
+    " failures=",
+    failures,
+    " checksum=",
+    checksum
+
+proc measureProjectMembers(
+    name: string, memberCount, unrelatedCount: int, stdlib: StdlibMap
+) =
+  measureProjectSource(
+    name,
+    projectProviderSource(memberCount),
+    "import provider\nproc measure() =\n  provider.member\n",
+    memberCount,
+    unrelatedCount,
+    stdlib,
+  )
+
+proc measureProjectObjectMembers(
+    fieldCount, unrelatedCount: int, mode: ObjectCompletionMode, stdlib: StdlibMap
+) =
+  measureProjectSource(
+    if mode == objectAnnotation:
+      "object_project_annotation"
+    else:
+      "object_project_constructor",
+    projectObjectProviderSource(fieldCount),
+    projectObjectSource(mode),
+    fieldCount,
+    unrelatedCount,
+    stdlib,
+  )
 
 proc sendMessage(input: Stream, message: JsonNode) =
   let body = $message
@@ -452,5 +512,10 @@ let stdlib = loadStdlibMap("")
 measureModuleFeature(stdlib)
 for unrelatedCount in [0, 128, 512]:
   measureProjectMembers("module_project", 256, unrelatedCount, stdlib)
+if getEnv("ONIM_BENCH_CROSS_FILE") == "1":
+  for fieldCount in [8, 64, 512]:
+    for mode in [objectAnnotation, objectConstructor]:
+      for unrelatedCount in [0, 128, 512]:
+        measureProjectObjectMembers(fieldCount, unrelatedCount, mode, stdlib)
 discard measureLsp(sourceFor(8), "  echo local")
 discard measureLsp(moduleSource("walkD"), "  filesystem.walkD")

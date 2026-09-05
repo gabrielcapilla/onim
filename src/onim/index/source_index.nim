@@ -11,6 +11,11 @@ import ../syntax/parser
 export lexer
 
 type
+  NativeIndexSafety = enum
+    nativeSafetyUncomputed
+    nativeSafetyRejected
+    nativeSafetyAccepted
+
   SourceIndex* = ref object
     contentHash*: uint64
     byteLength*: int
@@ -24,6 +29,7 @@ type
     imports*: seq[string]
     exports*: seq[string]
     includes*: seq[string]
+    nativeSafety: NativeIndexSafety
 
   IncrementalEditKind = enum
     incrementalUnsupported
@@ -117,16 +123,18 @@ proc moduleAliasesSafe(info: SourceImports): bool =
     aliases.incl key
   true
 
-proc nativeIndexSafe*(info: SourceImports, index: SourceIndex): bool =
+proc deriveNativeIndexSafety(
+    info: SourceImports, index: SourceIndex
+): NativeIndexSafety =
   if index == nil or index.includes.len > 0 or index.exports.len > 0 or
       not info.moduleAliasesSafe:
-    return false
+    return nativeSafetyRejected
   for reason in index.scopes.uncertainty:
     case reason
     of scopeNestedBlock:
       discard
     else:
-      return false
+      return nativeSafetyRejected
   for reason in index.occurrences.uncertainty:
     case reason
     of uncertaintyNestedScope, uncertaintyDeclarationOrder:
@@ -137,16 +145,28 @@ proc nativeIndexSafe*(info: SourceImports, index: SourceIndex): bool =
           continue
         if token.kind == tkPunctuation and operatorPunctuation(token.text) and
             token.text != "=":
-          return false
+          if token.text == "*" and (
+            index.types.objectFieldExportMarker(uint32(tokenIndex)) or
+            index.parsed.tokens.isExportMarker(tokenIndex)
+          ):
+            continue
+          return nativeSafetyRejected
         if token.text == "{" and tokenIndex + 1 < index.parsed.tokens.len and
             index.parsed.tokens[tokenIndex + 1].text == ".":
-          return false
+          return nativeSafetyRejected
     else:
-      return false
+      return nativeSafetyRejected
   for item in info.imports:
     if item.synthetic or item.conditional or item.excluded.len > 0:
-      return false
-  true
+      return nativeSafetyRejected
+  nativeSafetyAccepted
+
+proc initializeNativeIndexSafety*(index: SourceIndex) =
+  if index != nil:
+    index.nativeSafety = deriveNativeIndexSafety(index.parsed, index)
+
+proc nativeIndexSafe*(index: SourceIndex): bool {.inline.} =
+  index != nil and index.nativeSafety == nativeSafetyAccepted
 
 proc classifyIncrementalEdit(
     oldIndex: SourceIndex, oldSource, newSource: string
@@ -284,6 +304,7 @@ proc cloneIncrementalIndex(oldIndex: SourceIndex, source: string): SourceIndex =
   result.imports = oldIndex.imports
   result.exports = oldIndex.exports
   result.includes = oldIndex.includes
+  result.nativeSafety = oldIndex.nativeSafety
 
 proc tryIndexSourceIncremental*(
     oldSource: string, oldIndex: SourceIndex, source: string
@@ -367,3 +388,4 @@ proc indexSource*(source: string): SourceIndex {.gcsafe.} =
 
   result.imports.sort
   result.includes.sort
+  result.initializeNativeIndexSafety()

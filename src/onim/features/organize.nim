@@ -1310,7 +1310,7 @@ proc nativeImportRemovalPlan(
     owner: string,
 ): tuple[state: NativeRemovalState, plan: ImportRemovalPlan] =
   result.plan = initImportRemovalPlan(info)
-  if not info.nativeIndexSafe(index):
+  if not index.nativeIndexSafe():
     return
   for itemIndex, item in info.imports:
     let module = canonicalModule(item.module)

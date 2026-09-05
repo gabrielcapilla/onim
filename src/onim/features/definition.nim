@@ -230,9 +230,10 @@ proc qualifiedMember[T](tokens: T, tokenIndex: int): tuple[qualifier, member: in
     return
   let qualifier = tokenIndex - 2
   if tokens[qualifier].kind != tkIdentifier or
-      tokens[qualifier].line != tokens[tokenIndex].line or
-      (qualifier > 0 and tokens[qualifier - 1].text == ".") or
-      (tokenIndex + 1 < tokens.len and tokens[tokenIndex + 1].text == "."):
+      tokens[qualifier].line != tokens[tokenIndex].line or (
+    qualifier > 0 and tokens[qualifier - 1].text == "." and
+    tokens[qualifier - 1].line == tokens[qualifier].line
+  ) or (tokenIndex + 1 < tokens.len and tokens[tokenIndex + 1].text == "."):
     return
   result = (qualifier, tokenIndex)
 

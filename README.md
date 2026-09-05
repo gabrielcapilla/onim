@@ -232,3 +232,8 @@ Each result includes median, p95, MAD, result count, candidate count, and
 failures. Bootstrap time is reported separately from cache-ready requests.
 
 For LSP latency, measure both the first semantic prefetch and a cache-ready request. The first request can include Nim's initial module-graph build; subsequent requests for an unchanged or already-prefetched snapshot are served from the in-memory workspace/action cache.
+
+The completion benchmark keeps the default run bounded. Set
+`ONIM_BENCH_CROSS_FILE=1` to additionally measure qualified and constructor
+object-member completion across 8, 64, and 512 fields with 0, 128, and 512
+unrelated modules.

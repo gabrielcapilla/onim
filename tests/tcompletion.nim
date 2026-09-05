@@ -438,6 +438,117 @@ proc use() =
     check completeAt(workspace, duplicateSnapshot, duplicateOffset, stdlib).state ==
       completionUnsupported
 
+  test "completes exported fields from indexed project types":
+    let root = getTempDir() / ("onim-project-type-completion-" & $getCurrentProcessId())
+    let cacheRoot =
+      getTempDir() / ("onim-project-type-completion-cache-" & $getCurrentProcessId())
+    if dirExists(root):
+      removeDir(root)
+    if dirExists(cacheRoot):
+      removeDir(cacheRoot)
+    createDir(root)
+    let providerPath = root / "provider.nim"
+    let consumerPath = root / "consumer.nim"
+    let fromPath = root / "from_consumer.nim"
+    let ordinaryPath = root / "ordinary_consumer.nim"
+    let provider = """type
+  Person* = object
+    old*: string
+    private: int
+    age*: int
+"""
+    let consumer = """import provider as model
+proc show(value: ref model.Person; raw: ptr model.Person) =
+  value.
+  raw.ag
+proc make() =
+  let made = model.Person(old: "Ada")
+  made.ol
+"""
+    let fromConsumer = """from provider import Person
+proc show(value: Person) =
+  value.ol
+"""
+    let ordinaryConsumer = """import provider
+proc show(value: Person) =
+  value.ol
+"""
+    writeFile(providerPath, provider)
+    writeFile(consumerPath, consumer)
+    writeFile(fromPath, fromConsumer)
+    writeFile(ordinaryPath, ordinaryConsumer)
+    let previous = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
+    defer:
+      if previous.len > 0:
+        putEnv("ONIM_CACHE_DIR", previous)
+      else:
+        delEnv("ONIM_CACHE_DIR")
+      for path in [providerPath, consumerPath, fromPath, ordinaryPath]:
+        if fileExists(path):
+          removeFile(path)
+      if dirExists(root):
+        removeDir(root)
+      if dirExists(cacheRoot):
+        removeDir(cacheRoot)
+
+    let stdlib = loadStdlibMap("")
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    check workspace.graphComplete
+    let consumerId = workspace.fileIdForPath(consumerPath)
+    let consumerSnapshot = workspace.snapshotForFile(consumerId)
+    let valueOffset = consumer.find("value.") + "value.".len
+    let valueResult = completeAt(workspace, consumerSnapshot, valueOffset, stdlib)
+    check valueResult.state == completionAvailable
+    check valueResult.items.mapIt(it.label) == @["age", "old"]
+    check not valueResult.items.anyIt(it.label == "private")
+
+    let rawOffset = consumer.find("raw.ag") + "raw.ag".len
+    let rawResult = completeAt(workspace, consumerSnapshot, rawOffset, stdlib)
+    check rawResult.state == completionAvailable
+    check rawResult.items.mapIt(it.label) == @["age"]
+
+    let madeOffset = consumer.find("made.ol") + "made.ol".len
+    let madeResult = completeAt(workspace, consumerSnapshot, madeOffset, stdlib)
+    check madeResult.state == completionAvailable
+    check madeResult.items.mapIt(it.label) == @["old"]
+
+    let fromId = workspace.fileIdForPath(fromPath)
+    let fromSnapshot = workspace.snapshotForFile(fromId)
+    let fromOffset = fromConsumer.find("value.ol") + "value.ol".len
+    let fromResult = completeAt(workspace, fromSnapshot, fromOffset, stdlib)
+    check fromResult.state == completionAvailable
+    check fromResult.items.mapIt(it.label) == @["old"]
+
+    let ordinaryId = workspace.fileIdForPath(ordinaryPath)
+    let ordinarySnapshot = workspace.snapshotForFile(ordinaryId)
+    let ordinaryOffset = ordinaryConsumer.find("value.ol") + "value.ol".len
+    check completeAt(workspace, ordinarySnapshot, ordinaryOffset, stdlib).state ==
+      completionUnsupported
+
+    let reloaded = initWorkspace(root)
+    reloaded.indexWorkspace()
+    check reloaded.graphComplete
+    let reloadedId = reloaded.fileIdForPath(consumerPath)
+    let reloadedSnapshot = reloaded.snapshotForFile(reloadedId)
+    let reloadedResult = completeAt(reloaded, reloadedSnapshot, valueOffset, stdlib)
+    check reloadedResult.state == completionAvailable
+    check reloadedResult.items.mapIt(it.label) == @["age", "old"]
+
+    let overlay = """type
+  Person* = object
+    new*: string
+    private: int
+    age*: int
+"""
+    discard workspace.openDocument("file://" & providerPath, providerPath, overlay, 2)
+    let refreshed = workspace.snapshotForFile(consumerId)
+    let refreshedResult = completeAt(workspace, refreshed, valueOffset, stdlib)
+    check refreshedResult.state == completionAvailable
+    check refreshedResult.items.mapIt(it.label) == @["age", "new"]
+    check not refreshedResult.items.anyIt(it.label == "old")
+
   test "completes fields from explicit nominal object types":
     let source = """type
   Person = object

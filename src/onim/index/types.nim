@@ -3,6 +3,10 @@ import ./scopes
 import ./symbols
 
 type
+  ObjectFieldVisibility* = enum
+    objectFieldPrivate
+    objectFieldExported
+
   ObjectTypeRecord* = object
     declarationToken*: uint32
     firstField*: uint32
@@ -10,6 +14,7 @@ type
 
   ObjectField* = object
     nameToken*: uint32
+    visibility*: ObjectFieldVisibility
 
   TypeIndex* = object
     objects*: seq[ObjectTypeRecord]
@@ -63,7 +68,15 @@ proc addField(tokens: TokenStore, tokenIndex: int, fields: var seq[ObjectField])
   for field in fields:
     if sameIdentifier(tokens[int(field.nameToken)].text, token.text):
       return false
-  fields.add ObjectField(nameToken: uint32(tokenIndex))
+  fields.add ObjectField(
+    nameToken: uint32(tokenIndex),
+    visibility:
+      if tokenIndex + 1 < tokens.len and tokens[tokenIndex + 1].line == token.line and
+          tokens[tokenIndex + 1].text == "*":
+        objectFieldExported
+      else:
+        objectFieldPrivate,
+  )
   true
 
 proc parseFieldSegment(
@@ -202,16 +215,26 @@ proc nominalTypeToken(tokens: TokenStore, first, past: int): uint32 =
   if cursor < past and
       (tokens[cursor].isKeyword(kwRef) or tokens[cursor].isKeyword(kwPtr)):
     inc cursor
-  if cursor >= past or not validNameToken(tokens, cursor) or cursor + 1 != past:
+  if cursor >= past or not validNameToken(tokens, cursor):
     return InvalidTypeToken
-  uint32(cursor)
+  if cursor + 1 == past:
+    return uint32(cursor)
+  if cursor + 3 == past and tokens[cursor + 1].text == "." and
+      validNameToken(tokens, cursor + 2):
+    return uint32(cursor + 2)
+  InvalidTypeToken
 
 proc constructorTypeToken(tokens: TokenStore, first, past: int): uint32 =
-  if first >= past or not validNameToken(tokens, first) or first + 2 > past or
-      tokens[first + 1].text != "(":
+  if first >= past or not validNameToken(tokens, first):
+    return InvalidTypeToken
+  var nameToken = first
+  if first + 2 < past and tokens[first + 1].text == "." and
+      validNameToken(tokens, first + 2):
+    nameToken = first + 2
+  if nameToken + 1 >= past or tokens[nameToken + 1].text != "(":
     return InvalidTypeToken
   var delimiters: seq[char] = @[]
-  for index in first + 1 ..< past:
+  for index in nameToken + 1 ..< past:
     let text = tokens[index].text
     if text == "(" or text == "[" or text == "{":
       delimiters.add text[0]
@@ -219,9 +242,11 @@ proc constructorTypeToken(tokens: TokenStore, first, past: int): uint32 =
       if delimiters.len == 0 or not matchingDelimiter(delimiters[^1], text[0]):
         return InvalidTypeToken
       delimiters.setLen(delimiters.len - 1)
+      if delimiters.len == 0 and index + 1 != past:
+        return InvalidTypeToken
   if delimiters.len != 0:
     return InvalidTypeToken
-  uint32(first)
+  uint32(nameToken)
 
 proc typeUseFor(tokens: TokenStore, declaration: LexicalDeclaration): uint32 =
   let split = splitDeclaration(tokens, declaration)
@@ -259,6 +284,26 @@ proc objectOrdinal*(index: TypeIndex, declarationToken: uint32): int {.inline.} 
     else:
       return middle
   -1
+
+proc fieldOrdinal(index: TypeIndex, nameToken: uint32): int {.inline.} =
+  var first = 0
+  var past = index.fields.len
+  while first < past:
+    let middle = (first + past) div 2
+    let candidate = index.fields[middle].nameToken
+    if candidate < nameToken:
+      first = middle + 1
+    elif candidate > nameToken:
+      past = middle
+    else:
+      return middle
+  -1
+
+proc objectFieldExportMarker*(index: TypeIndex, tokenIndex: uint32): bool {.inline.} =
+  if tokenIndex == 0:
+    return false
+  let ordinal = index.fieldOrdinal(tokenIndex - 1'u32)
+  ordinal >= 0 and index.fields[ordinal].visibility == objectFieldExported
 
 proc objectOrdinalForType*(
     index: TypeIndex,

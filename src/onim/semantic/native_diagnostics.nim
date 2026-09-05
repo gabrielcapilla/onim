@@ -99,7 +99,7 @@ proc nativeNamesSafe(
     owner: string,
 ): bool =
   if index == nil or stdlib == nil or not stdlib.surfaceIsComplete or
-      not index.parsed.nativeIndexSafe(index):
+      not index.nativeIndexSafe():
     return false
   for item in index.parsed.imports:
     if stdlibModule(stdlib, item.module):

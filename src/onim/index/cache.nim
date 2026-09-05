@@ -343,6 +343,7 @@ proc readSourceIndex(
   result.occurrences = indexOccurrences(result.parsed, result.symbols)
   if not validateOccurrences(result.occurrences, result.parsed.tokens):
     invalidCache("cache occurrence index is invalid")
+  result.initializeNativeIndexSafety()
 
 proc cacheBaseDirectory(): string =
   let configured = getEnv("ONIM_CACHE_DIR")

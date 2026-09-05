@@ -108,9 +108,7 @@ proc resolveReferences*(
       )
     return
 
-  if not workspace.graphComplete or not source.index.parsed.nativeIndexSafe(
-    source.index
-  ):
+  if not workspace.graphComplete or not source.index.nativeIndexSafe():
     return
 
   let tokenIndex = tokenAtOffset(source.index.parsed.tokens, byteOffset)
@@ -126,7 +124,7 @@ proc resolveReferences*(
       targetView.id.value != source.id.value or
       targetView.contentGeneration.value != result.target.contentGeneration.value or
       result.target.nameToken >= uint32(targetView.index.parsed.tokens.len) or
-      not targetView.index.parsed.nativeIndexSafe(targetView.index):
+      not targetView.index.nativeIndexSafe():
     return
   let targetSymbolIndex = targetView.index.symbols.symbolToken(result.target.nameToken)
   if targetSymbolIndex < 0 or not targetView.index.symbols[targetSymbolIndex].exported:
@@ -156,7 +154,7 @@ proc resolveReferences*(
   for fileId in candidateFiles:
     let view = workspace.indexViewForFile(fileId)
     if not view.valid or view.index == nil or view.id.value != source.id.value or
-        not view.index.parsed.nativeIndexSafe(view.index):
+        not view.index.nativeIndexSafe():
       result.resetResult()
       return
     if not view.index.occurrences.hasUsage(view.index.parsed.tokens, targetName):
@@ -165,8 +163,7 @@ proc resolveReferences*(
     let candidate = workspace.snapshotForFile(fileId)
     if not candidate.valid or candidate.id.value != source.id.value or
         candidate.contentGeneration.value != view.contentGeneration.value or
-        candidate.index == nil or
-        not candidate.index.parsed.nativeIndexSafe(candidate.index):
+        candidate.index == nil or not candidate.index.nativeIndexSafe():
       result.resetResult()
       return
     let targetKey = identifierKey(targetName)
