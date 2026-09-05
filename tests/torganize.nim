@@ -1,6 +1,7 @@
 import std/[os, strutils, unittest]
 
 import onim/features/organize
+import onim/index/cache
 import onim/index/occurrences
 import onim/index/source_index
 import onim/index/surfaces
@@ -132,6 +133,113 @@ suite "organize imports":
       tryOrganizeSourceWithIndex("/no/such/file.nim", source, index, loadStdlibMap(""))
     check attempt.handled
     check attempt.edits.len == 0
+
+  test "handles plain stdlib aliases natively":
+    for source in [
+      "import std/os as fs\n\nproc main() =\n  discard fs.walkDir(\"/tmp\")\n",
+      "import std/os as file_system\n\nproc main() =\n  discard fileSystem.walkDir(\"/tmp\")\n",
+      "import std/os as fs\n\nproc main() =\n  discard walkDir(\"/tmp\")\n",
+      "import std/os as fs\n\nproc main() =\n  discard fs.walkDir(\"/tmp\").path\n",
+      "import std/os as fs, std/strformat as format_tools\n\nproc main() =\n  discard fs.walkDir(\"/tmp\")\n  discard format_tools.fmt(\"hi\")\n",
+    ]:
+      let attempt = tryOrganizeSourceWithIndex(
+        "/no/such/file.nim", source, indexSource(source), loadStdlibMap("")
+      )
+      check attempt.handled
+      check attempt.edits.len == 0
+
+  test "removes an unused aliased module natively":
+    let source = "import std/os as fs\n\nproc main() =\n  discard\n"
+    let attempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim", source, indexSource(source), loadStdlibMap("")
+    )
+    check attempt.handled
+    check applyEdits(source, attempt.edits) == "proc main() =\n  discard\n"
+
+  test "keeps an aliased project module natively":
+    let source = "import provider as data_provider\n\ndata_provider.provided()\n"
+    let project = buildSurfaceIndex(
+      @[projectSurfaceInput("provider", indexSource("proc provided*() = discard\n"))],
+      universeComplete = true,
+    )
+    let attempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim",
+      source,
+      indexSource(source),
+      loadStdlibMap(""),
+      defaultOrganizeOptions(),
+      project,
+      nil,
+      "",
+    )
+    check attempt.handled
+    check attempt.edits.len == 0
+
+  test "falls back for ambiguous or unsupported aliases":
+    for source in [
+      "import std/os as fs, std/strformat as f_s\n\ndiscard fs.walkDir(\"/tmp\")\n",
+      "when defined(posix):\n  import std/os as fs\n\ndiscard fs.walkDir(\"/tmp\")\n",
+      "import std/os as fs except walkDir\n\ndiscard fs.walkDir(\"/tmp\")\n",
+    ]:
+      let attempt = tryOrganizeSourceWithIndex(
+        "/no/such/file.nim", source, indexSource(source), loadStdlibMap("")
+      )
+      check not attempt.handled
+      check attempt.edits.len == 0
+
+  test "does not treat a local alias shadow as module use":
+    let source = "import std/os as fs\n\nproc main(fs: int) =\n  discard fs\n"
+    let attempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim", source, indexSource(source), loadStdlibMap("")
+    )
+    check attempt.handled
+    check applyEdits(source, attempt.edits) == "proc main(fs: int) =\n  discard fs\n"
+
+  test "keeps alias organization identical after source index cache reload":
+    let root = getTempDir() / ("onim-alias-cache-project-" & $getCurrentProcessId())
+    let cacheRoot = getTempDir() / ("onim-alias-cache-" & $getCurrentProcessId())
+    createDir(root)
+    let filePath = root / "alias.nim"
+    let source = "import std/os as fs\n\necho fmt(\"hi\")\n"
+    let previousCacheRoot = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
+    let cachePath = cacheFilePath(root, filePath)
+    let modulesPath = splitFile(cachePath).dir
+    let projectPath = parentDir(modulesPath)
+    let versionPath = parentDir(projectPath)
+    defer:
+      if previousCacheRoot.len > 0:
+        putEnv("ONIM_CACHE_DIR", previousCacheRoot)
+      else:
+        delEnv("ONIM_CACHE_DIR")
+      if fileExists(cachePath):
+        removeFile(cachePath)
+      if dirExists(modulesPath):
+        removeDir(modulesPath)
+      if dirExists(projectPath):
+        removeDir(projectPath)
+      if dirExists(versionPath):
+        removeDir(versionPath)
+      if dirExists(cacheRoot):
+        removeDir(cacheRoot)
+      if dirExists(root):
+        removeDir(root)
+
+    let stdlib = loadStdlibMap("")
+    let directIndex = indexSource(source)
+    let direct = tryOrganizeSourceWithIndex(filePath, source, directIndex, stdlib)
+    check direct.handled
+    check saveCachedSourceIndex(root, filePath, source, directIndex)
+    let cachedIndex = loadCachedSourceIndex(root, filePath, source)
+    check cachedIndex != nil
+    let cached = tryOrganizeSourceWithIndex(filePath, source, cachedIndex, stdlib)
+    check cached.handled == direct.handled
+    check applyEdits(source, cached.edits) == applyEdits(source, direct.edits)
+    let organized = applyEdits(source, direct.edits)
+    let second =
+      tryOrganizeSourceWithIndex(filePath, organized, indexSource(organized), stdlib)
+    check second.handled
+    check second.edits.len == 0
 
   test "falls back when a local declaration can shadow an indexed stdlib name":
     let source = "proc walkDir() = discard\n" & "proc main() =\n" & "  walkDir()\n"

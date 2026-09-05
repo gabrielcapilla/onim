@@ -66,9 +66,7 @@ proc providesUnqualified(
     return true
   for item in info.imports:
     if item.synthetic or item.conditional or item.form != importModule or
-        item.alias.len > 0:
-      continue
-    if item.excluded.len > 0:
+        item.excluded.len > 0:
       continue
     if stdlibModule(stdlib, item.module):
       for candidate in stdlib.candidatesFor(name, "", -1):
@@ -212,7 +210,8 @@ proc nativeMissingDiagnostics(
       continue
     let qualifier = index.parsed.tokens[qualifierIndex]
     let member = index.parsed.tokens[memberIndex]
-    if localName(index.parsed, qualifier.text) or
+    let binding = index.resolveBinding(qualified.qualifierToken)
+    if binding.state != bindingUnknown or localName(index.parsed, qualifier.text) or
         index.parsed.providesQualifier(qualifier.text):
       continue
     let resolved = stdlib.resolveUniqueCandidate(member.text, qualifier.text, -1)

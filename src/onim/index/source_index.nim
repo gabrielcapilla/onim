@@ -88,8 +88,36 @@ proc ordinaryReference(index: SourceIndex, tokenIndex: int): bool =
 proc includeReference(index: SourceIndex, tokenIndex: int): bool =
   tokenIndex > 0 and index.parsed.tokens[tokenIndex - 1].isKeyword(kwInclude)
 
+proc moduleAliasesSafe(info: SourceImports): bool =
+  var aliases = initHashSet[string]()
+  var hasAlias = false
+  for item in info.imports:
+    if item.alias.len == 0:
+      continue
+    hasAlias = true
+    if item.form != importModule or item.synthetic or item.conditional or
+        item.excluded.len > 0 or isNimKeyword(item.alias) or
+        identifierKey(item.alias).len == 0:
+      return false
+  if not hasAlias:
+    return true
+  for item in info.imports:
+    if item.synthetic or item.conditional or item.form != importModule:
+      continue
+    let qualifier =
+      if item.alias.len > 0:
+        item.alias
+      else:
+        moduleLeaf(item.module)
+    let key = identifierKey(qualifier)
+    if key.len == 0 or key in aliases:
+      return false
+    aliases.incl key
+  true
+
 proc nativeIndexSafe*(info: SourceImports, index: SourceIndex): bool =
-  if index == nil or index.includes.len > 0 or index.exports.len > 0:
+  if index == nil or index.includes.len > 0 or index.exports.len > 0 or
+      not info.moduleAliasesSafe:
     return false
   for reason in index.scopes.uncertainty:
     case reason
@@ -114,7 +142,7 @@ proc nativeIndexSafe*(info: SourceImports, index: SourceIndex): bool =
     else:
       return false
   for item in info.imports:
-    if item.synthetic or item.conditional or item.alias.len > 0 or item.excluded.len > 0:
+    if item.synthetic or item.conditional or item.excluded.len > 0:
       return false
   true
 

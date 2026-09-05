@@ -26,6 +26,16 @@ proc readResponse(output: Stream, id: int): JsonNode =
     if message.hasKey("id") and message["id"].kind == JInt and message["id"].getInt == id:
       return message
 
+proc readDiagnostics(output: Stream, uri: string): JsonNode =
+  while true:
+    let message = readMessage(output)
+    if message == nil:
+      return
+    if message.hasKey("method") and
+        message["method"].getStr == "textDocument/publishDiagnostics" and
+        message["params"]["uri"].getStr == uri:
+      return message
+
 suite "stdio LSP":
   test "returns organize-imports workspace edit":
     let root = currentSourcePath().parentDir.parentDir
@@ -122,6 +132,42 @@ suite "stdio LSP":
     check cachedActions["result"][0]["edit"]["changes"][uri][0]["newText"].getStr.contains(
       "import std/os"
     )
+
+    let aliasUri = "file:///tmp/onim-alias-action.nim"
+    let aliasText = "import std/os as fs\n\nproc main() =\n  discard\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument":
+            {"uri": aliasUri, "languageId": "nim", "version": 1, "text": aliasText}
+        },
+      },
+    )
+    let aliasDiagnostics = readDiagnostics(process.outputStream, aliasUri)
+    check aliasDiagnostics != nil
+    check aliasDiagnostics["params"]["diagnostics"].len == 0
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 18,
+        "method": "textDocument/codeAction",
+        "params": {
+          "textDocument": {"uri": aliasUri},
+          "context": {"only": ["source.organizeImports"]},
+        },
+      },
+    )
+    let aliasAction = readResponse(process.outputStream, 18)
+    check aliasAction != nil
+    check aliasAction["result"].kind == JArray
+    check aliasAction["result"].len == 1
+    check aliasAction["result"][0]["edit"]["changes"][aliasUri].len == 1
+    check aliasAction["result"][0]["edit"]["changes"][aliasUri][0]["newText"].getStr ==
+      ""
 
     let definitionUri = "file:///tmp/onim-definition.nim"
     let definitionText = "let smile = \"😀\"\nproc helper*() = discard\nhelper()\n"

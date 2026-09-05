@@ -427,10 +427,16 @@ proc providesName*(imports: SourceImports, name: string): bool =
   name in imports.availableNames
 
 proc providesQualifier*(imports: SourceImports, qualifier: string): bool =
-  if qualifier in imports.qualifiedNames:
-    return true
+  for known in imports.qualifiedNames:
+    if sameIdentifier(known, qualifier):
+      return true
   for item in imports.imports:
-    if item.form == importModule and not item.conditional and item.alias.len == 0:
-      if moduleLeaf(item.module) == qualifier:
+    if item.form == importModule and not item.conditional:
+      let known =
+        if item.alias.len > 0:
+          item.alias
+        else:
+          moduleLeaf(item.module)
+      if sameIdentifier(known, qualifier):
         return true
   false

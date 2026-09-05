@@ -1,5 +1,6 @@
 import std/[algorithm, hashes, os, sets, strutils, tables]
 
+import ../index/bindings
 import ../index/occurrences
 import ../index/scopes
 import ../index/cache
@@ -1084,6 +1085,15 @@ proc nativeBinding(
 ): NativeBindingState =
   if index == nil or tokenIndex < 0 or tokenIndex >= index.parsed.tokens.len:
     return nativeUnknown
+  if index.bindingsReady:
+    let binding = index.resolveBinding(uint32(tokenIndex))
+    case binding.state
+    of bindingResolved:
+      return nativeBound
+    of bindingAmbiguous:
+      return nativeUnknown
+    of bindingUnknown:
+      discard
   var found = false
   for symbol in index.symbols:
     let symbolIndex = int(symbol.nameToken)
@@ -1155,6 +1165,29 @@ proc nativeUnqualifiedUse(stdlib: StdlibMap, name, module: string): NativeModule
       nativeModuleUseFound
     else:
       nativeModuleUseNone
+
+proc nativeImplicitEquivalent(
+    stdlib: StdlibMap, name, qualifier: string, arity: int
+): bool =
+  let candidates = stdlib.candidatesFor(name, qualifier, arity)
+  var implicitCount = 0
+  for candidate in candidates:
+    if stdlib.implicitModule(candidate.module):
+      inc implicitCount
+  if implicitCount == 0:
+    return false
+  for candidate in candidates:
+    if stdlib.implicitModule(candidate.module):
+      continue
+    var equivalent = false
+    for implicit in candidates:
+      if stdlib.implicitModule(implicit.module) and candidate.kind == implicit.kind and
+          candidate.arity == implicit.arity and candidate.signature == implicit.signature:
+        equivalent = true
+        break
+    if not equivalent:
+      return false
+  true
 
 proc projectModuleResolution(
     project: SurfaceIndex, catalog: ModuleCatalog, owner, reference: string
@@ -1243,38 +1276,29 @@ proc nativeModuleUsed(
       let qualifierToken = index.parsed.tokens[qualifierIndex]
       if qualifierToken.kind == tkIdentifier and
           (qualifierIndex == 0 or index.parsed.tokens[qualifierIndex - 1].text != ".") and
-      (
-        tokenIndex + 1 >= index.parsed.tokens.len or
-        index.parsed.tokens[tokenIndex + 1].text != "."
-      ) and sameIdentifier(qualifierToken.text, qualifier):
+          sameIdentifier(qualifierToken.text, qualifier):
         let binding = nativeBinding(info, index, qualifierToken.text, qualifierIndex)
         if binding == nativeUnknown:
           return nativeModuleUseUnknown
         if binding == nativeNoBinding:
           return nativeModuleUseFound
-      if qualifierToken.kind == tkIdentifier and
-          sameIdentifier(qualifierToken.text, qualifier):
-        let binding = nativeBinding(info, index, qualifierToken.text, qualifierIndex)
-        if binding == nativeUnknown:
-          return nativeModuleUseUnknown
       continue
 
     if tokenIndex > 0 and index.parsed.tokens[tokenIndex - 1].text == "." or
         tokenIndex + 1 < index.parsed.tokens.len and
         index.parsed.tokens[tokenIndex + 1].text == ".":
       continue
-    if item.alias.len == 0:
-      let binding = nativeBinding(info, index, token.text, tokenIndex)
-      if binding == nativeUnknown:
-        return nativeModuleUseUnknown
-      if binding == nativeNoBinding:
-        let use =
-          if module.startsWith("std/"):
-            nativeUnqualifiedUse(stdlib, token.text, module)
-          else:
-            nativeProjectModuleUse(project, catalog, owner, token.text, module)
-        if use != nativeModuleUseNone:
-          return use
+    let binding = nativeBinding(info, index, token.text, tokenIndex)
+    if binding == nativeUnknown:
+      return nativeModuleUseUnknown
+    if binding == nativeNoBinding:
+      let use =
+        if module.startsWith("std/"):
+          nativeUnqualifiedUse(stdlib, token.text, module)
+        else:
+          nativeProjectModuleUse(project, catalog, owner, token.text, module)
+      if use != nativeModuleUseNone:
+        return use
   nativeModuleUseNone
 
 proc nativeImportRemovalPlan(
@@ -1392,6 +1416,10 @@ proc nativeImportAdditions(
       of candidateResolutionMissing:
         continue
       of candidateResolutionAmbiguous:
+        if stdlib.nativeImplicitEquivalent(
+          name, qualifier, callArity(info, source, tokenIndex)
+        ):
+          continue
         result.safe = false
         return
       of candidateResolutionResolved:
@@ -1421,9 +1449,10 @@ proc nativeImportAdditions(
         return
       if owner.len > 0 and sameModule(candidate.module, owner):
         continue
+    let existing = findExistingModule(info, candidate.module)
     if nativeProvidesName(info, name) or
-        (qualifier.len > 0 and info.providesQualifier(qualifier)) or
-        findExistingModule(info, candidate.module).plain >= 0:
+        (qualifier.len > 0 and info.providesQualifier(qualifier)) or existing.plain >= 0 or
+        existing.aliased >= 0:
       continue
     addUniqueModule(result.candidates, candidate, false)
 

@@ -77,6 +77,47 @@ suite "native diagnostics":
     check imported.len == 0
     check local.len == 0
 
+  test "recognizes aliased module exports for qualified and unqualified uses":
+    let qualified = nativeDiagnostics(
+      indexSource(
+        "import std/os as file_system\nproc main() =\n  discard fileSystem.walkDir(\"/tmp\")\n"
+      ),
+      loadStdlibMap(""),
+    )
+    let unqualified = nativeDiagnostics(
+      indexSource("import std/os as fs\nproc main() =\n  discard walkDir(\"/tmp\")\n"),
+      loadStdlibMap(""),
+    )
+    check qualified.len == 0
+    check unqualified.len == 0
+
+  test "keeps unrelated missing names diagnosed with an alias":
+    let diagnostics = nativeDiagnostics(
+      indexSource("import std/os as fs\nproc main() =\n  discard missingAliasName\n"),
+      loadStdlibMap(""),
+    )
+    check diagnostics.len == 1
+    check diagnostics[0].kind == nativeUndeclaredIdentifier
+    check diagnostics[0].name == "missingAliasName"
+
+  test "does not use an aliased module through a local shadow":
+    let diagnostics = nativeDiagnostics(
+      indexSource(
+        "import std/os as fs\nproc main(fs: int) =\n  discard fs.walkDir(\"/tmp\")\n"
+      ),
+      loadStdlibMap(""),
+    )
+    check diagnostics.len == 0
+
+  test "defers duplicate aliases to the compiler":
+    let diagnostics = nativeDiagnostics(
+      indexSource(
+        "import std/os as fs, std/strformat as f_s\nproc main() =\n  discard fs.walkDir(\"/tmp\")\n"
+      ),
+      loadStdlibMap(""),
+    )
+    check diagnostics.len == 0
+
   test "uses the canonical stdlib candidate for split":
     let diagnostics = nativeMissingStdlibDiagnostics(
       indexSource("proc main() =\n  discard split(\"a b\")\n"), loadStdlibMap("")

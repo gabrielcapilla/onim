@@ -1,5 +1,7 @@
 import ../syntax/lexer
 
+export lexer
+
 type
   SourceSymbolKind* = enum
     symbolProc
@@ -19,26 +21,6 @@ type
     nameToken*: uint32
     kind*: SourceSymbolKind
     exported*: bool
-
-proc identifierKey*(value: string): string =
-  ## Nim's style-insensitive identifier key for the ASCII spelling common to
-  ## source declarations. The first character retains its case; later ASCII
-  ## letters are folded and underscores are ignored.
-  if value.len == 0:
-    return
-  result = newStringOfCap(value.len)
-  result.add value[0]
-  for index in 1 ..< value.len:
-    let character = value[index]
-    if character == '_':
-      continue
-    if character >= 'A' and character <= 'Z':
-      result.add char(ord(character) + (ord('a') - ord('A')))
-    else:
-      result.add character
-
-proc sameIdentifier*(left, right: string): bool =
-  identifierKey(left) == identifierKey(right)
 
 proc normalToken(source: string, token: Token): bool =
   token.kind == tkIdentifier and token.startOffset >= 0 and
