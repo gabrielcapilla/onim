@@ -22,6 +22,7 @@ task test, "run the organize-imports regression suite":
   exec "nim c -r --path:src --hints:off --warnings:off tests/tsymbols.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/toccurrences.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/tscopes.nim"
+  exec "nim c -r --path:src --hints:off --warnings:off tests/tparser.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/tdefinition.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/treferences.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/tsurfaces.nim"

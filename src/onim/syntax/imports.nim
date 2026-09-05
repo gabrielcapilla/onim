@@ -105,7 +105,7 @@ proc conditionalImport(lines: openArray[string], token: Token): bool =
     dec line
   false
 
-proc statementEnd(tokens: seq[Token], start: int): int =
+proc statementEnd*[T](tokens: T, start: int): int =
   var index = start + 1
   var nesting = 0
   while index < tokens.len:
