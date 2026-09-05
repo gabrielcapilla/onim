@@ -1020,10 +1020,14 @@ proc indexWorkspaceImpl(workspace: Workspace): bool =
   else:
     workspace.bumpSnapshot()
   workspace.invalidateProjectSurface()
+  let directoriesChanged =
+    workspace.manifest.directories != discovered.directories or
+    not workspace.manifest.discoveryValid
   workspace.bootstrapState = workspaceBootstrapComplete
   workspace.manifest.directories = discovered.directories
   workspace.manifest.discoveryValid = true
-  workspace.persistManifest()
+  if not lazyRestored or directoriesChanged:
+    workspace.persistManifest()
   true
 
 proc indexWorkspace*(workspace: Workspace, root = "") =
