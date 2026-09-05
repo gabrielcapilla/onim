@@ -724,6 +724,122 @@ suite "stdio LSP":
     check readResponse(process.outputStream, 3)["result"].kind == JNull
     sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
 
+  test "bootstraps native cross-file rename with unopened dependents":
+    let projectRoot = currentSourcePath().parentDir.parentDir
+    let root = getTempDir() / ("onim-lsp-rename-" & $getCurrentProcessId())
+    if dirExists(root):
+      for path in walkDirRec(root):
+        if fileExists(path):
+          removeFile(path)
+      removeDir(root)
+    createDir(root)
+    let providerPath = root / "provider.nim"
+    let aliasPath = root / "alias_consumer.nim"
+    let fromPath = root / "from_consumer.nim"
+    let unusedPath = root / "unused_consumer.nim"
+    let providerSource = "proc answer*() = discard\nproc useAnswer() =\n  answer()\n"
+    let aliasSource =
+      "import provider as p\nproc useAlias() =\n  echo \"😀\"; p.answer()\n"
+    let fromSource = "from provider import answer\nproc useFrom() =\n  answer()\n"
+    let unusedSource = "from provider import answer\n"
+    writeFile(providerPath, providerSource)
+    writeFile(aliasPath, aliasSource)
+    writeFile(fromPath, fromSource)
+    writeFile(unusedPath, unusedSource)
+    let providerUri = "file://" & providerPath.replace('\\', '/')
+    let aliasUri = "file://" & aliasPath.replace('\\', '/')
+    let fromUri = "file://" & fromPath.replace('\\', '/')
+    let unusedUri = "file://" & unusedPath.replace('\\', '/')
+    let process =
+      startProcess(projectRoot / "onim", args = ["--stdio"], workingDir = projectRoot)
+    defer:
+      close process
+      for path in [providerPath, aliasPath, fromPath, unusedPath]:
+        if fileExists(path):
+          removeFile(path)
+      if dirExists(root):
+        removeDir(root)
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"rootUri": "file://" & root.replace('\\', '/')},
+      },
+    )
+    check readResponse(process.outputStream, 1) != nil
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "method": "initialized", "params": {}}
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument":
+            {"uri": aliasUri, "languageId": "nim", "version": 1, "text": aliasSource}
+        },
+      },
+    )
+    discard readMessage(process.outputStream)
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/rename",
+        "params": {
+          "textDocument": {"uri": aliasUri},
+          "position": {"line": 2, "character": 17},
+          "newName": "response",
+        },
+      },
+    )
+    let renameResult = readResponse(process.outputStream, 2)
+    check renameResult != nil
+    let changes = renameResult["result"]["changes"]
+    check changes.len == 4
+    check changes[providerUri].len == 2
+    check changes[aliasUri].len == 1
+    check changes[fromUri].len == 2
+    check changes[unusedUri].len == 1
+    check changes[providerUri][0]["range"]["start"]["character"].getInt == 5
+    check changes[providerUri][0]["range"]["end"]["character"].getInt == 11
+    check changes[providerUri][1]["range"]["start"]["character"].getInt == 2
+    check changes[providerUri][1]["range"]["end"]["character"].getInt == 8
+    check changes[aliasUri][0]["range"]["start"]["character"].getInt == 15
+    check changes[aliasUri][0]["range"]["end"]["character"].getInt == 21
+    check changes[fromUri][0]["range"]["start"]["line"].getInt == 0
+    check changes[fromUri][0]["range"]["start"]["character"].getInt == 21
+    check changes[fromUri][1]["range"]["start"]["character"].getInt == 2
+    check changes[unusedUri][0]["range"]["start"]["character"].getInt == 21
+    for uri in [providerUri, aliasUri, fromUri, unusedUri]:
+      for edit in changes[uri].items:
+        check edit["newText"].getStr == "response"
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/rename",
+        "params": {
+          "textDocument": {"uri": aliasUri},
+          "position": {"line": 2, "character": 17},
+          "newName": "response.next",
+        },
+      },
+    )
+    check readResponse(process.outputStream, 3)["result"].kind == JNull
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "id": 4, "method": "shutdown"}
+    )
+    check readResponse(process.outputStream, 4)["result"].kind == JNull
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+
   test "publishes native project-import diagnostics on first open":
     let projectRoot = currentSourcePath().parentDir.parentDir
     let root = getTempDir() / ("onim-lsp-project-diagnostic-" & $getCurrentProcessId())

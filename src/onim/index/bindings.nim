@@ -101,6 +101,17 @@ proc resolveBinding*(index: SourceIndex, tokenIndex: uint32): BindingResolution 
       return resolved(found)
     scope = index.scopes.parentScope(scope)
 
+proc inRoutineScope*(index: SourceIndex, tokenIndex: uint32): bool =
+  if index == nil or tokenIndex >= uint32(index.parsed.tokens.len):
+    return false
+  var scope = index.scopes.innermostScopeAt(tokenIndex)
+  while index.scopes.isLocalScope(scope):
+    let ordinal = int(uint32(scope)) - 1
+    if index.scopes.scopes[ordinal].kind == scopeRoutine:
+      return true
+    scope = index.scopes.parentScope(scope)
+  false
+
 proc implicitNameKind*(index: SourceIndex, tokenIndex: uint32): ImplicitNameKind =
   if index == nil or tokenIndex >= uint32(index.parsed.tokens.len):
     return implicitNone
@@ -108,13 +119,7 @@ proc implicitNameKind*(index: SourceIndex, tokenIndex: uint32): ImplicitNameKind
   if token.kind != tkIdentifier or isStropped(token) or
       identifierKey(token.text) != "result":
     return implicitNone
-  var scope = index.scopes.innermostScopeAt(tokenIndex)
-  while index.scopes.isLocalScope(scope):
-    let ordinal = int(uint32(scope)) - 1
-    if index.scopes.scopes[ordinal].kind == scopeRoutine:
-      return implicitResult
-    scope = index.scopes.parentScope(scope)
-  implicitNone
+  if index.inRoutineScope(tokenIndex): implicitResult else: implicitNone
 
 proc bindingRegionContains*(
     index: SourceIndex, declarationToken, useToken: uint32

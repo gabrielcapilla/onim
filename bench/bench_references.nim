@@ -2,6 +2,7 @@ import std/[algorithm, json, monotimes, osproc, streams, strutils, times]
 import std/os except FileId
 
 import onim/features/references
+import onim/features/rename
 import onim/index/source_index
 import onim/session/ids
 import onim/session/workspace
@@ -160,6 +161,26 @@ proc runProjectQuery(project: ProjectCase): tuple[success: bool, count: int] =
   result.count = references.matches.len
   result.success = references.supported and result.count == project.expectedMatches
 
+proc runProjectRename(
+    project: ProjectCase
+): tuple[success: bool, editedFiles: int, editedCount: int, checksum: uint64] =
+  let info =
+    resolveRename(project.workspace, project.snapshot, project.offset, "response")
+  result.editedCount = info.matches.len
+  for match in info.matches:
+    result.checksum =
+      result.checksum xor
+      (uint64(match.fileId.value) * 131'u64 + uint64(match.tokenIndex))
+  var previousFile = InvalidFileId
+  result.editedFiles = 0
+  for match in info.matches:
+    if match.fileId.value != previousFile.value:
+      inc result.editedFiles
+      previousFile = match.fileId
+  result.success =
+    info.state == renameAvailable and result.editedCount == project.expectedMatches and
+    result.editedFiles == project.candidateCount + 1
+
 proc measureProject(name: string, project: ProjectCase) =
   for _ in 0 ..< 5:
     let warm = project.runProjectQuery()
@@ -196,6 +217,53 @@ proc measureProject(name: string, project: ProjectCase) =
     project.expectedMatches,
     " candidates=",
     project.candidateCount,
+    " failures=",
+    failures,
+    " checksum=",
+    checksum
+
+proc measureProjectRename(name: string, project: ProjectCase) =
+  for _ in 0 ..< 5:
+    let warm = project.runProjectRename()
+    doAssert warm.success
+  var samples: seq[float] = @[]
+  var failures = 0
+  var checksum = 0'u64
+  var editedFiles = 0
+  var editedCount = 0
+  for _ in 0 ..< sampleCount:
+    let started = getMonoTime()
+    for _ in 0 ..< projectQueriesPerSample:
+      let value = project.runProjectRename()
+      if not value.success:
+        inc failures
+      checksum += value.checksum
+      editedFiles = value.editedFiles
+      editedCount = value.editedCount
+    samples.add (getMonoTime() - started).inNanoseconds.float /
+      (1_000_000 * projectQueriesPerSample)
+  let middle = samples.median()
+  let upper = samples.percentile(0.95)
+  var deviations: seq[float] = @[]
+  for sample in samples:
+    deviations.add abs(sample - middle)
+  echo name,
+    " samples=",
+    sampleCount,
+    " queries=",
+    projectQueriesPerSample,
+    " median_us=",
+    middle * 1_000,
+    " p95_us=",
+    upper * 1_000,
+    " mad_us=",
+    deviations.median() * 1_000,
+    " candidates=",
+    project.candidateCount,
+    " edited_files=",
+    editedFiles,
+    " edited_edits=",
+    editedCount,
     " failures=",
     failures,
     " checksum=",
@@ -386,6 +454,189 @@ proc measureStdio(name: string, project: ProjectCase) =
   discard readLspResponse(process.outputStream, 3)
   sendLspMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
 
+proc stdioRenameStats(
+    response: JsonNode, expectedFiles, expectedEdits: int
+): tuple[success: bool, editedFiles: int, editedCount: int, checksum: uint64] =
+  if response == nil or not response.hasKey("result") or
+      response["result"].kind != JObject or not response["result"].hasKey("changes") or
+      response["result"]["changes"].kind != JObject:
+    return
+  let changes = response["result"]["changes"]
+  for _, edits in changes.pairs:
+    if edits.kind != JArray:
+      return
+    inc result.editedFiles
+    for edit in edits.items:
+      if edit.kind != JObject or not edit.hasKey("range") or
+          not edit["range"].hasKey("start"):
+        return
+      inc result.editedCount
+      result.checksum =
+        result.checksum xor uint64(edit["range"]["start"]["line"].getInt + 1) * 257'u64 xor
+        uint64(edit["range"]["start"]["character"].getInt + 1)
+  result.success =
+    result.editedFiles == expectedFiles and result.editedCount == expectedEdits
+
+proc measureStdioRename(name: string, project: ProjectCase) =
+  let configuredServer = getEnv("ONIM_BIN")
+  let server =
+    if configuredServer.len > 0:
+      absolutePath(configuredServer)
+    else:
+      getCurrentDir() / "onim"
+  if not fileExists(server):
+    echo name, " unavailable=1 server=", server
+    return
+
+  let queryPath = project.root / "module_1.nim"
+  let queryUri = "file://" & queryPath.replace('\\', '/')
+  let queryText = readFile(queryPath)
+  let process = startProcess(server, args = ["--stdio"], workingDir = project.root)
+  defer:
+    close process
+
+  sendLspMessage(
+    process.inputStream,
+    %*{
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "initialize",
+      "params": {"rootUri": "file://" & project.root.replace('\\', '/')},
+    },
+  )
+  let initialized = readLspResponse(process.outputStream, 1)
+  if initialized == nil:
+    echo name, " failures=1 phase=initialize"
+    return
+  sendLspMessage(
+    process.inputStream, %*{"jsonrpc": "2.0", "method": "initialized", "params": {}}
+  )
+  sendLspMessage(
+    process.inputStream,
+    %*{
+      "jsonrpc": "2.0",
+      "method": "textDocument/didOpen",
+      "params": {
+        "textDocument":
+          {"uri": queryUri, "languageId": "nim", "version": 1, "text": queryText}
+      },
+    },
+  )
+  discard readLspMessage(process.outputStream)
+
+  let bootstrapStarted = getMonoTime()
+  sendLspMessage(
+    process.inputStream,
+    %*{
+      "jsonrpc": "2.0",
+      "id": 2,
+      "method": "textDocument/rename",
+      "params": {
+        "textDocument": {"uri": queryUri},
+        "position": {"line": 2, "character": 11},
+        "newName": "response",
+      },
+    },
+  )
+  let first = readLspResponse(process.outputStream, 2)
+  let bootstrapMilliseconds =
+    (getMonoTime() - bootstrapStarted).inNanoseconds.float / 1_000_000
+  let firstStats =
+    stdioRenameStats(first, project.candidateCount + 1, project.expectedMatches)
+  var failures = if firstStats.success: 0 else: 1
+  echo name,
+    " bootstrap_ms=", bootstrapMilliseconds, " candidates=", project.candidateCount,
+    " edited_files=", firstStats.editedFiles, " edited_edits=", firstStats.editedCount,
+    " failures=", failures
+
+  for warmup in 0 ..< 5:
+    let id = 1_000 + warmup
+    sendLspMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "textDocument/rename",
+        "params": {
+          "textDocument": {"uri": queryUri},
+          "position": {"line": 2, "character": 11},
+          "newName": "response",
+        },
+      },
+    )
+    if not stdioRenameStats(
+      readLspResponse(process.outputStream, id),
+      project.candidateCount + 1,
+      project.expectedMatches,
+    ).success:
+      inc failures
+
+  var samples: seq[float] = @[]
+  var checksum = firstStats.checksum
+  var editedFiles = firstStats.editedFiles
+  var editedCount = firstStats.editedCount
+  for sample in 0 ..< sampleCount:
+    let started = getMonoTime()
+    for query in 0 ..< projectQueriesPerSample:
+      let id = 10_000 + sample * projectQueriesPerSample + query
+      sendLspMessage(
+        process.inputStream,
+        %*{
+          "jsonrpc": "2.0",
+          "id": id,
+          "method": "textDocument/rename",
+          "params": {
+            "textDocument": {"uri": queryUri},
+            "position": {"line": 2, "character": 11},
+            "newName": "response",
+          },
+        },
+      )
+      let stats = stdioRenameStats(
+        readLspResponse(process.outputStream, id),
+        project.candidateCount + 1,
+        project.expectedMatches,
+      )
+      if not stats.success:
+        inc failures
+      checksum += stats.checksum
+      editedFiles = stats.editedFiles
+      editedCount = stats.editedCount
+    samples.add (getMonoTime() - started).inNanoseconds.float /
+      (1_000_000 * projectQueriesPerSample)
+  let middle = samples.median()
+  let upper = samples.percentile(0.95)
+  var deviations: seq[float] = @[]
+  for sample in samples:
+    deviations.add abs(sample - middle)
+  echo name,
+    " samples=",
+    sampleCount,
+    " queries=",
+    projectQueriesPerSample,
+    " median_us=",
+    middle * 1_000,
+    " p95_us=",
+    upper * 1_000,
+    " mad_us=",
+    deviations.median() * 1_000,
+    " candidates=",
+    project.candidateCount,
+    " edited_files=",
+    editedFiles,
+    " edited_edits=",
+    editedCount,
+    " failures=",
+    failures,
+    " checksum=",
+    checksum
+  sendLspMessage(
+    process.inputStream,
+    %*{"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": nil},
+  )
+  discard readLspResponse(process.outputStream, 3)
+  sendLspMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+
 let typicalText = sourceFor(2_000)
 let typical = localSnapshot(typicalText)
 discard measure("typical", typical, typicalText.find("value", 10))
@@ -427,7 +678,9 @@ block generatedReferenceBenchmarks:
     " failures=",
     if first.success: 0 else: 1
   measureProject("generated-1024-fanout-16", fanout16)
+  measureProjectRename("generated-1024-rename-fanout-16", fanout16)
   measureStdio("generated-1024-stdio", fanout16)
+  measureStdioRename("generated-1024-rename-stdio-fanout-16", fanout16)
 
   let overlayPath = root / "module_1.nim"
   let overlayText = fanout16.snapshot.text & "  module_0.answer()\n"
@@ -463,3 +716,5 @@ block generatedReferenceBenchmarks:
   generateProject(fanoutRoot, generatedModuleCount, 256, 1)
   let fanout256 = initializeProject(fanoutRoot, 256, 1)
   measureProject("generated-1024-fanout-256", fanout256)
+  measureProjectRename("generated-1024-rename-fanout-256", fanout256)
+  measureStdioRename("generated-1024-rename-stdio-fanout-256", fanout256)

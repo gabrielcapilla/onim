@@ -123,8 +123,11 @@ until the parser can represent them safely.
 
 Native hover resolves indexed local definitions, project symbols, and imported
 stdlib symbols, including `from` bindings and qualified aliases. Native rename
-currently applies only to proven same-file routine locals; ambiguous, conditional,
-top-level, and otherwise unsupported bindings return no edit instead of guessing.
+applies to proven routine locals and exported project symbols across direct
+dependents, including qualified aliases, plain `from` bindings, aliased `from`
+source names, and unused `from` imports. It returns no edit for ambiguous,
+conditional, re-exported, generated, stale, colliding, or otherwise unsupported
+bindings instead of guessing.
 
 ## Zed
 

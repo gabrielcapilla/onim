@@ -190,7 +190,7 @@ proc fromBindingState(
           not plainImported(source.text, symbol):
         result.uncertain = true
 
-proc localDeclarationShadows(
+proc localDeclarationShadows*(
     source: WorkspaceSnapshot, tokenIndex: int, name: string
 ): bool =
   if source.index == nil or not source.index.bindingsReady or tokenIndex < 0 or

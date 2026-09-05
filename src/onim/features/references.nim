@@ -29,7 +29,7 @@ proc sameTarget(left, right: DefinitionTarget): bool {.inline.} =
     left.contentGeneration.value == right.contentGeneration.value and
     left.nameToken == right.nameToken
 
-proc compareMatches(left, right: ReferenceMatch): int =
+proc compareReferenceMatches*(left, right: ReferenceMatch): int =
   result = cmp(left.fileId.value, right.fileId.value)
   if result == 0:
     result = cmp(left.tokenIndex, right.tokenIndex)
@@ -132,7 +132,6 @@ proc resolveReferences*(
   if targetSymbolIndex < 0 or not targetView.index.symbols[targetSymbolIndex].exported:
     return
   let targetName = targetView.index.parsed.tokens[int(result.target.nameToken)].text
-  let targetKey = identifierKey(targetName)
 
   var candidateFiles: seq[FileId] = @[result.target.fileId]
   for dependent in workspace.dependents(result.target.fileId):
@@ -189,5 +188,5 @@ proc resolveReferences*(
           tokenIndex: occurrence.token,
         )
 
-  result.matches.sort(compareMatches)
+  result.matches.sort(compareReferenceMatches)
   result.supported = true
