@@ -104,6 +104,16 @@ type
     line*: int
     column*: int
 
+  LexicalIssueKind* = enum
+    lexicalMalformedIdentifier
+    lexicalUnclosedString
+    lexicalUnexpectedDelimiter
+    lexicalUnclosedDelimiter
+
+  LexicalIssue* = object
+    kind*: LexicalIssueKind
+    tokenIndex*: uint32
+
 const tokenBlockLength* = 64
 
 type
@@ -420,6 +430,40 @@ proc isOpeningDelimiter*(value: char): bool {.inline.} =
 
 proc isClosingDelimiter*(value: char): bool {.inline.} =
   value in {')', ']', '}'}
+
+type LexicalDelimiter = object
+  value: char
+  tokenIndex: uint32
+
+proc lexicalIssues*(tokens: TokenStore): seq[LexicalIssue] =
+  var delimiters: seq[LexicalDelimiter] = @[]
+  for tokenIndex, token in tokens:
+    if token.kind == tkIdentifier and not validIdentifier(token):
+      result.add LexicalIssue(
+        kind: lexicalMalformedIdentifier, tokenIndex: uint32(tokenIndex)
+      )
+    elif token.kind == tkString and not isClosedString(token):
+      result.add LexicalIssue(
+        kind: lexicalUnclosedString, tokenIndex: uint32(tokenIndex)
+      )
+
+    if token.kind != tkPunctuation or token.text.len != 1:
+      continue
+    let value = token.text[0]
+    if isOpeningDelimiter(value):
+      delimiters.add LexicalDelimiter(value: value, tokenIndex: uint32(tokenIndex))
+    elif isClosingDelimiter(value):
+      if delimiters.len == 0 or not matchingDelimiter(delimiters[^1].value, value):
+        result.add LexicalIssue(
+          kind: lexicalUnexpectedDelimiter, tokenIndex: uint32(tokenIndex)
+        )
+      else:
+        delimiters.setLen(delimiters.len - 1)
+
+  for delimiter in delimiters:
+    result.add LexicalIssue(
+      kind: lexicalUnclosedDelimiter, tokenIndex: delimiter.tokenIndex
+    )
 
 proc isNimKeyword*(token: Token): bool {.inline.} =
   keywordOf(token) != kwNone

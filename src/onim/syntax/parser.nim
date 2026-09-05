@@ -109,31 +109,19 @@ proc assignParents(tree: var PartialSyntaxTree) =
     if parentIndex >= 0:
       tree.nodes[childIndex].parent = SyntaxNodeId(uint32(parentIndex + 1))
 
-proc markLexicalUncertainty(tree: var PartialSyntaxTree) =
-  var delimiters: seq[char] = @[]
-  for token in tree.tokens:
-    if token.kind == tkString:
-      if not token.isClosedString:
-        tree.uncertainty.incl parserMalformed
-      continue
-    if token.kind != tkPunctuation or token.text.len != 1:
-      continue
-    let value = token.text[0]
-    if isOpeningDelimiter(value):
-      delimiters.add value
-    elif isClosingDelimiter(value):
-      if delimiters.len == 0 or not matchingDelimiter(delimiters[^1], value):
-        tree.uncertainty.incl parserUnbalanced
-      else:
-        delimiters.setLen(delimiters.len - 1)
-  if delimiters.len > 0:
-    tree.uncertainty.incl parserUnbalanced
+proc applyLexicalUncertainty(tree: var PartialSyntaxTree) =
+  for issue in lexicalIssues(tree.tokens):
+    case issue.kind
+    of lexicalMalformedIdentifier, lexicalUnclosedString:
+      tree.uncertainty.incl parserMalformed
+    of lexicalUnexpectedDelimiter, lexicalUnclosedDelimiter:
+      tree.uncertainty.incl parserUnbalanced
 
 proc parsePartialSyntax*(source: string): PartialSyntaxTree =
   let lexed = lex(source)
   result.tokens = initTokenStore(lexed)
   result.root = result.addNode(syntaxModule, 0, result.tokens.len)
-  result.markLexicalUncertainty()
+  result.applyLexicalUncertainty()
 
   var index = 0
   while index < result.tokens.len:

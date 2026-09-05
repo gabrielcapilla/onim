@@ -24,10 +24,6 @@ type
     endOffset*: int
     module*: string
 
-  DelimiterEntry = object
-    value: char
-    tokenIndex: uint32
-
 proc nativeSyntaxDiagnostics*(index: SourceIndex): seq[NativeDiagnostic]
 
 proc localName(info: SourceImports, name: string): bool =
@@ -235,43 +231,17 @@ proc nativeSyntaxDiagnostics*(index: SourceIndex): seq[NativeDiagnostic] =
   if index == nil:
     return
 
-  var delimiters: seq[DelimiterEntry] = @[]
-  for tokenIndex, token in index.parsed.tokens:
-    if token.kind == tkIdentifier and not validIdentifier(token):
-      result.add NativeDiagnostic(
-        kind: nativeMalformedIdentifier,
-        startOffset: token.startOffset,
-        endOffset: token.endOffset,
-      )
-    elif token.kind == tkString and not isClosedString(token):
-      result.add NativeDiagnostic(
-        kind: nativeUnclosedString,
-        startOffset: token.startOffset,
-        endOffset: token.endOffset,
-      )
-
-    if token.kind != tkPunctuation or token.text.len != 1:
-      continue
-    let value = token.text[0]
-    if isOpeningDelimiter(value):
-      delimiters.add DelimiterEntry(value: value, tokenIndex: uint32(tokenIndex))
-    elif isClosingDelimiter(value):
-      if delimiters.len == 0 or not matchingDelimiter(delimiters[^1].value, value):
-        result.add NativeDiagnostic(
-          kind: nativeUnexpectedDelimiter,
-          startOffset: token.startOffset,
-          endOffset: token.endOffset,
-        )
-      else:
-        delimiters.setLen(delimiters.len - 1)
-
-  for entry in delimiters:
-    let tokenIndex = int(entry.tokenIndex)
+  for issue in lexicalIssues(index.parsed.tokens):
+    let tokenIndex = int(issue.tokenIndex)
     if tokenIndex < 0 or tokenIndex >= index.parsed.tokens.len:
       continue
     let token = index.parsed.tokens[tokenIndex]
+    let kind =
+      case issue.kind
+      of lexicalMalformedIdentifier: nativeMalformedIdentifier
+      of lexicalUnclosedString: nativeUnclosedString
+      of lexicalUnexpectedDelimiter: nativeUnexpectedDelimiter
+      of lexicalUnclosedDelimiter: nativeUnclosedDelimiter
     result.add NativeDiagnostic(
-      kind: nativeUnclosedDelimiter,
-      startOffset: token.startOffset,
-      endOffset: token.endOffset,
+      kind: kind, startOffset: token.startOffset, endOffset: token.endOffset
     )
