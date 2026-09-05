@@ -51,6 +51,7 @@ suite "stdio LSP":
     check initialized != nil
     check initialized["result"]["capabilities"]["codeActionProvider"] != nil
     check initialized["result"]["capabilities"]["definitionProvider"].getBool
+    check initialized["result"]["capabilities"]["referencesProvider"].getBool
     check initialized["result"]["capabilities"]["documentSymbolProvider"].getBool
 
     sendMessage(
@@ -191,6 +192,46 @@ suite "stdio LSP":
     check declarationDefinition != nil
     check declarationDefinition["result"]["range"]["start"]["line"].getInt == 1
     check declarationDefinition["result"]["range"]["start"]["character"].getInt == 5
+
+    let referencesUri = "file:///tmp/onim-references.nim"
+    let referencesText =
+      "proc sum(value: int) =\n  let doubled = value\n  echo doubled\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": referencesUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": referencesText,
+          }
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "textDocument/references",
+        "params": {
+          "textDocument": {"uri": referencesUri},
+          "position": {"line": 1, "character": 16},
+          "context": {"includeDeclaration": true},
+        },
+      },
+    )
+    let referencesResult = readResponse(process.outputStream, 11)
+    check referencesResult != nil
+    check referencesResult["result"].kind == JArray
+    check referencesResult["result"].len == 2
+    check referencesResult["result"][0]["range"]["start"]["line"].getInt == 0
+    check referencesResult["result"][0]["range"]["start"]["character"].getInt == 9
+    check referencesResult["result"][1]["range"]["start"]["line"].getInt == 1
+    check referencesResult["result"][1]["range"]["start"]["character"].getInt == 16
 
     let providerUri = "file:///tmp/onim-provider/provider.nim"
     let consumerUri = "file:///tmp/onim-provider/consumer.nim"

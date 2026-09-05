@@ -367,7 +367,8 @@ proc locals[T](
     if token.kind == tkIdentifier and not isStropped(token) and isBlockKeyword(token):
       result.uncertainty.incl scopeNestedBlock
     if tokens[index].line > tokens[bounds.first].line and
-        tokens[index].column > bounds.baseColumn:
+        tokens[index].column > bounds.baseColumn and
+        (index == bounds.first or tokens[index].line != tokens[index - 1].line):
       result.uncertainty.incl scopeNestedBlock
     inc index
 

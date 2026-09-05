@@ -79,21 +79,9 @@ proc locateIncrementalEdit(oldSource, newSource: string): IncrementalEdit =
   result.startOffset = start
   result.oldEndOffset = oldEnd
 
-proc occurrenceRoles(index: SourceIndex, tokenIndex: int): set[OccurrenceRole] =
-  var first = 0
-  var past = index.occurrences.identifiers.len
-  while first < past:
-    let middle = (first + past) div 2
-    let candidate = int(index.occurrences.identifiers[middle].token)
-    if candidate < tokenIndex:
-      first = middle + 1
-    elif candidate > tokenIndex:
-      past = middle
-    else:
-      return index.occurrences.identifiers[middle].roles
-
 proc ordinaryReference(index: SourceIndex, tokenIndex: int): bool =
-  index != nil and index.occurrenceRoles(tokenIndex) == {occurrenceReference}
+  index != nil and
+    index.occurrences.rolesForToken(uint32(tokenIndex)) == {occurrenceReference}
 
 proc includeReference(index: SourceIndex, tokenIndex: int): bool =
   tokenIndex > 0 and index.parsed.tokens[tokenIndex - 1].isKeyword(kwInclude)
@@ -203,7 +191,7 @@ proc patchUsage(
 ): bool =
   if oldKey == newKey:
     return true
-  let roles = oldIndex.occurrenceRoles(tokenIndex)
+  let roles = oldIndex.occurrences.rolesForToken(uint32(tokenIndex))
   if roles == {}:
     return false
 

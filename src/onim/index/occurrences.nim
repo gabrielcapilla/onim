@@ -187,6 +187,19 @@ proc sortUsage*[T](index: var OccurrenceIndex, tokens: T) =
       )
   )
 
+proc rolesForToken*(index: OccurrenceIndex, token: uint32): set[OccurrenceRole] =
+  var first = 0
+  var past = index.identifiers.len
+  while first < past:
+    let middle = (first + past) div 2
+    let candidate = index.identifiers[middle].token
+    if candidate < token:
+      first = middle + 1
+    elif candidate > token:
+      past = middle
+    else:
+      return index.identifiers[middle].roles
+
 proc indexOccurrences*(
     parsed: SourceImports, symbols: openArray[SourceSymbol]
 ): OccurrenceIndex =

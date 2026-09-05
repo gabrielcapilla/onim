@@ -2,6 +2,7 @@ import std/[json, streams, strutils, uri]
 
 import ../features/definition
 import ../features/organize
+import ../features/references
 import ../semantic/native_diagnostics
 import ../semantic/worker
 import ../session/bootstrap_worker
@@ -436,6 +437,57 @@ proc definitionResponse(
     definitionLocation(snapshot, uriText, view, resolution.target, positions)
   if result.value == nil:
     result.value = newJNull()
+
+proc referenceLocation(
+    uri: string, source: WorkspaceSnapshot, token: Token, positions: PositionIndex
+): JsonNode =
+  if token.startOffset < 0 or token.endOffset < token.startOffset or
+      token.endOffset > source.text.len:
+    return
+  %*{
+    "uri": uri,
+    "range": {
+      "start": positionAt(positions, source.text, token.startOffset),
+      "end": positionAt(positions, source.text, token.endOffset),
+    },
+  }
+
+proc referencesResponse(params: JsonNode, workspace: Workspace): JsonNode =
+  result = newJNull()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let snapshot = workspace.snapshotForDocument(uriText, path)
+  if not snapshot.valid:
+    return
+  let positions = initPositionIndex(snapshot.text)
+  let offset = offsetAt(positions, snapshot.text, valueOrEmpty(params, "position"))
+  let context = valueOrEmpty(params, "context")
+  let includeDeclaration =
+    context.kind == JObject and context.hasKey("includeDeclaration") and
+    context["includeDeclaration"].kind == JBool and context["includeDeclaration"].getBool
+  let references =
+    resolveSameFileReferences(workspace, snapshot, offset, includeDeclaration)
+  if not references.supported:
+    return
+  result = newJArray()
+  for tokenIndex in references.tokens:
+    if tokenIndex >= uint32(snapshot.index.parsed.tokens.len):
+      result = newJNull()
+      return
+    let location = referenceLocation(
+      uriText, snapshot, snapshot.index.parsed.tokens[int(tokenIndex)], positions
+    )
+    if location == nil:
+      result = newJNull()
+      return
+    result.add location
 
 proc documentSymbolKind(kind: SourceSymbolKind): int =
   case kind
@@ -947,6 +999,7 @@ proc runLsp*() =
       capabilities["textDocumentSync"] = sync
       capabilities["codeActionProvider"] = provider
       capabilities["definitionProvider"] = %true
+      capabilities["referencesProvider"] = %true
       capabilities["documentSymbolProvider"] = %true
       capabilities["positionEncoding"] = %"utf-16"
       var result = newJObject()
@@ -1046,6 +1099,9 @@ proc runLsp*() =
             sendResponse(id, response.value)
         else:
           sendResponse(id, response.value)
+    of "textDocument/references":
+      if hasId:
+        sendResponse(id, referencesResponse(params, workspace))
     of "textDocument/documentSymbol":
       if hasId:
         sendResponse(id, documentSymbols(params, workspace))

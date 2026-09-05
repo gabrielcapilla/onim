@@ -1,6 +1,8 @@
 import std/strutils
 
+import ../index/occurrences
 import ../index/source_index
+import ../index/scopes
 import ../index/symbols
 import ../session/ids
 import ../session/workspace
@@ -31,6 +33,98 @@ proc validSource(source: WorkspaceSnapshot): bool =
   source.valid and source.index != nil and
     source.index.contentHash == contentFingerprint(source.text) and
     source.index.byteLength == source.text.len
+
+proc localResolutionReady(source: WorkspaceSnapshot): bool =
+  if not validSource(source) or not source.index.scopes.isComplete:
+    return false
+  for reason in source.index.occurrences.uncertainty:
+    case reason
+    of uncertaintyNestedScope, uncertaintyDeclarationOrder:
+      discard
+    of uncertaintyUnsupportedSyntax:
+      for tokenIndex, token in source.index.parsed.tokens:
+        if token.kind == tkPunctuation and operatorPunctuation(token.text):
+          continue
+        if token.text == "{" and tokenIndex + 1 < source.index.parsed.tokens.len and
+            source.index.parsed.tokens[tokenIndex + 1].text == ".":
+          return false
+    else:
+      return false
+  true
+
+proc routineScopeOrdinal(index: ScopeIndex, scope: ScopeId): int {.inline.} =
+  let ordinal = int(uint32(scope)) - 1
+  if ordinal >= 0 and ordinal < index.scopes.len and
+      index.scopes[ordinal].kind == scopeRoutine: ordinal else: -1
+
+proc localDeclarationIndex(source: WorkspaceSnapshot, tokenIndex: int): int =
+  if not localResolutionReady(source) or tokenIndex < 0:
+    return -1
+  for declarationIndex, declaration in source.index.scopes.declarations:
+    if int(declaration.nameToken) != tokenIndex:
+      continue
+    if source.index.scopes.routineScopeOrdinal(declaration.scope) >= 0:
+      return declarationIndex
+  -1
+
+proc localDeclarationForUse(source: WorkspaceSnapshot, tokenIndex: int): int =
+  if not localResolutionReady(source) or tokenIndex < 0 or
+      tokenIndex >= source.index.parsed.tokens.len:
+    return -1
+  let scope = source.index.scopes.innermostScopeAt(uint32(tokenIndex))
+  if source.index.scopes.routineScopeOrdinal(scope) < 0:
+    return -1
+  let wanted = identifierKey(source.index.parsed.tokens[tokenIndex].text)
+  if wanted.len == 0:
+    return -1
+  var found = -1
+  for declarationIndex, declaration in source.index.scopes.declarations:
+    if declaration.scope != scope or int(declaration.nameToken) >= tokenIndex:
+      continue
+    let nameIndex = int(declaration.nameToken)
+    if nameIndex < 0 or nameIndex >= source.index.parsed.tokens.len or
+        identifierKey(source.index.parsed.tokens[nameIndex].text) != wanted:
+      continue
+    if found >= 0:
+      return -2
+    found = declarationIndex
+  found
+
+proc localTarget(
+    source: WorkspaceSnapshot, declarationIndex: int
+): DefinitionResolution =
+  if declarationIndex < 0 or declarationIndex >= source.index.scopes.declarations.len:
+    return unknownResolution()
+  let declaration = source.index.scopes.declarations[declarationIndex]
+  if source.index.scopes.routineScopeOrdinal(declaration.scope) < 0 or
+      int(declaration.nameToken) >= source.index.parsed.tokens.len:
+    return unknownResolution()
+  result.kind = definitionResolved
+  result.target = DefinitionTarget(
+    snapshotId: source.id,
+    fileId: source.fileId,
+    contentGeneration: source.contentGeneration,
+    nameToken: declaration.nameToken,
+  )
+
+proc resolveLocalDefinitionAtToken*(
+    source: WorkspaceSnapshot, tokenIndex: int
+): DefinitionResolution =
+  result = unknownResolution()
+  if not localResolutionReady(source) or tokenIndex < 0 or
+      tokenIndex >= source.index.parsed.tokens.len:
+    return
+  let token = source.index.parsed.tokens[tokenIndex]
+  if token.kind != tkIdentifier or source.index.parsed.tokenInsideImport(token):
+    return
+  let declarationIndex = localDeclarationIndex(source, tokenIndex)
+  if declarationIndex >= 0:
+    return localTarget(source, declarationIndex)
+  let useIndex = localDeclarationForUse(source, tokenIndex)
+  if useIndex == -2:
+    return unknownResolution(definitionAmbiguous)
+  if useIndex >= 0:
+    return localTarget(source, useIndex)
 
 proc symbolMatches(index: SourceIndex, name: string, exportedOnly = false): seq[int] =
   if index == nil:
