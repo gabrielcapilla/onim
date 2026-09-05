@@ -41,3 +41,5 @@ task bench, "measure organize-imports and workspace-index latency":
   exec "bench/bench_incremental"
   exec "nim c --path:src --hints:off --warnings:off bench/bench_workspace.nim"
   exec "bench/bench_workspace"
+  exec "nim c --path:src --hints:off --warnings:off bench/bench_surface.nim"
+  exec "bench/bench_surface"
