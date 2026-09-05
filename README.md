@@ -103,6 +103,11 @@ Their names, kinds, and UTF-16 selection ranges are available without invoking
 the compiler; declarations outside the conservative native index are omitted
 until the parser can represent them safely.
 
+Native hover resolves indexed local definitions, project symbols, and imported
+stdlib symbols, including `from` bindings and qualified aliases. Native rename
+currently applies only to proven same-file routine locals; ambiguous, conditional,
+top-level, and otherwise unsupported bindings return no edit instead of guessing.
+
 ## Zed
 
 Put `onim` on `PATH`, or expose the executable as an `onim` language-server entry in the Nim language extension. Keep the existing Nim server if desired; onim only contributes the organize-imports action. Add the following to the corresponding parts of `~/.config/zed/settings.json`:
