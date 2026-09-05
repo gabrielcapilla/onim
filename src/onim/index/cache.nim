@@ -2,6 +2,7 @@ import std/[algorithm, os, sets, streams, times]
 
 import ../syntax/imports
 import ../syntax/lexer
+import ../syntax/parser
 import ./source_index
 import ./occurrences
 import ./scopes
@@ -323,7 +324,12 @@ proc readSourceIndex(
     validateSourceSymbol(symbol, result.parsed.tokens, previousToken)
     result.symbols.add symbol
     previousToken = symbol.nameToken
-  result.scopes = indexScopes(result.parsed.tokens, result.symbols, result.byteLength)
+  result.syntax = parsePartialSyntax(result.parsed.tokens)
+  if not result.syntax.validateSyntaxTree or
+      not result.syntax.importsMatch(result.parsed):
+    invalidCache("cache syntax tree is invalid")
+  result.scopes =
+    indexScopes(result.parsed.tokens, result.symbols, result.byteLength, result.syntax)
   if not validateScopes(
     result.scopes, result.parsed.tokens, result.symbols, result.byteLength
   ):

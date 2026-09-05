@@ -20,6 +20,19 @@ suite "native rename":
     check info.state == renameAvailable
     check info.tokens.len == 2
 
+  test "renames the parent binding without changing a block shadow":
+    let info = renameFor(
+      """proc show(value: int) =
+  block:
+    let value = 1
+    echo value
+  echo value
+""",
+      "value", "item",
+    )
+    check info.state == renameAvailable
+    check info.tokens.len == 2
+
   test "rejects invalid names and unsupported top-level bindings":
     check renameFor("proc sum(value: int) =\n  echo value\n", "value", "when").state ==
       renameUnavailable

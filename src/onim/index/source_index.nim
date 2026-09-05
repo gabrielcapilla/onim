@@ -311,7 +311,8 @@ proc indexSource*(source: string): SourceIndex {.gcsafe.} =
   result.syntax = parsePartialSyntax(result.parsed.tokens)
   result.tokenCount = result.parsed.tokens.len
   result.symbols = indexSymbols(source, result.parsed.tokens)
-  result.scopes = indexScopes(result.parsed.tokens, result.symbols, result.byteLength)
+  result.scopes =
+    indexScopes(result.parsed.tokens, result.symbols, result.byteLength, result.syntax)
   result.occurrences = indexOccurrences(result.parsed, result.symbols)
 
   for item in result.parsed.imports:

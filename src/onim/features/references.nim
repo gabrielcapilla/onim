@@ -1,6 +1,6 @@
 import ./definition
+import ../index/bindings
 import ../index/occurrences
-import ../index/scopes
 import ../index/symbols
 import ../session/ids
 import ../session/workspace
@@ -9,10 +9,6 @@ import ../syntax/lexer
 type SameFileReferences* = object
   supported*: bool
   tokens*: seq[uint32]
-
-proc sameScope(source: WorkspaceSnapshot, left, right: uint32): bool {.inline.} =
-  source.index.scopes.innermostScopeAt(left) ==
-    source.index.scopes.innermostScopeAt(right)
 
 proc resolveSameFileReferences*(
     workspace: Workspace,
@@ -35,23 +31,23 @@ proc resolveSameFileReferences*(
     if occurrenceReference notin roles or occurrenceMember in roles:
       return
 
-  let targetScope = source.index.scopes.innermostScopeAt(selected.target.nameToken)
-  if targetScope == InvalidScopeId or
-      localTargetHasCompetingDeclaration(source, selected.target):
-    return
   result.supported = true
   if includeDeclaration:
     result.tokens.add selected.target.nameToken
 
-  let wanted = source.index.parsed.tokens[tokenIndex].text
+  let wanted =
+    identifierKey(source.index.parsed.tokens[int(selected.target.nameToken)].text)
   for occurrence in source.index.occurrences.identifiers:
     let occurrenceIndex = int(occurrence.token)
     if occurrenceIndex == int(selected.target.nameToken) or
-        not sameIdentifier(source.index.parsed.tokens[occurrenceIndex].text, wanted) or
-        not sameScope(source, selected.target.nameToken, occurrence.token) or
+        identifierKey(source.index.parsed.tokens[occurrenceIndex].text) != wanted or
         occurrenceMember in occurrence.roles:
       continue
-    if occurrenceIndex < int(selected.target.nameToken):
+    let binding = source.index.resolveBinding(occurrence.token)
+    if binding.state == bindingResolved and
+        binding.declarationToken == selected.target.nameToken:
+      result.tokens.add occurrence.token
+    elif binding.state != bindingResolved and
+        source.index.bindingRegionContains(selected.target.nameToken, occurrence.token):
       result = SameFileReferences()
       return
-    result.tokens.add occurrence.token

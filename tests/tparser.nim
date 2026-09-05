@@ -58,6 +58,23 @@ proc main(value: int) =
     check parserUnbalanced in unbalanced.uncertainty
     check not unbalanced.isComplete
 
+  test "records unnamed block containers":
+    let tree = parsePartialSyntax(
+      """proc main() =
+  block:
+    let value = 1
+    echo value
+  echo value
+"""
+    )
+    check tree.validateSyntaxTree
+    check countNodes(tree, syntaxBlock) == 1
+    check childOf(tree, syntaxBlock, syntaxDeclaration)
+
+    let named = parsePartialSyntax("proc main() =\n  block label:\n    discard\n")
+    check countNodes(named, syntaxBlock) == 0
+    check parserUnsupportedStructure in named.uncertainty
+
   test "matches every checked-in import fixture":
     let root = currentSourcePath().parentDir.parentDir / "tests" / "before"
     for path in walkDirRec(root):

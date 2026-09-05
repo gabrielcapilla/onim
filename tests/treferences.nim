@@ -101,6 +101,28 @@ proc second(value: int) =
     check references.tokens ==
       @[tokenAt(text, snapshot, offsets[0]), tokenAt(text, snapshot, offsets[1])]
 
+  test "resolves nested block shadowing by binding identity":
+    let text = """proc show(value: int) =
+  block:
+    let value = 1
+    echo value
+  echo value
+"""
+    let snapshot = snapshotFor(text)
+    let offsets = text.referenceOffsets("value")
+    let parentReferences = resolveSameFileReferences(
+      initWorkspace(), snapshot, offsets[3], includeDeclaration = true
+    )
+    check parentReferences.supported
+    check parentReferences.tokens ==
+      @[tokenAt(text, snapshot, offsets[0]), tokenAt(text, snapshot, offsets[3])]
+    let innerReferences = resolveSameFileReferences(
+      initWorkspace(), snapshot, offsets[2], includeDeclaration = true
+    )
+    check innerReferences.supported
+    check innerReferences.tokens ==
+      @[tokenAt(text, snapshot, offsets[1]), tokenAt(text, snapshot, offsets[2])]
+
   test "supports unused locals and optional declarations":
     let text = """proc unused() =
   let value = 1

@@ -9,6 +9,7 @@ type
     syntaxImport
     syntaxFromImport
     syntaxWhen
+    syntaxBlock
     syntaxInclude
     syntaxExport
     syntaxDeclaration
@@ -34,6 +35,8 @@ type
     uncertainty*: set[ParserUncertainty]
 
 const InvalidSyntaxNodeId* = SyntaxNodeId(0)
+
+proc `==`*(left, right: SyntaxNodeId): bool {.borrow.}
 
 proc nodeIndex(id: SyntaxNodeId): int {.inline.} =
   if uint32(id) == 0'u32:
@@ -85,7 +88,11 @@ proc validNodeRange(tree: PartialSyntaxTree, node: SyntaxNode): bool {.inline.} 
   first >= 0 and past <= tree.tokens.len and first < past
 
 proc isContainer(kind: SyntaxNodeKind): bool {.inline.} =
-  kind in {syntaxWhen, syntaxDeclaration}
+  kind in {syntaxWhen, syntaxBlock, syntaxDeclaration}
+
+proc unnamedBlockHeader[T](tokens: T, index: int): bool {.inline.} =
+  index + 1 < tokens.len and tokens[index + 1].line == tokens[index].line and
+    tokens[index + 1].text == ":"
 
 proc assignParents(tree: var PartialSyntaxTree) =
   if tree.nodes.len < 2:
@@ -120,7 +127,8 @@ proc parsePartialSyntax*(tokens: TokenStore): PartialSyntaxTree =
     let token = result.tokens[index]
     if not token.isKeyword(kwImport) and not token.isKeyword(kwFrom) and
         not token.isKeyword(kwWhen) and not token.isKeyword(kwInclude) and
-        not token.isKeyword(kwExport) and not token.declarationStart:
+        not token.isKeyword(kwExport) and not token.isKeyword(kwBlock) and
+        not token.declarationStart:
       inc index
       continue
     if not statementStart(result.tokens, index):
@@ -146,6 +154,12 @@ proc parsePartialSyntax*(tokens: TokenStore): PartialSyntaxTree =
       kind = syntaxWhen
       past = blockEnd(result.tokens, index)
       if not hasToken(result.tokens, index + 1, min(past, result.tokens.len), ":"):
+        result.uncertainty.incl parserUnsupportedStructure
+    elif token.isKeyword(kwBlock):
+      if unnamedBlockHeader(result.tokens, index):
+        kind = syntaxBlock
+        past = blockEnd(result.tokens, index)
+      else:
         result.uncertainty.incl parserUnsupportedStructure
     elif token.isKeyword(kwInclude):
       kind = syntaxInclude

@@ -1,6 +1,7 @@
 import std/[algorithm, strutils]
 
 import ../syntax/lexer
+import ../syntax/parser
 import ./symbols
 
 type
@@ -9,6 +10,7 @@ type
   ScopeKind* = enum
     scopeModule
     scopeRoutine
+    scopeBlock
 
   ScopeUncertainty* = enum
     scopeUnsupportedHeader
@@ -333,6 +335,74 @@ proc localDeclarationEnd[T](tokens: T, start, past, baseColumn: int): int =
       break
     inc result
 
+proc blockScopeStartingAt(index: ScopeIndex, token: uint32): ScopeId {.inline.} =
+  for ordinal, scope in index.scopes:
+    if scope.kind == scopeBlock and scope.firstToken == token:
+      return ScopeId(uint32(ordinal + 1))
+
+proc syntaxAllowsBlocks(tree: PartialSyntaxTree): bool =
+  if not tree.validateSyntaxTree:
+    return false
+  for reason in tree.uncertainty:
+    case reason
+    of parserMalformed, parserUnbalanced, parserUnsupportedStructure:
+      return false
+    of parserNestedDeclaration:
+      discard
+  true
+
+proc routineBodyEnd[T](tokens: T, past, byteLength: int): int
+
+proc addBlockScopes[T](
+    tokens: T,
+    syntax: PartialSyntaxTree,
+    routineScope: ScopeId,
+    byteLength: int,
+    scopeIndex: var ScopeIndex,
+): bool =
+  if not syntax.syntaxAllowsBlocks:
+    return false
+  let routineOrdinal = int(uint32(routineScope)) - 1
+  if routineOrdinal < 0 or routineOrdinal >= scopeIndex.scopes.len:
+    return false
+  let routine = scopeIndex.scopes[routineOrdinal]
+  for node in syntax.nodes:
+    if node.kind != syntaxBlock or node.firstToken <= routine.firstToken or
+        node.pastToken > routine.pastToken:
+      continue
+    let first = int(node.firstToken)
+    let past = int(node.pastToken)
+    if first < 0 or first + 1 >= tokens.len or past <= first + 1 or past > tokens.len or
+        tokens[first + 1].text != ":" or tokens[first + 1].line != tokens[first].line:
+      scopeIndex.uncertainty.incl scopeNestedBlock
+      continue
+    let body = first + 2
+    if body >= past or tokens[body].line <= tokens[first].line or
+        tokens[body].column <= tokens[first].column:
+      scopeIndex.uncertainty.incl scopeNestedBlock
+      continue
+
+    var parent = routineScope
+    for ordinal, candidate in scopeIndex.scopes:
+      if candidate.kind != scopeBlock or candidate.firstToken >= node.firstToken or
+          candidate.pastToken < node.pastToken:
+        continue
+      let parentOrdinal = int(uint32(parent)) - 1
+      if parentOrdinal < 0 or
+          candidate.firstToken >= scopeIndex.scopes[parentOrdinal].firstToken:
+        parent = ScopeId(uint32(ordinal + 1))
+
+    scopeIndex.scopes.add ScopeInterval(
+      parent: parent,
+      kind: scopeBlock,
+      ownerSymbol: invalidScopeOwner,
+      firstToken: node.firstToken,
+      pastToken: node.pastToken,
+      startOffset: tokens[first].startOffset,
+      endOffset: routineBodyEnd(tokens, past, byteLength),
+    )
+  true
+
 proc locals[T](
     tokens: T,
     bounds: tuple[first, past, baseColumn: int, valid: bool],
@@ -345,6 +415,13 @@ proc locals[T](
   var index = bounds.first
   while index < bounds.past:
     let token = tokens[index]
+    if token.kind == tkIdentifier and not isStropped(token) and isBlockKeyword(token):
+      let nestedScope = result.blockScopeStartingAt(uint32(index))
+      if nestedScope != InvalidScopeId:
+        index =
+          max(index + 1, int(result.scopes[int(uint32(nestedScope)) - 1].pastToken))
+        continue
+      result.uncertainty.incl scopeNestedBlock
     if token.kind == tkIdentifier and not isStropped(token) and
         token.hasKeywordRole(roleValueDeclaration):
       if not statementStart(tokens, index, bounds.first, bounds.baseColumn) or
@@ -364,8 +441,6 @@ proc locals[T](
         result.uncertainty.incl scopeUnsupportedDeclaration
       index = max(index + 1, finish)
       continue
-    if token.kind == tkIdentifier and not isStropped(token) and isBlockKeyword(token):
-      result.uncertainty.incl scopeNestedBlock
     if tokens[index].line > tokens[bounds.first].line and
         tokens[index].column > bounds.baseColumn and
         (index == bounds.first or tokens[index].line != tokens[index - 1].line):
@@ -382,6 +457,7 @@ proc indexedRoutine[T](
     symbol: SourceSymbol,
     symbolIndex: int,
     byteLength: int,
+    syntax: PartialSyntaxTree,
     result: var ScopeIndex,
 ) =
   let nameToken = int(symbol.nameToken)
@@ -429,10 +505,37 @@ proc indexedRoutine[T](
   if not parameters(tokens, header.opening, header.closing, scope, result.declarations):
     result.declarations.setLen(before)
     result.uncertainty.incl scopeUnsupportedHeader
+  discard addBlockScopes(tokens, syntax, scope, byteLength, result)
   locals(tokens, bounds, scope, result.declarations, result)
+  for ordinal in 1 ..< result.scopes.len:
+    if result.scopes[ordinal].kind != scopeBlock or
+        result.scopes[ordinal].firstToken < uint32(bounds.first) or
+        result.scopes[ordinal].pastToken > uint32(bounds.past):
+      continue
+    let blockScope = result.scopes[ordinal]
+    let blockFirst = int(blockScope.firstToken) + 2
+    let blockPast = int(blockScope.pastToken)
+    if blockFirst >= blockPast or blockFirst >= tokens.len:
+      result.uncertainty.incl scopeNestedBlock
+      continue
+    locals(
+      tokens,
+      (
+        first: blockFirst,
+        past: blockPast,
+        baseColumn: tokens[blockFirst].column,
+        valid: true,
+      ),
+      ScopeId(uint32(ordinal + 1)),
+      result.declarations,
+      result,
+    )
 
 proc indexScopes*[T](
-    tokens: T, symbols: openArray[SourceSymbol], byteLength: int
+    tokens: T,
+    symbols: openArray[SourceSymbol],
+    byteLength: int,
+    syntax: PartialSyntaxTree,
 ): ScopeIndex =
   result.scopes.add ScopeInterval(
     parent: InvalidScopeId,
@@ -448,7 +551,7 @@ proc indexScopes*[T](
 
   for symbolIndex, symbol in symbols:
     if isRoutineKind(symbol.kind):
-      indexedRoutine(tokens, symbol, symbolIndex, byteLength, result)
+      indexedRoutine(tokens, symbol, symbolIndex, byteLength, syntax, result)
 
   result.scopes.sort(
     proc(left, right: ScopeInterval): int =
@@ -458,6 +561,19 @@ proc indexScopes*[T](
         return 1
       cmp(left.firstToken, right.firstToken)
   )
+  result.declarations.sort(
+    proc(left, right: LexicalDeclaration): int =
+      cmp(left.nameToken, right.nameToken)
+  )
+
+proc indexScopes*[T](
+    tokens: T, symbols: openArray[SourceSymbol], byteLength: int
+): ScopeIndex =
+  var copied = newSeqOfCap[Token](tokens.len)
+  for token in tokens:
+    copied.add token
+  let syntax = parsePartialSyntax(initTokenStore(copied))
+  indexScopes(tokens, symbols, byteLength, syntax)
 
 proc containsToken(scope: ScopeInterval, token: uint32): bool {.inline.} =
   token >= scope.firstToken and token < scope.pastToken
@@ -497,10 +613,21 @@ proc validateScopes*[T](
         not index.scopes[parentOrdinal].containsToken(scope.firstToken) or
         scope.pastToken > index.scopes[parentOrdinal].pastToken:
       return false
-    if scope.kind != scopeRoutine or scope.ownerSymbol >= uint32(symbols.len):
-      return false
-    let owner = symbols[int(scope.ownerSymbol)]
-    if not isRoutineKind(owner.kind) or not scope.containsToken(owner.nameToken):
+    case scope.kind
+    of scopeRoutine:
+      if scope.ownerSymbol >= uint32(symbols.len):
+        return false
+      let owner = symbols[int(scope.ownerSymbol)]
+      if not isRoutineKind(owner.kind) or not scope.containsToken(owner.nameToken):
+        return false
+    of scopeBlock:
+      if scope.ownerSymbol != invalidScopeOwner or parentOrdinal == 0 or
+          index.scopes[parentOrdinal].kind notin {scopeRoutine, scopeBlock} or
+          scope.firstToken + 1 >= uint32(tokens.len) or
+          tokens[int(scope.firstToken)].text != "block" or
+          tokens[int(scope.firstToken) + 1].text != ":":
+        return false
+    else:
       return false
 
   for leftIndex in 1 ..< index.scopes.len:

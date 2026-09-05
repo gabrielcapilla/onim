@@ -95,6 +95,41 @@ proc second(value: int) =
     check scopeNestedBlock in nested.scopes.uncertainty
     check not nested.scopes.isComplete
 
+  test "models unnamed block lifetime and nesting":
+    let source = """proc nested() =
+  block:
+    let local = 1
+    echo local
+  echo local
+"""
+    let index = indexSource(source)
+    check index.scopes.validateScopes(index.parsed.tokens, index.symbols, source.len)
+    check index.scopes.scopes.len == 3
+    check index.scopes.scopes[2].kind == scopeBlock
+    let local = index.tokenNamed("local")
+    check index.scopes.innermostScopeAt(local) == ScopeId(3)
+    let after = uint32(index.parsed.tokens.len - 1)
+    check index.scopes.innermostScopeAt(after) == ScopeId(2)
+    check index.scopes.isComplete
+
+  test "parents nested blocks and indexes each block's locals":
+    let source = """proc nested() =
+  block:
+    let outer = 1
+    block:
+      let inner = outer
+      echo inner
+    echo outer
+"""
+    let index = indexSource(source)
+    check index.scopes.validateScopes(index.parsed.tokens, index.symbols, source.len)
+    check index.scopes.scopes.len == 4
+    check index.scopes.scopes[2].kind == scopeBlock
+    check index.scopes.scopes[3].kind == scopeBlock
+    check index.scopes.scopes[3].parent == ScopeId(3)
+    check declarationNames(index) == @["outer", "inner"]
+    check index.scopes.isComplete
+
   test "marks malformed delimiters without reading source bytes":
     let malformed = indexSource("\"\"\"not closed\n")
     check scopeMalformed in malformed.scopes.uncertainty
