@@ -4,6 +4,7 @@ import ../index/bindings
 import ../index/source_index
 import ../index/symbols
 import ../index/scopes
+import ../index/types
 import ../session/ids
 import ../session/workspace
 import ../syntax/imports
@@ -14,9 +15,15 @@ type
     definitionUnknown
     definitionUnresolved
     definitionAmbiguous
+    definitionUnsupported
     definitionResolved
 
+  DefinitionTargetKind* = enum
+    targetDeclaration
+    targetObjectField
+
   DefinitionTarget* = object
+    kind*: DefinitionTargetKind
     snapshotId*: SnapshotId
     fileId*: FileId
     contentGeneration*: ContentGeneration
@@ -25,6 +32,13 @@ type
   DefinitionResolution* = object
     kind*: DefinitionResolutionKind
     target*: DefinitionTarget
+
+  ObjectReceiverResolution* = object
+    resolved*: bool
+    typeTarget*: DefinitionTarget
+    provider*: SourceIndex
+    objectOrdinal*: uint32
+    exportedOnly*: bool
 
 proc unknownResolution(kind = definitionUnknown): DefinitionResolution =
   DefinitionResolution(kind: kind)
@@ -41,6 +55,7 @@ proc localTarget(
     return unknownResolution()
   result.kind = definitionResolved
   result.target = DefinitionTarget(
+    kind: targetDeclaration,
     snapshotId: source.id,
     fileId: source.fileId,
     contentGeneration: source.contentGeneration,
@@ -50,6 +65,8 @@ proc localTarget(
 proc localTargetHasCompetingDeclaration*(
     source: WorkspaceSnapshot, target: DefinitionTarget
 ): bool =
+  if target.kind != targetDeclaration:
+    return true
   if source.index == nil or target.nameToken >= uint32(source.index.parsed.tokens.len):
     return true
   let binding = source.index.resolveBinding(target.nameToken)
@@ -137,6 +154,7 @@ proc targetFor(
     return unknownResolution()
   result.kind = definitionResolved
   result.target = DefinitionTarget(
+    kind: targetDeclaration,
     snapshotId: source.id,
     fileId: view.fileId,
     contentGeneration: view.contentGeneration,
@@ -145,7 +163,7 @@ proc targetFor(
 
 proc addTarget(targets: var seq[DefinitionTarget], target: DefinitionTarget) =
   for existing in targets:
-    if existing.fileId.value == target.fileId.value and
+    if existing.kind == target.kind and existing.fileId.value == target.fileId.value and
         existing.nameToken == target.nameToken:
       return
   targets.add target
@@ -262,6 +280,8 @@ proc resolveQualified(
       return unknownResolution()
     let moduleId = workspace.resolveModule(source.fileId, item.module)
     if not moduleId.valid:
+      if item.module.startsWith("std/"):
+        return unknownResolution()
       unresolved = true
       continue
     let view = workspace.indexViewForFile(moduleId)
@@ -298,6 +318,8 @@ proc resolveFrom(
         return unknownResolution()
       let moduleId = workspace.resolveModule(source.fileId, item.module)
       if not moduleId.valid:
+        if item.module.startsWith("std/"):
+          return unknownResolution()
         unresolved = true
         continue
       let view = workspace.indexViewForFile(moduleId)
@@ -317,6 +339,116 @@ proc resolveFrom(
   finishTargets(targets, unresolved)
 
 proc resolveDefinitionAtToken*(
+  workspace: Workspace, source: WorkspaceSnapshot, tokenIndex: int
+): DefinitionResolution
+
+proc resolveObjectReceiver*(
+    workspace: Workspace, source: WorkspaceSnapshot, receiverDeclarationToken: uint32
+): ObjectReceiverResolution =
+  if workspace == nil or not validSource(source) or source.index == nil or
+      not source.index.bindingsReady or not source.index.nativeIndexSafe():
+    return
+  let declarationOrdinal =
+    source.index.scopes.declarationOrdinalAt(receiverDeclarationToken)
+  if declarationOrdinal < 0 or declarationOrdinal >= source.index.types.localTypeUses.len:
+    return
+  let typeToken = source.index.types.localTypeUses[declarationOrdinal]
+  if typeToken == InvalidTypeToken:
+    return
+  let typeResolution = resolveDefinitionAtToken(workspace, source, int(typeToken))
+  if typeResolution.kind != definitionResolved or
+      typeResolution.target.kind != targetDeclaration or
+      typeResolution.target.snapshotId.value != source.id.value or
+      not typeResolution.target.fileId.valid:
+    return
+
+  var provider = source.index
+  var exportedOnly = false
+  if typeResolution.target.fileId.value == source.fileId.value:
+    if typeResolution.target.contentGeneration.value != source.contentGeneration.value:
+      return
+  else:
+    let view = workspace.indexViewForFile(typeResolution.target.fileId)
+    if not view.valid or view.index == nil or view.id.value != source.id.value or
+        view.contentGeneration.value != typeResolution.target.contentGeneration.value or
+        not view.index.nativeIndexSafe():
+      return
+    provider = view.index
+    exportedOnly = true
+
+  let objectOrdinal = provider.types.objectOrdinal(typeResolution.target.nameToken)
+  if objectOrdinal < 0 or objectOrdinal >= provider.types.objects.len:
+    return
+  result.resolved = true
+  result.typeTarget = typeResolution.target
+  result.provider = provider
+  result.objectOrdinal = uint32(objectOrdinal)
+  result.exportedOnly = exportedOnly
+
+proc resolveObjectField(
+    source: WorkspaceSnapshot, receiver: ObjectReceiverResolution, memberToken: int
+): DefinitionResolution =
+  if not receiver.resolved or receiver.provider == nil or memberToken < 0 or
+      memberToken >= source.index.parsed.tokens.len:
+    return unknownResolution(definitionUnsupported)
+  let provider = receiver.provider
+  let objectOrdinal = int(receiver.objectOrdinal)
+  if objectOrdinal < 0 or objectOrdinal >= provider.types.objects.len:
+    return unknownResolution(definitionUnsupported)
+  let objectType = provider.types.objects[objectOrdinal]
+  if objectType.firstField > objectType.pastField or
+      objectType.pastField > uint32(provider.types.fields.len):
+    return unknownResolution(definitionUnsupported)
+  var matched = -1
+  let wanted = source.index.parsed.tokens[memberToken].text
+  for fieldIndex in objectType.firstField ..< objectType.pastField:
+    let field = provider.types.fields[int(fieldIndex)]
+    if receiver.exportedOnly and field.visibility != objectFieldExported:
+      continue
+    if field.nameToken >= uint32(provider.parsed.tokens.len):
+      return unknownResolution(definitionUnsupported)
+    if not sameIdentifier(provider.parsed.tokens[int(field.nameToken)].text, wanted):
+      continue
+    if matched >= 0:
+      return unknownResolution(definitionAmbiguous)
+    matched = int(fieldIndex)
+  if matched < 0:
+    return unknownResolution(definitionUnsupported)
+  let field = provider.types.fields[matched]
+  result.kind = definitionResolved
+  result.target = DefinitionTarget(
+    kind: targetObjectField,
+    snapshotId: source.id,
+    fileId: receiver.typeTarget.fileId,
+    contentGeneration: receiver.typeTarget.contentGeneration,
+    nameToken: field.nameToken,
+  )
+
+proc resolveObjectFieldDeclaration(
+    source: WorkspaceSnapshot, tokenIndex: int
+): DefinitionResolution =
+  if not source.index.nativeIndexSafe():
+    return unknownResolution(definitionUnsupported)
+  let fieldOrdinal = source.index.types.objectFieldOrdinal(uint32(tokenIndex))
+  if fieldOrdinal < 0:
+    return unknownResolution()
+  for objectType in source.index.types.objects:
+    if uint32(fieldOrdinal) < objectType.firstField or
+        uint32(fieldOrdinal) >= objectType.pastField:
+      continue
+    let field = source.index.types.fields[fieldOrdinal]
+    result.kind = definitionResolved
+    result.target = DefinitionTarget(
+      kind: targetObjectField,
+      snapshotId: source.id,
+      fileId: source.fileId,
+      contentGeneration: source.contentGeneration,
+      nameToken: field.nameToken,
+    )
+    return
+  unknownResolution(definitionUnsupported)
+
+proc resolveDefinitionAtToken*(
     workspace: Workspace, source: WorkspaceSnapshot, tokenIndex: int
 ): DefinitionResolution =
   result = unknownResolution()
@@ -326,6 +458,8 @@ proc resolveDefinitionAtToken*(
   let token = source.index.parsed.tokens[tokenIndex]
   if source.index.parsed.tokenInsideImport(token):
     return
+  if source.index.types.objectFieldOrdinal(uint32(tokenIndex)) >= 0:
+    return resolveObjectFieldDeclaration(source, tokenIndex)
   let local = resolveLocalDefinitionAtToken(source, tokenIndex)
   if local.kind != definitionUnknown:
     return local
@@ -339,6 +473,7 @@ proc resolveDefinitionAtToken*(
       return
     result.kind = definitionResolved
     result.target = DefinitionTarget(
+      kind: targetDeclaration,
       snapshotId: source.id,
       fileId: source.fileId,
       contentGeneration: source.contentGeneration,
@@ -350,10 +485,21 @@ proc resolveDefinitionAtToken*(
   if qualified.member >= 0:
     if source.index.parsed.tokens[qualified.qualifier].startOffset < 0:
       return
-    if not source.importedUseSupported(
-      qualified.qualifier, source.index.parsed.tokens[qualified.qualifier].text
-    ):
-      return
+    let qualifierBinding = source.index.resolveBinding(uint32(qualified.qualifier))
+    case qualifierBinding.state
+    of bindingResolved:
+      let receiver =
+        resolveObjectReceiver(workspace, source, qualifierBinding.declarationToken)
+      if not receiver.resolved:
+        return unknownResolution(definitionUnsupported)
+      return resolveObjectField(source, receiver, qualified.member)
+    of bindingAmbiguous:
+      return unknownResolution(definitionAmbiguous)
+    of bindingUnknown:
+      if not source.importedUseSupported(
+        qualified.qualifier, source.index.parsed.tokens[qualified.qualifier].text
+      ):
+        return
     return resolveQualified(
       workspace,
       source,
@@ -380,6 +526,7 @@ proc resolveDefinitionAtToken*(
       return
     result.kind = definitionResolved
     result.target = DefinitionTarget(
+      kind: targetDeclaration,
       snapshotId: source.id,
       fileId: source.fileId,
       contentGeneration: source.contentGeneration,

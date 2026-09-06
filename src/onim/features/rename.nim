@@ -225,6 +225,8 @@ proc validateMatches(
     targetName, newName: string,
     matches: openArray[ReferenceMatch],
 ): bool =
+  if target.kind != targetDeclaration:
+    return false
   let oldKey = identifierKey(targetName)
   let newKey = identifierKey(newName)
   if oldKey.len == 0 or newKey.len == 0:
@@ -295,7 +297,7 @@ proc validateMatches(
     if exported:
       let currentView = workspace.indexViewForFile(current.fileId)
       if currentView.moduleNameCollision(
-        DefinitionTarget(nameToken: high(uint32)), newKey
+        DefinitionTarget(kind: targetDeclaration, nameToken: high(uint32)), newKey
       ):
         return false
     if importedBindingCollision(workspace, current, target, targetName, newKey):
@@ -311,7 +313,8 @@ proc resolveRename*(
       not validRenameName(newName):
     return
   let references = resolveReferences(workspace, source, byteOffset, true)
-  if not references.supported or references.matches.len == 0:
+  if not references.supported or references.target.kind != targetDeclaration or
+      references.matches.len == 0:
     return
   var matches = references.matches
   let targetView = workspace.indexViewForFile(references.target.fileId)

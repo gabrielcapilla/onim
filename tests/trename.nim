@@ -75,6 +75,15 @@ suite "native rename":
     check renameFor("proc show(value: int) =\n  echo value\n", "value", "result").state ==
       renameUnavailable
 
+  test "does not rename object fields":
+    let source = """type Person = object
+  name: string
+
+proc show(person: Person) =
+  discard person.name
+"""
+    check renameFor(source, "name", "label").state == renameUnavailable
+
   test "rejects names that are not one Nim identifier":
     let source = "proc show(value: int) =\n  echo value\n"
     check renameFor(source, "value", "when").state == renameUnavailable

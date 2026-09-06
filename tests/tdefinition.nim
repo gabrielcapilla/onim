@@ -61,6 +61,97 @@ suite "native definition resolution":
     check local.target.fileId.value == fileId.value
     check local.target.nameToken == 9'u32
 
+  test "resolves object fields through local and project receivers":
+    let localText = """type Person = object
+  display_name*: string
+
+proc show(person: Person) =
+  discard person.displayName
+"""
+    let localWorkspace = initWorkspace()
+    let localId = localWorkspace.openDocument(
+      "file:///tmp/onim-local-field.nim", "/tmp/onim-local-field.nim", localText, 1
+    )
+    let localResolution = resolveLast(localWorkspace, localId, "displayName")
+    check localResolution.kind == definitionResolved
+    check localResolution.target.kind == targetObjectField
+    check localResolution.target.fileId.value == localId.value
+    let localTargetSnapshot = localWorkspace.snapshotForFile(localId)
+    check localTargetSnapshot.index.parsed.tokens[int(localResolution.target.nameToken)].text ==
+      "display_name"
+
+    let root =
+      getTempDir() / ("onim-field-definition-project-" & $getCurrentProcessId())
+    let cacheRoot =
+      getTempDir() / ("onim-field-definition-cache-" & $getCurrentProcessId())
+    cleanTree(root)
+    cleanTree(cacheRoot)
+    createDir(root)
+    let providerPath = root / "provider.nim"
+    let consumerPath = root / "consumer.nim"
+    writeFile(
+      providerPath,
+      """type Person* = object
+  display_name*: string
+  privateName: string
+""",
+    )
+    writeFile(
+      consumerPath,
+      """import provider as model
+proc show(person: model.Person) =
+  discard person.displayName
+""",
+    )
+
+    let previousCacheRoot = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
+    defer:
+      if previousCacheRoot.len > 0:
+        putEnv("ONIM_CACHE_DIR", previousCacheRoot)
+      else:
+        delEnv("ONIM_CACHE_DIR")
+      cleanTree(root)
+      cleanTree(cacheRoot)
+
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    let providerId = workspace.fileIdForPath(providerPath)
+    let consumerId = workspace.fileIdForPath(consumerPath)
+    var resolution = resolveLast(workspace, consumerId, "displayName")
+    check resolution.kind == definitionResolved
+    check resolution.target.kind == targetObjectField
+    check resolution.target.fileId.value == providerId.value
+    let providerSnapshot = workspace.snapshotForFile(providerId)
+    check providerSnapshot.index.parsed.tokens[int(resolution.target.nameToken)].text ==
+      "display_name"
+
+    discard workspace.changeDocument(
+      "file://" & consumerPath,
+      consumerPath,
+      "import provider as model\nproc show(person: model.Person) =\n  discard person.privateName\n",
+      2,
+    )
+    resolution = resolveLast(workspace, consumerId, "privateName")
+    check resolution.kind == definitionUnsupported
+
+    discard workspace.changeDocument(
+      "file://" & consumerPath,
+      consumerPath,
+      "import provider as model\nproc show() =\n  let person = model.Person()\n  discard person.displayName\n",
+      3,
+    )
+    resolution = resolveLast(workspace, consumerId, "displayName")
+    check resolution.kind == definitionResolved
+    check resolution.target.kind == targetObjectField
+
+    let reopened = initWorkspace(root)
+    reopened.indexWorkspace()
+    let reopenedConsumer = reopened.fileIdForPath(consumerPath)
+    resolution = resolveLast(reopened, reopenedConsumer, "displayName")
+    check resolution.kind == definitionResolved
+    check resolution.target.kind == targetObjectField
+
   test "resolves module qualifiers, aliases, and from bindings":
     let root = getTempDir() / ("onim-definition-project-" & $getCurrentProcessId())
     let cacheRoot = getTempDir() / ("onim-definition-cache-" & $getCurrentProcessId())

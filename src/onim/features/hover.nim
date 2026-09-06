@@ -35,6 +35,11 @@ proc targetHover(
     return
   result.state = hoverAvailable
   result.name = token.text
+  case resolution.target.kind
+  of targetObjectField:
+    result.kind = "field"
+  of targetDeclaration:
+    discard
   if uint32(view.fileId) != uint32(source.fileId):
     result.module = workspace.moduleForPath(view.path)
 
@@ -110,8 +115,7 @@ proc resolveHover*(
   let token = source.index.parsed.tokens[tokenIndex]
   if token.kind != tkIdentifier or source.index.parsed.tokenInsideImport(token):
     return
-  let localOrProject =
-    targetHover(workspace, source, resolveDefinition(workspace, source, byteOffset))
-  if localOrProject.state == hoverAvailable:
-    return localOrProject
+  let resolution = resolveDefinition(workspace, source, byteOffset)
+  if resolution.kind != definitionUnknown:
+    return targetHover(workspace, source, resolution)
   source.stdlibHover(stdlib, tokenIndex)

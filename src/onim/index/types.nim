@@ -34,7 +34,13 @@ proc typeDeclarationEnd(tokens: TokenStore, nameToken: int): int =
   if nameToken < 0 or nameToken >= tokens.len:
     return -1
   let line = tokens[nameToken].line
-  let column = tokens[nameToken].column
+  var column = tokens[nameToken].column
+  var cursor = nameToken - 1
+  while cursor >= 0 and tokens[cursor].line == line:
+    if tokens[cursor].isKeyword(kwType):
+      column = tokens[cursor].column
+      break
+    dec cursor
   result = tokens.len
   for index in nameToken + 1 ..< tokens.len:
     if tokens[index].line > line and tokens[index].column <= column:
@@ -143,7 +149,13 @@ proc parseFieldLine(
 proc parseObjectFields(
     tokens: TokenStore, nameToken, objectToken, limit: int, fields: var seq[ObjectField]
 ): bool =
-  let nameColumn = tokens[nameToken].column
+  var baseColumn = tokens[nameToken].column
+  var declarationToken = nameToken - 1
+  while declarationToken >= 0 and tokens[declarationToken].line == tokens[nameToken].line:
+    if tokens[declarationToken].isKeyword(kwType):
+      baseColumn = tokens[declarationToken].column
+      break
+    dec declarationToken
   let objectLine = tokens[objectToken].line
   var fieldIndent = -1
   var cursor = objectToken + 1
@@ -154,7 +166,7 @@ proc parseObjectFields(
     if token.line <= objectLine:
       inc cursor
       continue
-    if token.column <= nameColumn:
+    if token.column <= baseColumn:
       return false
     if fieldIndent < 0:
       fieldIndent = token.column
@@ -285,7 +297,7 @@ proc objectOrdinal*(index: TypeIndex, declarationToken: uint32): int {.inline.} 
       return middle
   -1
 
-proc fieldOrdinal(index: TypeIndex, nameToken: uint32): int {.inline.} =
+proc objectFieldOrdinal*(index: TypeIndex, nameToken: uint32): int {.inline.} =
   var first = 0
   var past = index.fields.len
   while first < past:
@@ -302,7 +314,7 @@ proc fieldOrdinal(index: TypeIndex, nameToken: uint32): int {.inline.} =
 proc objectFieldExportMarker*(index: TypeIndex, tokenIndex: uint32): bool {.inline.} =
   if tokenIndex == 0:
     return false
-  let ordinal = index.fieldOrdinal(tokenIndex - 1'u32)
+  let ordinal = index.objectFieldOrdinal(tokenIndex - 1'u32)
   ordinal >= 0 and index.fields[ordinal].visibility == objectFieldExported
 
 proc objectOrdinalForType*(

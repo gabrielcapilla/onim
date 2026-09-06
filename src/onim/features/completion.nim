@@ -424,40 +424,15 @@ proc completeLocalMembers(
   if workspace == nil or not source.valid or source.index == nil or
       not source.index.bindingsReady or not source.index.nativeIndexSafe():
     return
-  let declarationOrdinal = source.index.scopes.declarationOrdinalAt(declarationToken)
-  if declarationOrdinal < 0 or declarationOrdinal >= source.index.types.localTypeUses.len:
+  let receiver = resolveObjectReceiver(workspace, source, declarationToken)
+  if not receiver.resolved:
     return
-  let typeToken = source.index.types.localTypeUses[declarationOrdinal]
-  if typeToken == InvalidTypeToken:
-    return
-  let typeResolution = resolveDefinitionAtToken(workspace, source, int(typeToken))
-  if typeResolution.kind != definitionResolved or
-      typeResolution.target.snapshotId.value != source.id.value or
-      not typeResolution.target.fileId.valid:
-    return
-
-  var provider = source.index
-  var visibility = fieldsAll
-  if typeResolution.target.fileId.value == source.fileId.value:
-    if typeResolution.target.contentGeneration.value != source.contentGeneration.value:
-      return
-  else:
-    let view = workspace.indexViewForFile(typeResolution.target.fileId)
-    if not view.valid or view.index == nil or view.id.value != source.id.value or
-        view.contentGeneration.value != typeResolution.target.contentGeneration.value or
-        not view.index.nativeIndexSafe():
-      return
-    provider = view.index
-    visibility = fieldsExported
-
-  let objectOrdinal = provider.types.objectOrdinal(typeResolution.target.nameToken)
-  if objectOrdinal < 0 or objectOrdinal >= provider.types.objects.len:
-    return
-  let objectType = provider.types.objects[objectOrdinal]
+  let visibility = if receiver.exportedOnly: fieldsExported else: fieldsAll
+  let objectType = receiver.provider.types.objects[int(receiver.objectOrdinal)]
   var candidates: seq[VisibleCompletion] = @[]
   var candidateByName = initTable[string, int]()
   if not appendObjectFields(
-    provider,
+    receiver.provider,
     objectType,
     identifierKey(context.prefix),
     visibility,

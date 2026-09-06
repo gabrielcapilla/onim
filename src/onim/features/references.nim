@@ -27,7 +27,7 @@ type
 proc sameTarget(left, right: DefinitionTarget): bool {.inline.} =
   left.fileId.value == right.fileId.value and
     left.contentGeneration.value == right.contentGeneration.value and
-    left.nameToken == right.nameToken
+    left.nameToken == right.nameToken and left.kind == right.kind
 
 proc compareReferenceMatches*(left, right: ReferenceMatch): int =
   result = cmp(left.fileId.value, right.fileId.value)
@@ -52,7 +52,7 @@ proc resolveSameFileReferences*(
   if tokenIndex < 0:
     return
   let selected = resolveLocalDefinitionAtToken(source, tokenIndex)
-  if selected.kind != definitionResolved or
+  if selected.kind != definitionResolved or selected.target.kind != targetDeclaration or
       selected.target.fileId.value != source.fileId.value:
     return
 
@@ -96,7 +96,7 @@ proc resolveReferences*(
   if local.supported:
     let tokenIndex = tokenAtOffset(source.index.parsed.tokens, byteOffset)
     let selected = resolveLocalDefinitionAtToken(source, tokenIndex)
-    if selected.kind != definitionResolved:
+    if selected.kind != definitionResolved or selected.target.kind != targetDeclaration:
       return
     result.supported = true
     result.target = selected.target
@@ -115,7 +115,7 @@ proc resolveReferences*(
   if tokenIndex < 0:
     return
   let selected = resolveDefinitionAtToken(workspace, source, tokenIndex)
-  if selected.kind != definitionResolved:
+  if selected.kind != definitionResolved or selected.target.kind != targetDeclaration:
     return
   result.target = selected.target
 

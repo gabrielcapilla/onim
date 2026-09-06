@@ -40,3 +40,16 @@ suite "native hover":
     let info = hoverFor("proc walkDir() = discard\nwalkDir()\n", "walkDir")
     check info.state == hoverAvailable
     check info.module.len == 0
+
+  test "resolves native object field hover":
+    let source = """type Person = object
+  display_name*: string
+
+proc show(person: Person) =
+  discard person.displayName
+"""
+    let info = hoverFor(source, "displayName")
+    check info.state == hoverAvailable
+    check info.name == "display_name"
+    check info.kind == "field"
+    check info.module.len == 0

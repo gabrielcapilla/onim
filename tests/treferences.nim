@@ -121,6 +121,19 @@ proc second(value: int) =
     check references.tokens ==
       @[tokenAt(text, snapshot, offsets[0]), tokenAt(text, snapshot, offsets[1])]
 
+  test "declines object field references":
+    let text = """type Person = object
+  name: string
+
+proc show(person: Person) =
+  discard person.name
+"""
+    let snapshot = snapshotFor(text)
+    let references = resolveReferences(
+      initWorkspace(), snapshot, text.rfind("name"), includeDeclaration = true
+    )
+    check not references.supported
+
   test "resolves nested block shadowing by binding identity":
     let text = """proc show(value: int) =
   block:
