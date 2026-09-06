@@ -1,8 +1,10 @@
-import std/sets
+import std/[sets, strutils]
 
 import ../index/occurrences
+import ../index/scopes
 import ../index/source_index
 import ../index/symbols
+import ../index/types
 import ../session/workspace
 import ../stdlib/map
 import ../syntax/imports
@@ -33,13 +35,62 @@ proc targetHover(
   let token = view.index.parsed.tokens[int(resolution.target.nameToken)]
   if token.kind != tkIdentifier:
     return
+
+  proc localTypeText(typeInfo: LocalTypeInfo): string =
+    case typeInfo.kind
+    of localTypeBool:
+      "bool"
+    of localTypeChar:
+      "char"
+    of localTypeString:
+      "string"
+    of localTypeInt:
+      "int"
+    of localTypeUnknown:
+      ""
+    of localTypeNamed:
+      if typeInfo.firstToken >= typeInfo.pastToken or
+          typeInfo.pastToken > uint32(source.index.parsed.tokens.len):
+        return
+      let first = source.index.parsed.tokens[int(typeInfo.firstToken)]
+      let last = source.index.parsed.tokens[int(typeInfo.pastToken) - 1]
+      if first.startOffset < 0 or last.endOffset <= first.startOffset or
+          last.endOffset > source.text.len:
+        return
+      source.text[first.startOffset ..< last.endOffset].strip
+
+  proc localSignature(): string =
+    if uint32(resolution.target.fileId) != uint32(source.fileId) or
+        uint64(resolution.target.snapshotId) != uint64(source.id) or
+        uint64(resolution.target.contentGeneration) != uint64(source.contentGeneration):
+      return
+    let declarationOrdinal =
+      source.index.scopes.declarationOrdinalAt(resolution.target.nameToken)
+    if declarationOrdinal < 0 or
+        declarationOrdinal >= source.index.scopes.declarations.len:
+      return
+    let typeInfo = source.index.types.localTypeAt(
+      source.index.parsed.tokens, source.index.scopes, resolution.target.nameToken
+    )
+    let typeName = localTypeText(typeInfo)
+    if typeName.len == 0:
+      return
+    let declaration = source.index.scopes.declarations[declarationOrdinal]
+    let prefix =
+      case declaration.kind
+      of declarationParameter: ""
+      of declarationLet: "let "
+      of declarationVar: "var "
+      of declarationConst: "const "
+    prefix & token.text & ": " & typeName
+
   result.state = hoverAvailable
   result.name = token.text
   case resolution.target.kind
   of targetObjectField:
     result.kind = "field"
   of targetDeclaration:
-    discard
+    result.signature = localSignature()
   if uint32(view.fileId) != uint32(source.fileId):
     result.module = workspace.moduleForPath(view.path)
 

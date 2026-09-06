@@ -16,6 +16,20 @@ type
     nameToken*: uint32
     visibility*: ObjectFieldVisibility
 
+  LocalTypeKind* = enum
+    localTypeUnknown
+    localTypeNamed
+    localTypeBool
+    localTypeChar
+    localTypeString
+    localTypeInt
+
+  LocalTypeInfo* = object
+    kind*: LocalTypeKind
+    typeToken*: uint32
+    firstToken*: uint32
+    pastToken*: uint32
+
   TypeIndex* = object
     objects*: seq[ObjectTypeRecord]
     fields*: seq[ObjectField]
@@ -272,6 +286,93 @@ proc typeUseFor(tokens: TokenStore, declaration: LexicalDeclaration): uint32 =
   if split.equals >= 0:
     return constructorTypeToken(tokens, split.equals + 1, int(declaration.pastToken))
   InvalidTypeToken
+
+proc directLiteralKind(tokens: TokenStore, first, past: int): LocalTypeKind =
+  if first < 0 or first >= past or past > tokens.len:
+    return localTypeUnknown
+  if past == first + 1:
+    let token = tokens[first]
+    if token.kind == tkIdentifier:
+      case token.text
+      of "true", "false":
+        return localTypeBool
+      else:
+        discard
+    elif token.kind == tkString and isClosedString(token):
+      if token.text[0] == '"':
+        if token.text.len >= 3 and token.text[1] == '"' and token.text[2] == '"':
+          return localTypeUnknown
+        return localTypeString
+      if token.text[0] == char(39) and token.text.len >= 3:
+        return localTypeChar
+    elif token.kind == tkPunctuation and token.text.len == 1 and token.text[0] >= '0' and
+        token.text[0] <= '9':
+      return localTypeInt
+    return localTypeUnknown
+
+  var previousEnd = -1
+  for index in first ..< past:
+    let token = tokens[index]
+    if token.kind != tkPunctuation or token.text.len != 1 or token.text[0] < '0' or
+        token.text[0] > '9' or (previousEnd >= 0 and token.startOffset != previousEnd):
+      return localTypeUnknown
+    previousEnd = token.endOffset
+  localTypeInt
+
+proc constructorTypeSpan(
+    tokens: TokenStore, typeToken: uint32
+): tuple[first, past: int] =
+  result.first = int(typeToken)
+  result.past = result.first + 1
+  if result.first >= 2 and tokens[result.first - 1].text == "." and
+      validNameToken(tokens, result.first - 2):
+    result.first -= 2
+
+proc localTypeAt*(
+    types: TypeIndex, tokens: TokenStore, scopes: ScopeIndex, declarationToken: uint32
+): LocalTypeInfo =
+  if types.localTypeUses.len != scopes.declarations.len:
+    return
+  let declarationOrdinal = scopes.declarationOrdinalAt(declarationToken)
+  if declarationOrdinal < 0 or declarationOrdinal >= scopes.declarations.len:
+    return
+  let declaration = scopes.declarations[declarationOrdinal]
+  if declaration.pastToken > uint32(tokens.len):
+    return
+  let split = splitDeclaration(tokens, declaration)
+  if split.colon >= 0:
+    let past =
+      if split.equals > split.colon:
+        split.equals
+      else:
+        int(declaration.pastToken)
+    let typeToken = typeUseFor(tokens, declaration)
+    if typeToken == InvalidTypeToken or
+        types.localTypeUses[declarationOrdinal] != typeToken:
+      return
+    result.kind = localTypeNamed
+    result.typeToken = typeToken
+    result.firstToken = uint32(split.colon + 1)
+    result.pastToken = uint32(past)
+    return
+  if split.equals < 0:
+    return
+
+  let typeToken = typeUseFor(tokens, declaration)
+  if typeToken != InvalidTypeToken:
+    if types.localTypeUses[declarationOrdinal] != typeToken:
+      return
+    let span = constructorTypeSpan(tokens, typeToken)
+    result.kind = localTypeNamed
+    result.typeToken = typeToken
+    result.firstToken = uint32(span.first)
+    result.pastToken = uint32(span.past)
+    return
+
+  result.kind = directLiteralKind(tokens, split.equals + 1, int(declaration.pastToken))
+  if result.kind != localTypeUnknown:
+    result.firstToken = uint32(split.equals + 1)
+    result.pastToken = declaration.pastToken
 
 proc indexTypes*(
     tokens: TokenStore, symbols: openArray[SourceSymbol], scopes: ScopeIndex

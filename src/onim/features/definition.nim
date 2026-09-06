@@ -348,13 +348,12 @@ proc resolveObjectReceiver*(
   if workspace == nil or not validSource(source) or source.index == nil or
       not source.index.bindingsReady or not source.index.nativeIndexSafe():
     return
-  let declarationOrdinal =
-    source.index.scopes.declarationOrdinalAt(receiverDeclarationToken)
-  if declarationOrdinal < 0 or declarationOrdinal >= source.index.types.localTypeUses.len:
+  let typeInfo = source.index.types.localTypeAt(
+    source.index.parsed.tokens, source.index.scopes, receiverDeclarationToken
+  )
+  if typeInfo.kind != localTypeNamed:
     return
-  let typeToken = source.index.types.localTypeUses[declarationOrdinal]
-  if typeToken == InvalidTypeToken:
-    return
+  let typeToken = typeInfo.typeToken
   let typeResolution = resolveDefinitionAtToken(workspace, source, int(typeToken))
   if typeResolution.kind != definitionResolved or
       typeResolution.target.kind != targetDeclaration or

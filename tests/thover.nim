@@ -1,6 +1,8 @@
 import std/[strutils, unittest]
 
 import onim/features/hover
+import onim/index/bindings
+import onim/index/scopes
 import onim/session/workspace
 import onim/stdlib/map
 
@@ -11,6 +13,14 @@ proc hoverFor(source, wanted: string): HoverInfo =
   discard workspace.openDocument(uri, path, source, 1)
   let snapshot = workspace.snapshotForDocument(uri, path)
   resolveHover(workspace, snapshot, source.rfind(wanted) + 1, stdlibMap())
+
+proc hoverAt(source: string, byteOffset: int): HoverInfo =
+  let workspace = initWorkspace()
+  let path = "/tmp/onim-hover-test.nim"
+  let uri = "file:///tmp/onim-hover-test.nim"
+  discard workspace.openDocument(uri, path, source, 1)
+  let snapshot = workspace.snapshotForDocument(uri, path)
+  resolveHover(workspace, snapshot, byteOffset, stdlibMap())
 
 suite "native hover":
   test "resolves imported stdlib names":
@@ -53,3 +63,102 @@ proc show(person: Person) =
     check info.name == "display_name"
     check info.kind == "field"
     check info.module.len == 0
+
+  test "reports explicit, constructor, and literal local types":
+    let source = """type Person = object
+  name: string
+
+proc show(value: ref Person) =
+  let made = model.Person()
+  let flag = true
+  var character = 'x'
+  const text = "hello"
+  let count = 42
+  discard value
+  discard made
+  discard flag
+  discard character
+  discard text
+  discard count
+"""
+    check hoverFor(source, "value").signature == "value: ref Person"
+    check hoverFor(source, "made").signature == "let made: model.Person"
+    check hoverFor(source, "flag").signature == "let flag: bool"
+    check hoverFor(source, "character").signature == "var character: char"
+    check hoverFor(source, "text").signature == "const text: string"
+    check hoverFor(source, "count").signature == "let count: int"
+
+  test "keeps unsupported local inference conservative":
+    let source = """proc show() =
+  let unary = -1
+  let floating = 1.0
+  let prefixed = r"raw"
+  let missing = nil
+  let compound = 1 + 2
+  discard unary
+  discard floating
+  discard prefixed
+  discard missing
+  discard compound
+"""
+    for name in ["unary", "floating", "prefixed", "missing", "compound"]:
+      let info = hoverFor(source, name)
+      check info.state == hoverAvailable
+      check info.name == name
+      check info.signature.len == 0
+
+  test "keeps unsupported numeric suffixes conservatively rejected":
+    let source = """proc show() =
+  let suffixed = 1'i32
+  discard suffixed
+"""
+    let path = "/tmp/onim-hover-suffixed.nim"
+    let uri = "file:///tmp/onim-hover-suffixed.nim"
+    let workspace = initWorkspace()
+    discard workspace.openDocument(uri, path, source, 1)
+    let snapshot = workspace.snapshotForDocument(uri, path)
+    let info =
+      resolveHover(workspace, snapshot, source.rfind("suffixed") + 1, stdlibMap())
+    check scopeMalformed in snapshot.index.scopes.uncertainty
+    check not snapshot.index.bindingsReady
+    check info.state == hoverUnavailable
+
+  test "keeps typed hover bound to the nearest shadow":
+    let source = """proc show() =
+  let item = 1
+  block:
+    let item = "inner"
+    discard item
+  discard item
+"""
+    let innerOffset = source.find("discard item") + "discard ".len + 1
+    let outerOffset = source.rfind("discard item") + "discard ".len + 1
+    check hoverAt(source, innerOffset).signature == "let item: string"
+    check hoverAt(source, outerOffset).signature == "let item: int"
+
+  test "revalidates equal-length incremental literal edits":
+    let oldSource = """proc show() =
+  let flag = true
+  discard flag
+"""
+    let newSource = oldSource.replace("true", "name")
+    let path = "/tmp/onim-hover-incremental.nim"
+    let uri = "file:///tmp/onim-hover-incremental.nim"
+    let workspace = initWorkspace()
+    discard workspace.openDocument(uri, path, oldSource, 1)
+    let oldSnapshot = workspace.snapshotForDocument(uri, path)
+    let oldInfo =
+      resolveHover(workspace, oldSnapshot, oldSource.rfind("flag") + 1, stdlibMap())
+    discard workspace.changeDocument(uri, path, newSource, 2)
+    let updatedSnapshot = workspace.snapshotForDocument(uri, path)
+    let updatedInfo =
+      resolveHover(workspace, updatedSnapshot, newSource.rfind("flag") + 1, stdlibMap())
+    let freshWorkspace = initWorkspace()
+    discard freshWorkspace.openDocument(uri, path, newSource, 1)
+    let freshSnapshot = freshWorkspace.snapshotForDocument(uri, path)
+    let freshInfo = resolveHover(
+      freshWorkspace, freshSnapshot, newSource.rfind("flag") + 1, stdlibMap()
+    )
+    check oldInfo.signature == "let flag: bool"
+    check updatedInfo.signature.len == 0
+    check updatedInfo.signature == freshInfo.signature

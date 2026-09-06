@@ -395,6 +395,40 @@ suite "stdio LSP":
     check localHover != nil
     check localHover["result"]["contents"]["value"].getStr.contains("helper")
 
+    let typedHoverUri = "file:///tmp/onim-typed-hover.nim"
+    let typedHoverText = "proc show() =\n  let smile = \"😀\"\n  discard smile\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": typedHoverUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": typedHoverText,
+          }
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 19,
+        "method": "textDocument/hover",
+        "params": {
+          "textDocument": {"uri": typedHoverUri},
+          "position": {"line": 1, "character": 7},
+        },
+      },
+    )
+    let typedLocalHover = readResponse(process.outputStream, 19)
+    check typedLocalHover != nil
+    check typedLocalHover["result"]["contents"]["value"].getStr ==
+      "```nim\nlet smile: string\n```"
+
     let hoverUri = "file:///tmp/onim-hover.nim"
     sendMessage(
       process.inputStream,
