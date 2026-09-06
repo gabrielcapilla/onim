@@ -40,6 +40,12 @@ type
     objectOrdinal*: uint32
     exportedOnly*: bool
 
+  LocalTypeResolution* = object
+    info*: LocalTypeInfo
+    snapshotId*: SnapshotId
+    fileId*: FileId
+    contentGeneration*: ContentGeneration
+
 proc unknownResolution(kind = definitionUnknown): DefinitionResolution =
   DefinitionResolution(kind: kind)
 
@@ -342,19 +348,88 @@ proc resolveDefinitionAtToken*(
   workspace: Workspace, source: WorkspaceSnapshot, tokenIndex: int
 ): DefinitionResolution
 
+proc resolveLocalType*(
+    workspace: Workspace, source: WorkspaceSnapshot, declarationToken: uint32
+): LocalTypeResolution =
+  if workspace == nil or not validSource(source) or source.index == nil:
+    return
+  let local = source.index.types.localTypeAt(
+    source.index.parsed.tokens, source.index.scopes, declarationToken
+  )
+  result.info = local
+  result.snapshotId = source.id
+  result.fileId = source.fileId
+  result.contentGeneration = source.contentGeneration
+  if local.form != localTypeFormCall:
+    return
+  if not source.index.nativeIndexSafe() or
+      local.typeToken >= uint32(source.index.parsed.tokens.len):
+    result.info = LocalTypeInfo()
+    return
+
+  let resolution = resolveDefinitionAtToken(workspace, source, int(local.typeToken))
+  if resolution.kind != definitionResolved or resolution.target.kind != targetDeclaration or
+      not resolution.target.fileId.valid:
+    result.info = LocalTypeInfo()
+    return
+
+  var targetSource: WorkspaceSnapshot
+  if resolution.target.fileId.value == source.fileId.value:
+    if resolution.target.snapshotId.value != source.id.value or
+        resolution.target.contentGeneration.value != source.contentGeneration.value:
+      result.info = LocalTypeInfo()
+      return
+    targetSource = source
+  else:
+    targetSource = workspace.snapshotForFile(resolution.target.fileId)
+    if not targetSource.valid or targetSource.id.value != source.id.value or
+        targetSource.contentGeneration.value != resolution.target.contentGeneration.value or
+        targetSource.index == nil or not targetSource.index.nativeIndexSafe():
+      result.info = LocalTypeInfo()
+      return
+
+  let symbolIndex = targetSource.index.symbols.symbolToken(resolution.target.nameToken)
+  if symbolIndex < 0 or symbolIndex >= targetSource.index.symbols.len:
+    result.info = LocalTypeInfo()
+    return
+  case targetSource.index.symbols[symbolIndex].kind
+  of symbolType:
+    result.info.kind = localTypeNamed
+  of symbolProc, symbolFunc:
+    let returnInfo = targetSource.index.types.routineReturnAt(
+      targetSource.index.parsed.tokens, targetSource.index.symbols, symbolIndex
+    )
+    if returnInfo.kind != localTypeNamed:
+      result.info = LocalTypeInfo()
+      return
+    result.info = returnInfo
+    result.snapshotId = targetSource.id
+    result.fileId = targetSource.fileId
+    result.contentGeneration = targetSource.contentGeneration
+  else:
+    result.info = LocalTypeInfo()
+
 proc resolveObjectReceiver*(
     workspace: Workspace, source: WorkspaceSnapshot, receiverDeclarationToken: uint32
 ): ObjectReceiverResolution =
   if workspace == nil or not validSource(source) or source.index == nil or
       not source.index.bindingsReady or not source.index.nativeIndexSafe():
     return
-  let typeInfo = source.index.types.localTypeAt(
-    source.index.parsed.tokens, source.index.scopes, receiverDeclarationToken
-  )
-  if typeInfo.kind != localTypeNamed:
+  let localType = workspace.resolveLocalType(source, receiverDeclarationToken)
+  if localType.info.kind != localTypeNamed:
     return
-  let typeToken = typeInfo.typeToken
-  let typeResolution = resolveDefinitionAtToken(workspace, source, int(typeToken))
+  var typeSource = source
+  if localType.fileId.value != source.fileId.value:
+    typeSource = workspace.snapshotForFile(localType.fileId)
+    if not typeSource.valid or typeSource.id.value != source.id.value or
+        typeSource.contentGeneration.value != localType.contentGeneration.value or
+        typeSource.index == nil or not typeSource.index.nativeIndexSafe():
+      return
+  elif localType.contentGeneration.value != source.contentGeneration.value or
+      localType.snapshotId.value != source.id.value:
+    return
+  let typeToken = localType.info.typeToken
+  let typeResolution = resolveDefinitionAtToken(workspace, typeSource, int(typeToken))
   if typeResolution.kind != definitionResolved or
       typeResolution.target.kind != targetDeclaration or
       typeResolution.target.snapshotId.value != source.id.value or

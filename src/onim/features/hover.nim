@@ -36,7 +36,7 @@ proc targetHover(
   if token.kind != tkIdentifier:
     return
 
-  proc localTypeText(typeInfo: LocalTypeInfo): string =
+  proc localTypeText(typeSource: WorkspaceSnapshot, typeInfo: LocalTypeInfo): string =
     case typeInfo.kind
     of localTypeBool:
       "bool"
@@ -49,15 +49,16 @@ proc targetHover(
     of localTypeUnknown:
       ""
     of localTypeNamed:
-      if typeInfo.firstToken >= typeInfo.pastToken or
-          typeInfo.pastToken > uint32(source.index.parsed.tokens.len):
+      if not typeSource.valid or typeSource.index == nil or
+          typeInfo.firstToken >= typeInfo.pastToken or
+          typeInfo.pastToken > uint32(typeSource.index.parsed.tokens.len):
         return
-      let first = source.index.parsed.tokens[int(typeInfo.firstToken)]
-      let last = source.index.parsed.tokens[int(typeInfo.pastToken) - 1]
+      let first = typeSource.index.parsed.tokens[int(typeInfo.firstToken)]
+      let last = typeSource.index.parsed.tokens[int(typeInfo.pastToken) - 1]
       if first.startOffset < 0 or last.endOffset <= first.startOffset or
-          last.endOffset > source.text.len:
+          last.endOffset > typeSource.text.len:
         return
-      source.text[first.startOffset ..< last.endOffset].strip
+      typeSource.text[first.startOffset ..< last.endOffset].strip
 
   proc localSignature(): string =
     if uint32(resolution.target.fileId) != uint32(source.fileId) or
@@ -69,10 +70,21 @@ proc targetHover(
     if declarationOrdinal < 0 or
         declarationOrdinal >= source.index.scopes.declarations.len:
       return
-    let typeInfo = source.index.types.localTypeAt(
-      source.index.parsed.tokens, source.index.scopes, resolution.target.nameToken
-    )
-    let typeName = localTypeText(typeInfo)
+    let localType = workspace.resolveLocalType(source, resolution.target.nameToken)
+    if localType.info.kind == localTypeUnknown:
+      return
+    let typeInfo = localType.info
+    var typeSource = source
+    if uint32(localType.fileId) != uint32(source.fileId):
+      typeSource = workspace.snapshotForFile(localType.fileId)
+      if not typeSource.valid or uint64(typeSource.id) != uint64(source.id) or
+          uint64(typeSource.contentGeneration) != uint64(localType.contentGeneration) or
+          typeSource.index == nil or not typeSource.index.nativeIndexSafe():
+        return
+    elif uint64(localType.contentGeneration) != uint64(source.contentGeneration) or
+        uint64(localType.snapshotId) != uint64(source.id):
+      return
+    let typeName = localTypeText(typeSource, typeInfo)
     if typeName.len == 0:
       return
     let declaration = source.index.scopes.declarations[declarationOrdinal]

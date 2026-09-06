@@ -2,6 +2,7 @@ import std/unittest
 
 import onim/index/source_index
 import onim/index/symbols
+import onim/index/types
 
 proc symbolNames(index: SourceIndex): seq[string] =
   for symbol in index.symbols:
@@ -79,3 +80,25 @@ proc `proc`() = discard
     check source[token.startOffset ..< token.endOffset] == "hello"
     check token.line == 0
     check token.column == 5
+
+  test "aligns and validates routine return anchors":
+    let index = indexSource(
+      """proc make*(): int = 1
+func text(): string = "ok"
+proc inferred() = discard
+proc generic[T](): int = 1
+"""
+    )
+    check index.types.routineReturnTypeUses.len == index.symbols.len
+    check index.types.routineReturnTypeUses[0] != InvalidTypeToken
+    check index.types.routineReturnTypeUses[1] != InvalidTypeToken
+    check index.types.routineReturnTypeUses[2] == InvalidTypeToken
+    check index.types.routineReturnTypeUses[3] == InvalidTypeToken
+    check validateTypeIndex(
+      index.types, index.parsed.tokens, index.symbols, index.scopes
+    )
+    var corrupted = index.types
+    corrupted.routineReturnTypeUses = newSeq[uint32](0)
+    check not validateTypeIndex(
+      corrupted, index.parsed.tokens, index.symbols, index.scopes
+    )

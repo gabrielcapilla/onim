@@ -456,6 +456,7 @@ proc use() =
     old*: string
     private: int
     age*: int
+proc makePerson*(): Person = discard
 """
     let consumer = """import provider as model
 proc show(value: ref model.Person; raw: ptr model.Person) =
@@ -464,10 +465,15 @@ proc show(value: ref model.Person; raw: ptr model.Person) =
 proc make() =
   let made = model.Person(old: "Ada")
   made.ol
+  let returned = model.makePerson()
+  returned.ol
 """
     let fromConsumer = """from provider import Person
+from provider import makePerson
 proc show(value: Person) =
   value.ol
+  let made = makePerson()
+  made.ol
 """
     let ordinaryConsumer = """import provider
 proc show(value: Person) =
@@ -514,12 +520,23 @@ proc show(value: Person) =
     check madeResult.state == completionAvailable
     check madeResult.items.mapIt(it.label) == @["old"]
 
+    let returnedOffset = consumer.find("returned.ol") + "returned.ol".len
+    let returnedResult = completeAt(workspace, consumerSnapshot, returnedOffset, stdlib)
+    check returnedResult.state == completionAvailable
+    check returnedResult.items.mapIt(it.label) == @["old"]
+
     let fromId = workspace.fileIdForPath(fromPath)
     let fromSnapshot = workspace.snapshotForFile(fromId)
     let fromOffset = fromConsumer.find("value.ol") + "value.ol".len
     let fromResult = completeAt(workspace, fromSnapshot, fromOffset, stdlib)
     check fromResult.state == completionAvailable
     check fromResult.items.mapIt(it.label) == @["old"]
+
+    let fromFactoryOffset = fromConsumer.find("made.ol") + "made.ol".len
+    let fromFactoryResult =
+      completeAt(workspace, fromSnapshot, fromFactoryOffset, stdlib)
+    check fromFactoryResult.state == completionAvailable
+    check fromFactoryResult.items.mapIt(it.label) == @["old"]
 
     let ordinaryId = workspace.fileIdForPath(ordinaryPath)
     let ordinarySnapshot = workspace.snapshotForFile(ordinaryId)
@@ -535,12 +552,18 @@ proc show(value: Person) =
     let reloadedResult = completeAt(reloaded, reloadedSnapshot, valueOffset, stdlib)
     check reloadedResult.state == completionAvailable
     check reloadedResult.items.mapIt(it.label) == @["age", "old"]
+    let reloadedReturnedOffset = consumer.find("returned.ol") + "returned.ol".len
+    let reloadedReturned =
+      completeAt(reloaded, reloadedSnapshot, reloadedReturnedOffset, stdlib)
+    check reloadedReturned.state == completionAvailable
+    check reloadedReturned.items.mapIt(it.label) == @["old"]
 
     let overlay = """type
   Person* = object
     new*: string
     private: int
     age*: int
+proc makePerson*(): Person = discard
 """
     discard workspace.openDocument("file://" & providerPath, providerPath, overlay, 2)
     let refreshed = workspace.snapshotForFile(consumerId)
@@ -548,6 +571,10 @@ proc show(value: Person) =
     check refreshedResult.state == completionAvailable
     check refreshedResult.items.mapIt(it.label) == @["age", "new"]
     check not refreshedResult.items.anyIt(it.label == "old")
+    let returnedDotOffset = consumer.find("returned.") + "returned.".len
+    let refreshedReturned = completeAt(workspace, refreshed, returnedDotOffset, stdlib)
+    check refreshedReturned.state == completionAvailable
+    check refreshedReturned.items.mapIt(it.label) == @["age", "new"]
 
   test "completes fields from explicit nominal object types":
     let source = """type

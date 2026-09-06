@@ -1,4 +1,4 @@
-import std/[strutils, unittest]
+import std/[os, strutils, unittest]
 
 import onim/features/hover
 import onim/index/bindings
@@ -69,7 +69,7 @@ proc show(person: Person) =
   name: string
 
 proc show(value: ref Person) =
-  let made = model.Person()
+  let made = Person()
   let flag = true
   var character = 'x'
   const text = "hello"
@@ -82,11 +82,68 @@ proc show(value: ref Person) =
   discard count
 """
     check hoverFor(source, "value").signature == "value: ref Person"
-    check hoverFor(source, "made").signature == "let made: model.Person"
+    check hoverFor(source, "made").signature == "let made: Person"
     check hoverFor(source, "flag").signature == "let flag: bool"
     check hoverFor(source, "character").signature == "var character: char"
     check hoverFor(source, "text").signature == "const text: string"
     check hoverFor(source, "count").signature == "let count: int"
+
+  test "propagates direct procedure and function return types":
+    let source = """type Person = object
+  name: string
+
+proc makePerson(): Person = discard
+func makeText(): string = "hello"
+proc infer() = discard
+
+proc show() =
+  let person = makePerson()
+  let text = makeText()
+  let unknown = infer()
+  discard person
+  discard text
+  discard unknown
+"""
+    check hoverFor(source, "person").signature == "let person: Person"
+    check hoverFor(source, "text").signature == "let text: string"
+    let unknown = hoverFor(source, "unknown")
+    check unknown.state == hoverAvailable
+    check unknown.name == "unknown"
+    check unknown.signature.len == 0
+
+  test "propagates a project procedure return type":
+    let root = getTempDir() / ("onim-hover-return-" & $getCurrentProcessId())
+    if dirExists(root):
+      removeDir(root)
+    createDir(root)
+    let providerPath = root / "provider.nim"
+    let consumerPath = root / "consumer.nim"
+    let provider = """type Person* = object
+  name*: string
+
+proc makePerson*(): Person = discard
+"""
+    let consumer = """import provider as model
+proc show() =
+  let person = model.makePerson()
+  discard person
+"""
+    writeFile(providerPath, provider)
+    writeFile(consumerPath, consumer)
+    defer:
+      if fileExists(providerPath):
+        removeFile(providerPath)
+      if fileExists(consumerPath):
+        removeFile(consumerPath)
+      if dirExists(root):
+        removeDir(root)
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    let snapshot = workspace.snapshotForFile(workspace.fileIdForPath(consumerPath))
+    let info =
+      resolveHover(workspace, snapshot, consumer.find("person") + 1, stdlibMap())
+    check info.state == hoverAvailable
+    check info.signature == "let person: Person"
 
   test "keeps unsupported local inference conservative":
     let source = """proc show() =

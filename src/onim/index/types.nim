@@ -24,8 +24,15 @@ type
     localTypeString
     localTypeInt
 
+  LocalTypeForm* = enum
+    localTypeFormUnknown
+    localTypeFormAnnotation
+    localTypeFormCall
+    localTypeFormLiteral
+
   LocalTypeInfo* = object
     kind*: LocalTypeKind
+    form*: LocalTypeForm
     typeToken*: uint32
     firstToken*: uint32
     pastToken*: uint32
@@ -34,6 +41,7 @@ type
     objects*: seq[ObjectTypeRecord]
     fields*: seq[ObjectField]
     localTypeUses*: seq[uint32]
+    routineReturnTypeUses*: seq[uint32]
 
 const InvalidTypeToken* = high(uint32)
 
@@ -250,15 +258,15 @@ proc nominalTypeToken(tokens: TokenStore, first, past: int): uint32 =
     return uint32(cursor + 2)
   InvalidTypeToken
 
-proc constructorTypeToken(tokens: TokenStore, first, past: int): uint32 =
+proc directCallInfo(tokens: TokenStore, first, past: int): LocalTypeInfo =
   if first >= past or not validNameToken(tokens, first):
-    return InvalidTypeToken
+    return
   var nameToken = first
   if first + 2 < past and tokens[first + 1].text == "." and
       validNameToken(tokens, first + 2):
     nameToken = first + 2
   if nameToken + 1 >= past or tokens[nameToken + 1].text != "(":
-    return InvalidTypeToken
+    return
   var delimiters: seq[char] = @[]
   for index in nameToken + 1 ..< past:
     let text = tokens[index].text
@@ -266,13 +274,17 @@ proc constructorTypeToken(tokens: TokenStore, first, past: int): uint32 =
       delimiters.add text[0]
     elif text == ")" or text == "]" or text == "}":
       if delimiters.len == 0 or not matchingDelimiter(delimiters[^1], text[0]):
-        return InvalidTypeToken
+        return
       delimiters.setLen(delimiters.len - 1)
       if delimiters.len == 0 and index + 1 != past:
-        return InvalidTypeToken
+        return
   if delimiters.len != 0:
-    return InvalidTypeToken
-  uint32(nameToken)
+    return
+  result.kind = localTypeNamed
+  result.form = localTypeFormCall
+  result.typeToken = uint32(nameToken)
+  result.firstToken = uint32(first)
+  result.pastToken = uint32(nameToken + 1)
 
 proc typeUseFor(tokens: TokenStore, declaration: LexicalDeclaration): uint32 =
   let split = splitDeclaration(tokens, declaration)
@@ -284,7 +296,9 @@ proc typeUseFor(tokens: TokenStore, declaration: LexicalDeclaration): uint32 =
         int(declaration.pastToken)
     return nominalTypeToken(tokens, split.colon + 1, past)
   if split.equals >= 0:
-    return constructorTypeToken(tokens, split.equals + 1, int(declaration.pastToken))
+    let call = directCallInfo(tokens, split.equals + 1, int(declaration.pastToken))
+    if call.form == localTypeFormCall:
+      return call.typeToken
   InvalidTypeToken
 
 proc directLiteralKind(tokens: TokenStore, first, past: int): LocalTypeKind =
@@ -319,15 +333,6 @@ proc directLiteralKind(tokens: TokenStore, first, past: int): LocalTypeKind =
     previousEnd = token.endOffset
   localTypeInt
 
-proc constructorTypeSpan(
-    tokens: TokenStore, typeToken: uint32
-): tuple[first, past: int] =
-  result.first = int(typeToken)
-  result.past = result.first + 1
-  if result.first >= 2 and tokens[result.first - 1].text == "." and
-      validNameToken(tokens, result.first - 2):
-    result.first -= 2
-
 proc localTypeAt*(
     types: TypeIndex, tokens: TokenStore, scopes: ScopeIndex, declarationToken: uint32
 ): LocalTypeInfo =
@@ -351,6 +356,7 @@ proc localTypeAt*(
         types.localTypeUses[declarationOrdinal] != typeToken:
       return
     result.kind = localTypeNamed
+    result.form = localTypeFormAnnotation
     result.typeToken = typeToken
     result.firstToken = uint32(split.colon + 1)
     result.pastToken = uint32(past)
@@ -358,21 +364,87 @@ proc localTypeAt*(
   if split.equals < 0:
     return
 
-  let typeToken = typeUseFor(tokens, declaration)
-  if typeToken != InvalidTypeToken:
-    if types.localTypeUses[declarationOrdinal] != typeToken:
+  let call = directCallInfo(tokens, split.equals + 1, int(declaration.pastToken))
+  if call.form == localTypeFormCall:
+    if types.localTypeUses[declarationOrdinal] != call.typeToken:
       return
-    let span = constructorTypeSpan(tokens, typeToken)
-    result.kind = localTypeNamed
-    result.typeToken = typeToken
-    result.firstToken = uint32(span.first)
-    result.pastToken = uint32(span.past)
-    return
+    return call
 
   result.kind = directLiteralKind(tokens, split.equals + 1, int(declaration.pastToken))
   if result.kind != localTypeUnknown:
+    result.form = localTypeFormLiteral
     result.firstToken = uint32(split.equals + 1)
     result.pastToken = declaration.pastToken
+
+proc routineReturnSpan(
+    tokens: TokenStore, symbol: SourceSymbol
+): tuple[typeToken: uint32, first, past: int] =
+  result.typeToken = InvalidTypeToken
+  result.first = -1
+  result.past = -1
+  if symbol.kind notin {symbolProc, symbolFunc} or symbol.nameToken >= uint32(
+    tokens.len
+  ):
+    return
+  let nameToken = int(symbol.nameToken)
+  if nameToken <= 0 or
+      not tokens[nameToken - 1].isKeyword(kwProc) and
+      not tokens[nameToken - 1].isKeyword(kwFunc):
+    return
+  var opening = nameToken + 1
+  if opening < tokens.len and tokens[opening].text == "*":
+    inc opening
+  if opening >= tokens.len or tokens[opening].text != "(":
+    return
+
+  var delimiters: seq[char] = @[]
+  var closing = -1
+  for index in opening ..< tokens.len:
+    let text = tokens[index].text
+    if text.len == 1 and isOpeningDelimiter(text[0]):
+      delimiters.add text[0]
+    elif text.len == 1 and isClosingDelimiter(text[0]):
+      if delimiters.len == 0 or not matchingDelimiter(delimiters[^1], text[0]):
+        return
+      delimiters.setLen(delimiters.len - 1)
+      if delimiters.len == 0:
+        closing = index
+        break
+  if closing < 0 or closing + 1 >= tokens.len or tokens[closing + 1].text != ":":
+    return
+
+  let first = closing + 2
+  var past = first
+  while past < tokens.len and tokens[past].text != "=":
+    inc past
+  if first >= past:
+    return
+  let typeToken = nominalTypeToken(tokens, first, past)
+  if typeToken == InvalidTypeToken:
+    return
+  result.typeToken = typeToken
+  result.first = first
+  result.past = past
+
+proc routineReturnAt*(
+    types: TypeIndex,
+    tokens: TokenStore,
+    symbols: openArray[SourceSymbol],
+    symbolOrdinal: int,
+): LocalTypeInfo =
+  if types.routineReturnTypeUses.len != symbols.len or symbolOrdinal < 0 or
+      symbolOrdinal >= symbols.len:
+    return
+  if types.routineReturnTypeUses[symbolOrdinal] == InvalidTypeToken:
+    return
+  let span = routineReturnSpan(tokens, symbols[symbolOrdinal])
+  if span.typeToken != types.routineReturnTypeUses[symbolOrdinal]:
+    return
+  result.kind = localTypeNamed
+  result.form = localTypeFormAnnotation
+  result.typeToken = span.typeToken
+  result.firstToken = uint32(span.first)
+  result.pastToken = uint32(span.past)
 
 proc indexTypes*(
     tokens: TokenStore, symbols: openArray[SourceSymbol], scopes: ScopeIndex
@@ -380,7 +452,10 @@ proc indexTypes*(
   result.localTypeUses = newSeq[uint32](scopes.declarations.len)
   for declarationIndex, declaration in scopes.declarations:
     result.localTypeUses[declarationIndex] = typeUseFor(tokens, declaration)
-  for symbol in symbols:
+  result.routineReturnTypeUses = newSeq[uint32](symbols.len)
+  for symbolIndex, symbol in symbols:
+    result.routineReturnTypeUses[symbolIndex] =
+      routineReturnSpan(tokens, symbol).typeToken
     if symbol.kind == symbolType:
       discard indexObject(tokens, symbol, result)
 
@@ -447,7 +522,8 @@ proc validateTypeIndex*(
     symbols: openArray[SourceSymbol],
     scopes: ScopeIndex,
 ): bool =
-  if index.localTypeUses.len != scopes.declarations.len:
+  if index.localTypeUses.len != scopes.declarations.len or
+      index.routineReturnTypeUses.len != symbols.len:
     return false
   var previousObject = high(uint32)
   for objectType in index.objects:
@@ -484,5 +560,11 @@ proc validateTypeIndex*(
     let declaration = scopes.declarations[declarationIndex]
     if typeToken < declaration.firstToken or typeToken >= declaration.pastToken or
         not validNameToken(tokens, int(typeToken)):
+      return false
+  for symbolIndex, typeToken in index.routineReturnTypeUses:
+    if typeToken == InvalidTypeToken:
+      continue
+    if symbolIndex >= symbols.len or
+        routineReturnSpan(tokens, symbols[symbolIndex]).typeToken != typeToken:
       return false
   true

@@ -131,6 +131,12 @@ source names, and unused `from` imports. It returns no edit for ambiguous,
 conditional, re-exported, generated, stale, colliding, or otherwise unsupported
 bindings instead of guessing.
 
+Native local type propagation is intentionally bounded: it handles explicit nominal
+types, simple literals, and one direct same-workspace `proc`/`func` call with an
+explicit nominal `ref`/`ptr` return. Unsupported overloads, generics, UFCS,
+macros/templates, and inferred or generated types remain unresolved rather than
+being guessed; the existing compiler boundary may handle those cases.
+
 ## Zed
 
 Put `onim` on `PATH`, or expose the executable as an `onim` language-server entry in the Nim language extension. Keep the existing Nim server if desired; onim only contributes the organize-imports action. Add the following to the corresponding parts of `~/.config/zed/settings.json`:
