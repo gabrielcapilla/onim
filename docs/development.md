@@ -39,7 +39,7 @@ nimble bench
 
 Treat benchmark output as evidence for a fixed workload only. It does not establish a universal latency or memory guarantee. Reproduce memory or process-lifetime reports with a named project, a fixed sequence of LSP messages, and resident-memory/process-tree measurements before changing the architecture.
 
-For protocol evidence, set `ONIM_TRACE_LSP=1`; it emits diagnostic publication events with a hashed URI, versions, numeric snapshot generations, reason, and count, plus code-action request events with a hashed request ID, generations, duration, result state, and worker state. It never emits source text or paths. Set `ONIM_TRACE_WORKERS=1` to trace semantic/bootstrap worker start, cancellation, interruption, and reap events. Both are disabled by default.
+For protocol evidence, set `ONIM_TRACE_LSP=1`; it emits diagnostic publication events with a hashed URI, versions, numeric snapshot generations, reason, and count, plus code-action request events with a hashed request ID, generations, duration, result state, worker state, and Linux `rssKb`/`peakRssKb` process-memory fields. It never emits source text or paths. Set `ONIM_TRACE_WORKERS=1` to trace semantic/bootstrap worker start, cancellation, interruption, and reap events. Both are disabled by default.
 
 ## Source layout
 
