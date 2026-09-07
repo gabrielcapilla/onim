@@ -323,6 +323,7 @@ suite "stdio LSP":
       "tokenTypes"
     ].len == 8
     check initialized["result"]["capabilities"]["workspaceSymbolProvider"].getBool
+    check initialized["result"]["capabilities"]["inlayHintProvider"].getBool
     check not initialized["result"]["capabilities"]["completionProvider"][
       "resolveProvider"
     ].getBool
@@ -584,6 +585,27 @@ suite "stdio LSP":
       },
     )
     check readDiagnostics(process.outputStream, highlightUri) != nil
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "textDocument/inlayHint",
+        "params": {
+          "textDocument": {"uri": highlightUri},
+          "range":
+            {"start": {"line": 0, "character": 0}, "end": {"line": 3, "character": 0}},
+        },
+      },
+    )
+    let inlays = readResponse(process.outputStream, 32)
+    check inlays != nil
+    check inlays["result"].kind == JArray
+    check inlays["result"].len == 1
+    check inlays["result"][0]["label"].getStr == ": int"
+    check inlays["result"][0]["kind"].getInt == 1
+    check inlays["result"][0]["position"]["line"].getInt == 1
+    check inlays["result"][0]["position"]["character"].getInt == 11
     sendMessage(
       process.inputStream,
       %*{

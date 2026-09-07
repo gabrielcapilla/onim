@@ -9,6 +9,7 @@ elif defined(windows):
 import ../features/completion
 import ../features/definition
 import ../features/hover
+import ../features/inlay
 import ../features/organize
 import ../features/references
 import ../features/rename
@@ -394,6 +395,11 @@ proc validPositionValue(position: JsonNode): bool =
   line.getInt >= 0 and character.getInt >= 0 and line.getInt <= int64(high(int)) and
     character.getInt <= int64(high(int))
 
+proc validRangeValue(value: JsonNode): bool =
+  value != nil and value.kind == JObject and value.hasKey("start") and
+    value.hasKey("end") and validPositionValue(value["start"]) and
+    validPositionValue(value["end"])
+
 proc validPositionParams(params: JsonNode): bool =
   validTextDocumentParams(params) and params.hasKey("position") and
     validPositionValue(params["position"])
@@ -496,7 +502,7 @@ proc validMethodForm(methodName: string, hasId: bool): bool =
       "textDocument/documentHighlight", "textDocument/foldingRange",
       "textDocument/selectionRange", "textDocument/signatureHelp",
       "textDocument/semanticTokens/full", "textDocument/documentLink",
-      "textDocument/codeAction", "workspace/symbol":
+      "textDocument/inlayHint", "textDocument/codeAction", "workspace/symbol":
     hasId
   of "initialized", "textDocument/didOpen", "textDocument/didChange",
       "textDocument/didSave", "textDocument/didClose",
@@ -525,6 +531,9 @@ proc validMethodParams(methodName: string, params: JsonNode): bool =
       "textDocument/completion", "textDocument/documentHighlight",
       "textDocument/signatureHelp":
     validPositionParams(params)
+  of "textDocument/inlayHint":
+    validTextDocumentParams(params) and params.hasKey("range") and
+      validRangeValue(params["range"])
   of "textDocument/references":
     validReferencesParams(params)
   of "textDocument/rename":
@@ -1299,6 +1308,85 @@ proc documentSymbols(params: JsonNode, workspace: Workspace): JsonNode =
       "kind": documentSymbolKind(symbol.kind),
       "range": {"start": start, "end": finish},
       "selectionRange": {"start": start, "end": finish},
+    }
+
+proc inlayTypeLabel(
+    types: TypeIndex, tokens: TokenStore, id: TypeId, depth: uint8 = 0'u8
+): string =
+  if not id.valid or depth > 4'u8:
+    return
+  let ordinal = int(uint32(id)) - 1
+  if ordinal < 0 or ordinal >= types.records.len:
+    return
+  let record = types.records[ordinal]
+  case record.kind
+  of typeBool, typeChar, typeString, typeInt, typeFloat:
+    result = record.kind.primitiveTypeName
+  of typeNamed:
+    if record.nameToken < uint32(tokens.len):
+      result = tokens.tokenText(tokens[int(record.nameToken)])
+  of typeSeq:
+    let base = inlayTypeLabel(types, tokens, record.baseType, depth + 1'u8)
+    if base.len > 0:
+      result = "seq[" & base & "]"
+  of typeRef:
+    let base = inlayTypeLabel(types, tokens, record.baseType, depth + 1'u8)
+    if base.len > 0:
+      result = "ref " & base
+  of typeArray:
+    let base = inlayTypeLabel(types, tokens, record.baseType, depth + 1'u8)
+    if base.len > 0:
+      result = "array[" & $record.extent & ", " & base & "]"
+  of typeGenericInstance:
+    if record.nameToken < uint32(tokens.len):
+      let base = inlayTypeLabel(types, tokens, record.baseType, depth + 1'u8)
+      if base.len > 0:
+        result = tokens.tokenText(tokens[int(record.nameToken)]) & "[" & base & "]"
+  of typeUnknown:
+    result = ""
+
+proc inlayHints(params: JsonNode, workspace: Workspace): JsonNode =
+  result = newJArray()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let source = workspace.snapshotForDocument(uriText, path)
+  if not source.valid or source.index == nil:
+    return
+  let positions = initPositionIndex(source.text)
+  let range = params["range"]
+  let firstOffset = offsetAt(positions, source.text, range["start"])
+  let pastOffset = offsetAt(positions, source.text, range["end"])
+  if firstOffset < 0 or pastOffset < firstOffset:
+    return
+  for hint in inferredInlayHints(workspace, source, firstOffset, pastOffset):
+    if hint.declarationToken >= uint32(source.index.parsed.tokens.len):
+      continue
+    let token = source.index.parsed.tokens[int(hint.declarationToken)]
+    if token.endOffset <= token.startOffset or token.endOffset > source.text.len:
+      continue
+    let typeSource = workspace.snapshotForFile(hint.typeResolution.fileId)
+    if not typeSource.valid or typeSource.index == nil or
+        typeSource.id.value != hint.typeResolution.snapshotId.value or
+        typeSource.contentGeneration.value != hint.typeResolution.contentGeneration.value:
+      continue
+    let label = inlayTypeLabel(
+      typeSource.index.types, typeSource.index.parsed.tokens,
+      hint.typeResolution.info.typeId,
+    )
+    if label.len == 0:
+      continue
+    result.add %*{
+      "position": positionAt(positions, source.text, token.endOffset),
+      "label": ": " & label,
+      "kind": 1,
+      "paddingLeft": true,
     }
 
 proc workspaceSymbols(params: JsonNode, workspace: Workspace): JsonNode =
@@ -2193,6 +2281,7 @@ proc runLsp*() =
       capabilities["foldingRangeProvider"] = %true
       capabilities["selectionRangeProvider"] = %true
       capabilities["documentLinkProvider"] = %*{"resolveProvider": false}
+      capabilities["inlayHintProvider"] = %true
       capabilities["signatureHelpProvider"] =
         %*{"triggerCharacters": ["(", ","], "retriggerCharacters": [","]}
       var semanticTokenTypes = newJArray()
@@ -2339,6 +2428,9 @@ proc runLsp*() =
     of "textDocument/completion":
       if hasId:
         sendResponse(id, completionResponse(params, workspace, stdlib))
+    of "textDocument/inlayHint":
+      if hasId:
+        sendResponse(id, inlayHints(params, workspace))
     of "textDocument/documentSymbol":
       if hasId:
         sendResponse(id, documentSymbols(params, workspace))

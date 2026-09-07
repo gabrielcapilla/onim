@@ -11,7 +11,7 @@ protocol -> features -> session -> index -> syntax
 ```
 
 - `protocol/` owns LSP transport, positions, request dispatch, and response lifecycle.
-- `features/` owns user-visible actions such as organize-imports, completion, definitions, references, hover, rename, and document symbols.
+- `features/` owns user-visible actions such as organize-imports, completion, definitions, references, hover, rename, document symbols, and inlay hints.
 - `session/` owns document overlays, snapshots, numeric identities, and the workspace dependency graph.
 - `index/` owns per-source indexes, occurrences, scopes, module surfaces, and validated disk persistence.
 - `syntax/` owns lexing and conservative structural parsing.

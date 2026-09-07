@@ -38,6 +38,7 @@ The current native index covers the common local and workspace cases for:
 - references and rename for proven bindings;
 - local and direct imported-module completion;
 - hover and document symbols;
+- inferred type inlay hints for resolved literal and direct-call bindings;
 - syntax and conservative semantic diagnostics.
 
 Unsupported or uncertain syntax is left unresolved rather than guessed. The current implementation still has a compiler/nimsuggest semantic boundary for cases that cannot be resolved by the native index. This is an implementation detail under active replacement, not a promise that every Nim construct is already supported.
