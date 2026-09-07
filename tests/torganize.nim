@@ -107,6 +107,11 @@ suite "organize imports":
 
   test "organizeSource uses the native index before compiler fallback":
     let source = "for k, v in walkDir(\"/tmp\"):\n  discard k\n"
+    let attempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim", source, indexSource(source), loadStdlibMap("")
+    )
+    check attempt.handled
+    check applyEdits(source, attempt.edits) == "import std/os\n\n" & source
     let edits = organizeSource("/no/such/file.nim", source)
     check applyEdits(source, edits) == "import std/os\n\n" & source
 
@@ -241,12 +246,12 @@ suite "organize imports":
     check second.handled
     check second.edits.len == 0
 
-  test "falls back when a local declaration can shadow an indexed stdlib name":
+  test "keeps a local declaration that shadows an indexed stdlib name natively":
     let source = "proc walkDir() = discard\n" & "proc main() =\n" & "  walkDir()\n"
     let index = indexSource(source)
     let attempt =
       tryOrganizeSourceWithIndex("/no/such/file.nim", source, index, loadStdlibMap(""))
-    check not attempt.handled
+    check attempt.handled
     check attempt.edits.len == 0
 
   test "keeps a used indexed stdlib import without compiler validation":

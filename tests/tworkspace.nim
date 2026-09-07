@@ -8,7 +8,8 @@ import onim/index/source_index
 import onim/index/surfaces
 import onim/session/ids
 import onim/session/workspace
-import onim/syntax/lexer
+import onim/syntax/parser
+import onim/index/types
 
 proc uriFor(path: string): string =
   "file://" & path.replace('\\', '/')
@@ -60,57 +61,6 @@ proc replaceLine(source: string, line: int, name: string): string =
   lines.join("\n")
 
 suite "workspace index":
-  test "token store preserves logical order with copy-on-write blocks":
-    var expected = newSeq[Token](tokenBlockLength * 2 + 1)
-    for index in 0 ..< expected.len:
-      expected[index] = Token(
-        kind: tkIdentifier,
-        text: "token" & $index,
-        startOffset: index,
-        endOffset: index + 1,
-        line: index,
-        column: 0,
-      )
-    let empty = initTokenStore(newSeq[Token]())
-    check empty.len == 0
-    check empty.high == -1
-    var boundsRaised = false
-    try:
-      discard empty[0]
-    except IndexDefect:
-      boundsRaised = true
-    check boundsRaised
-    let one = initTokenStore(@[expected[0]])
-    check one.len == 1
-    check one[0] == expected[0]
-    let base = initTokenStore(expected)
-    check base.len == expected.len
-    check base.high == expected.high
-    check base == expected
-    check base.toSeq == expected
-
-    var changed = base[tokenBlockLength]
-    changed.text = "middle"
-    let middle = base.withToken(tokenBlockLength, changed)
-    check base[tokenBlockLength].text == "token" & $tokenBlockLength
-    check middle[tokenBlockLength].text == "middle"
-    check middle[0] == base[0]
-    check middle[middle.high] == base[base.high]
-
-    changed = middle[tokenBlockLength]
-    changed.text = "center"
-    let repeated = middle.withToken(tokenBlockLength, changed)
-    check middle[tokenBlockLength].text == "middle"
-    check repeated[tokenBlockLength].text == "center"
-
-    changed = repeated[repeated.high]
-    changed.text = "last"
-    let last = repeated.withToken(repeated.high, changed)
-    check repeated[repeated.high].text == "token" & $(expected.high)
-    check last[last.high].text == "last"
-    check last[tokenBlockLength].text == "center"
-    check last.toSeq[tokenBlockLength].text == "center"
-
   test "persists and reloads source indexes":
     let root = getTempDir() / ("onim-cache-project-" & $getCurrentProcessId())
     let cacheRoot = getTempDir() / ("onim-cache-" & $getCurrentProcessId())
@@ -119,7 +69,7 @@ suite "workspace index":
     createDir(root)
     let filePath = root / "cached.nim"
     let source =
-      "import std/os\nproc listFiles(dir: string) =\n  discard walkDir(dir)\n"
+      "import std/os\nproc listFiles(dir: string) =\n  let widths: array[4, int] = default(array[4, int])\n  discard walkDir(dir)\n  discard widths\n"
     writeFile(filePath, source)
 
     let previousCacheRoot = getEnv("ONIM_CACHE_DIR")
@@ -181,6 +131,19 @@ suite "workspace index":
     check secondSnapshot.index.occurrences.validateOccurrences(
       secondSnapshot.index.parsed.tokens
     )
+    var widthsToken = InvalidTypeToken
+    for declaration in secondSnapshot.index.scopes.declarations:
+      let token = secondSnapshot.index.parsed.tokens[int(declaration.nameToken)]
+      if secondSnapshot.index.parsed.tokens.tokenTextEquals(token, "widths"):
+        widthsToken = declaration.nameToken
+    check widthsToken != InvalidTypeToken
+    let widths = secondSnapshot.index.types.localTypeAt(
+      secondSnapshot.index.parsed.tokens, secondSnapshot.index.scopes, widthsToken
+    )
+    check widths.kind == typeArray
+    check secondSnapshot.index.types.records[int(uint32(widths.typeId)) - 1].extent ==
+      4'u32
+    check secondSnapshot.index.nativeIndexSafe()
 
     let cacheBytes = readFile(path)
     writeFile(path, cacheBytes & "trailing")
@@ -191,6 +154,114 @@ suite "workspace index":
     let manifestBytes = readFile(manifestPath)
     writeFile(manifestPath, manifestBytes & "trailing")
     check loadProjectManifest(root).entries.len == 0
+
+  test "persists recovered import boundaries":
+    let root = getTempDir() / ("onim-recovery-cache-project-" & $getCurrentProcessId())
+    let cacheRoot = getTempDir() / ("onim-recovery-cache-" & $getCurrentProcessId())
+    cleanTree(root)
+    cleanTree(cacheRoot)
+    createDir(root)
+    let modulePath = root / "main.nim"
+    let source = "import goodA\nimport pkg/[part,\nimport goodB\n"
+    let previousCacheRoot = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
+    defer:
+      if previousCacheRoot.len > 0:
+        putEnv("ONIM_CACHE_DIR", previousCacheRoot)
+      else:
+        delEnv("ONIM_CACHE_DIR")
+      cleanTree(root)
+      cleanTree(cacheRoot)
+
+    let index = indexSource(source)
+    check index.syntax.importNodes.len == 3
+    check index.imports == @["goodA", "goodB"]
+    check saveCachedSourceIndex(root, modulePath, source, index)
+    let loaded = loadCachedSourceIndex(root, modulePath, source)
+    check loaded != nil
+    check loaded.imports == index.imports
+    check loaded.parsed.imports == index.parsed.imports
+    check loaded.syntax.importNodes.len == index.syntax.importNodes.len
+    check loaded.syntax.nodes[int(uint32(loaded.syntax.importNodes[1])) - 1].uncertainty ==
+      index.syntax.nodes[int(uint32(index.syntax.importNodes[1])) - 1].uncertainty
+    check loaded.syntax.importsMatch(loaded.parsed)
+
+  test "indexes complete include statements without phantom dependencies":
+    let root = getTempDir() / ("onim-include-project-" & $getCurrentProcessId())
+    let cacheRoot = getTempDir() / ("onim-include-cache-" & $getCurrentProcessId())
+    cleanTree(root)
+    cleanTree(cacheRoot)
+    createDir(root)
+    createDir(root / "pkg")
+    let mainPath = root / "main.nim"
+    let source =
+      "include\n" & "import goodA\n" & "include first, \"second\", pkg/[third, fourth]\n" &
+      "include broken/[part,\n" & "include final\n"
+    writeFile(mainPath, source)
+    for path in [
+      root / "goodA.nim",
+      root / "first.nim",
+      root / "second.nim",
+      root / "final.nim",
+      root / "import.nim",
+      root / "broken.nim",
+      root / "pkg" / "third.nim",
+      root / "pkg" / "fourth.nim",
+    ]:
+      writeFile(path, "")
+
+    let previousCacheRoot = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
+    defer:
+      if previousCacheRoot.len > 0:
+        putEnv("ONIM_CACHE_DIR", previousCacheRoot)
+      else:
+        delEnv("ONIM_CACHE_DIR")
+      cleanTree(root)
+      cleanTree(cacheRoot)
+
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    let mainId = workspace.fileIdForPath(mainPath)
+    let snapshot = workspace.snapshotForFile(mainId)
+    check snapshot.index.syntax.importNodes.len == 1
+    var certainIncludes = 0
+    var uncertainIncludes = 0
+    for node in snapshot.index.syntax.nodes:
+      if node.kind != syntaxInclude:
+        continue
+      if node.uncertainty == {}:
+        inc certainIncludes
+      else:
+        inc uncertainIncludes
+    check certainIncludes == 2
+    check uncertainIncludes == 2
+    check workspace.graphComplete
+    for path in [
+      root / "goodA.nim",
+      root / "first.nim",
+      root / "second.nim",
+      root / "final.nim",
+      root / "pkg" / "third.nim",
+      root / "pkg" / "fourth.nim",
+    ]:
+      check workspace.dependencies(mainId).hasId(workspace.fileIdForPath(path))
+    check not workspace.dependencies(mainId).hasId(
+      workspace.fileIdForPath(root / "import.nim")
+    )
+    check not workspace.dependencies(mainId).hasId(
+      workspace.fileIdForPath(root / "broken.nim")
+    )
+
+    let warm = initWorkspace(root)
+    warm.indexWorkspace()
+    let warmMain = warm.fileIdForPath(mainPath)
+    check warm.graphComplete
+    let coldDependencies = workspace.dependencies(mainId)
+    let warmDependencies = warm.dependencies(warmMain)
+    check warmDependencies.len == coldDependencies.len
+    for index in 0 ..< coldDependencies.len:
+      check sameId(warmDependencies[index], coldDependencies[index])
 
   test "reconciles deleted and recreated modules":
     let root = getTempDir() / ("onim-reconcile-" & $getCurrentProcessId())
@@ -219,6 +290,7 @@ suite "workspace index":
     let consumerId = workspace.fileIdForPath(consumerPath)
     check workspace.dependencies(consumerId).hasId(providerId)
     check workspace.graphComplete
+
     check workspace.manifest.graphValid
     discard workspace.drainInvalidated()
 
@@ -242,6 +314,43 @@ suite "workspace index":
     check workspace.snapshotForFile(providerId).state == workspaceOnDisk
     check workspace.dependencies(consumerId).hasId(providerId)
     check workspace.graphComplete
+
+  test "invalidates only the reverse dependency closure":
+    let root = getTempDir() / ("onim-invalidation-" & $getCurrentProcessId())
+    cleanRoot(root)
+    createDir(root)
+    defer:
+      cleanRoot(root)
+
+    let providerPath = root / "provider.nim"
+    let consumerPath = root / "consumer.nim"
+    let downstreamPath = root / "downstream.nim"
+    let unrelatedPath = root / "unrelated.nim"
+    writeFile(providerPath, "proc provided*() = discard\n")
+    writeFile(consumerPath, "import provider\nprovided()\n")
+    writeFile(downstreamPath, "import consumer\n")
+    writeFile(unrelatedPath, "proc idle*() = discard\n")
+
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    let providerId = workspace.fileIdForPath(providerPath)
+    let consumerId = workspace.fileIdForPath(consumerPath)
+    let downstreamId = workspace.fileIdForPath(downstreamPath)
+    let unrelatedId = workspace.fileIdForPath(unrelatedPath)
+    check workspace.graphComplete
+    discard workspace.drainInvalidated()
+    let unrelatedGeneration =
+      workspace.snapshotForFile(unrelatedId).dependencyGeneration
+
+    writeFile(providerPath, "proc provided*() = echo 1\n")
+    workspace.fileChanged(providerPath)
+    let invalidated = workspace.drainInvalidated()
+    check invalidated.hasId(providerId)
+    check invalidated.hasId(consumerId)
+    check invalidated.hasId(downstreamId)
+    check not invalidated.hasId(unrelatedId)
+    check workspace.snapshotForFile(unrelatedId).dependencyGeneration.value ==
+      unrelatedGeneration.value
 
   test "caches and invalidates the project surface":
     let root = getTempDir() / ("onim-surface-workspace-" & $getCurrentProcessId())
@@ -337,6 +446,7 @@ suite "workspace index":
     let dPath = root / "d.nim"
     let ePath = root / "e.nim"
     let exporterPath = root / "exporter.nim"
+    let localThingPath = root / "localThing.nim"
     let includeParentPath = root / "include_parent.nim"
     let includedPath = root / "included.nim"
     let cycleOnePath = root / "cycle1.nim"
@@ -348,7 +458,13 @@ suite "workspace index":
     writeFile(cPath, cText)
     writeFile(dPath, "import c\n")
     writeFile(ePath, "import b\nimport d\n")
-    writeFile(exporterPath, "import c\nexport c\n")
+    writeFile(
+      exporterPath,
+      "import c\nfrom c import c\nimport c as moduleAlias\n" &
+        "proc localThing() = discard\nexport c\nexport moduleAlias\n" &
+        "export c\nexport localThing\n",
+    )
+    writeFile(localThingPath, "proc decoy() = discard\n")
     writeFile(includeParentPath, "include included\n")
     writeFile(includedPath, "const includedValue = 1\n")
     writeFile(cycleOnePath, "import cycle2\n")
@@ -356,7 +472,7 @@ suite "workspace index":
 
     let workspace = initWorkspace(root)
     workspace.indexWorkspace()
-    check workspace.fileCount == 10
+    check workspace.fileCount == 11
     check workspace.graphComplete
     check workspace.drainInvalidated().len == 0
 
@@ -366,6 +482,7 @@ suite "workspace index":
     let dId = workspace.fileIdForPath(dPath)
     let eId = workspace.fileIdForPath(ePath)
     let exporterId = workspace.fileIdForPath(exporterPath)
+    let localThingId = workspace.fileIdForPath(localThingPath)
     let includeParentId = workspace.fileIdForPath(includeParentPath)
     let includedId = workspace.fileIdForPath(includedPath)
     let cycleOneId = workspace.fileIdForPath(cycleOnePath)
@@ -377,8 +494,18 @@ suite "workspace index":
     check workspace.dependencies(aId).hasId(cId)
     check workspace.dependencies(exporterId).len == 1
     check workspace.dependencies(exporterId).hasId(cId)
+    check not workspace.dependencies(exporterId).hasId(localThingId)
+    check workspace.dependents(localThingId).len == 0
     check workspace.dependencies(includeParentId).len == 1
     check workspace.dependencies(includeParentId).hasId(includedId)
+
+    let cachedBefore = workspace.snapshotForFile(cId)
+    workspace.indexWorkspace()
+    let cachedAfter = workspace.snapshotForFile(cId)
+    check cachedBefore.contentGeneration.value == cachedAfter.contentGeneration.value
+    check cachedBefore.dependencyGeneration.value ==
+      cachedAfter.dependencyGeneration.value
+    check cachedBefore.index == cachedAfter.index
 
     let cDependents = workspace.dependents(cId)
     check cDependents.len == 4
@@ -392,9 +519,29 @@ suite "workspace index":
     check includedDependents.len == 1
     check includedDependents.hasId(includeParentId)
 
+    writeFile(localThingPath, "proc changedDecoy() = discard\n")
+    workspace.fileChanged(localThingPath)
+    let decoyChanged = workspace.drainInvalidated()
+    check decoyChanged.hasId(localThingId)
+    check not decoyChanged.hasId(exporterId)
+
+    let unrelatedBefore = workspace.snapshotForFile(cId)
+    check workspace.changeDocument(
+      uriFor(aPath), aPath, "import b\nimport c\n# unrelated edit\n", 0
+    )
+    discard workspace.drainInvalidated()
+    let unrelatedAfter = workspace.snapshotForFile(cId)
+    check unrelatedBefore.fileId.sameId(unrelatedAfter.fileId)
+    check unrelatedBefore.contentGeneration.value ==
+      unrelatedAfter.contentGeneration.value
+    check unrelatedBefore.dependencyGeneration.value ==
+      unrelatedAfter.dependencyGeneration.value
+    check unrelatedBefore.index == unrelatedAfter.index
+
     let opened = workspace.openDocument(uriFor(cPath), cPath, cText, 1)
     check opened.sameId(cId)
     check workspace.drainInvalidated().len == 0
+
     check workspace.changeDocument(uriFor(cPath), cPath, cText, 2)
     check workspace.drainInvalidated().len == 0
 
@@ -451,10 +598,10 @@ suite "workspace index":
       uriFor(aPath), aPath, "import b\nimport c\n# changed\n", 1
     )
     let conservative = workspace.drainInvalidated()
-    check conservative.len == 2
+    check conservative.len == 1
     check conservative.sortedUnique
     check conservative.hasId(aId)
-    check conservative.hasId(unresolvedId)
+    check not conservative.hasId(unresolvedId)
 
     removeFile(unresolvedPath)
     workspace.fileChanged(unresolvedPath, deleted = true)

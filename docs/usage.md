@@ -25,6 +25,8 @@ These inputs are ignored:
 
 The CLI also accepts `--useStdPrefix:on`, `--stdio`, and `--lsp`. Without a file argument, `onim`, `onim --stdio`, and `onim --lsp` start the stdio LSP.
 
+Print the package version with `./onim --version`.
+
 ## LSP behavior
 
 The LSP operates over stdio and does not write files itself. Zed applies its returned `WorkspaceEdit` and then runs the configured formatter.

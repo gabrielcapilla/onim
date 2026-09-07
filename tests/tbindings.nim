@@ -17,7 +17,7 @@ suite "native lexical bindings":
     let index = indexSource(source)
     var values: seq[uint32] = @[]
     for tokenIndex, token in index.parsed.tokens:
-      if token.text == "value":
+      if index.parsed.tokens.tokenTextEquals(token, "value"):
         values.add uint32(tokenIndex)
     check values.len == 4
     check index.resolveBinding(values[0]).state == bindingResolved
@@ -35,7 +35,7 @@ suite "native lexical bindings":
     let index = indexSource(source)
     var values: seq[uint32] = @[]
     for tokenIndex, token in index.parsed.tokens:
-      if token.text == "value":
+      if index.parsed.tokens.tokenTextEquals(token, "value"):
         values.add uint32(tokenIndex)
     check values.len == 3
     check index.resolveBinding(values[0]).state == bindingUnknown

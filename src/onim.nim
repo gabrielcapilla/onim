@@ -4,8 +4,14 @@ import onim/features/organize
 import onim/protocol/lsp
 import onim/semantic/worker
 
-proc usage() =
-  stderr.writeLine "usage: onim [--stdio] [--useStdPrefix:on|off] | onim file.nim"
+const onimVersion = staticRead("../onim.nimble").split('"')[1]
+
+proc usage(output: File) =
+  output.writeLine "usage: onim [--stdio] [--useStdPrefix:on|off] | onim file.nim"
+  output.writeLine "       onim --version"
+
+proc version(output: File) =
+  output.writeLine "onim " & onimVersion
 
 when isMainModule:
   if commandLineParams().len > 0 and commandLineParams()[0] == "--semantic-worker":
@@ -15,7 +21,13 @@ when isMainModule:
   var options = defaultOrganizeOptions()
   var runServer = true
   for argument in commandLineParams():
-    if argument == "--stdio" or argument == "--lsp":
+    if argument == "--help" or argument == "-h":
+      usage(stdout)
+      quit(0)
+    elif argument == "--version" or argument == "-v":
+      version(stdout)
+      quit(0)
+    elif argument == "--stdio" or argument == "--lsp":
       runServer = true
     elif argument.startsWith("--useStdPrefix:"):
       let value = argument["--useStdPrefix:".len .. ^1].toLowerAscii
@@ -24,13 +36,13 @@ when isMainModule:
     elif argument == "--no-std-prefix":
       options.useStdPrefix = false
     elif argument.startsWith("-"):
-      usage()
+      usage(stderr)
       quit 2
     elif filePath.len == 0:
       filePath = argument
       runServer = false
     else:
-      usage()
+      usage(stderr)
       quit 2
 
   if runServer:

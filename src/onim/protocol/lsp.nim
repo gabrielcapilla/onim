@@ -1,4 +1,10 @@
-import std/[json, streams, strutils, uri]
+import std/[atomics, json, monotimes, streams, strutils, times, uri]
+import std/os except FileId
+
+when defined(posix):
+  import std/posix
+elif defined(windows):
+  import std/winlean
 
 import ../features/completion
 import ../features/definition
@@ -6,6 +12,8 @@ import ../features/hover
 import ../features/organize
 import ../features/references
 import ../features/rename
+import ../features/semantic_tokens
+import ../features/signature
 import ../semantic/native_diagnostics
 import ../semantic/worker
 import ../session/bootstrap_worker
@@ -15,8 +23,11 @@ import ../session/workspace
 import ../index/source_index
 import ../index/surfaces
 import ../index/symbols
+import ../index/types
 import ../stdlib/map
 import ../syntax/lexer
+import ../syntax/imports
+import ../syntax/parser
 
 type
   CachedAction = object
@@ -38,11 +49,17 @@ type
   LspEventKind = enum
     lspMessageEvent
     lspBootstrapEvent
+    lspSemanticEvent
     lspEndEvent
 
   LspEvent = object
     kind: LspEventKind
     payload: string
+
+  PendingCodeAction = object
+    id: JsonNode
+    semantic: SemanticKey
+    uri: string
 
   BootstrapRuntime = object
     active: bool
@@ -50,20 +67,17 @@ type
     nextJobGeneration: uint64
     pending: BootstrapRequest
 
-  PendingDefinition = object
-    id: JsonNode
-    params: JsonNode
-
-  PendingReference = object
-    id: JsonNode
-    params: JsonNode
-
-  PendingRename = object
+  PendingWorkspaceRequest = object
     id: JsonNode
     params: JsonNode
 
   PositionIndex = object
     lineStarts: seq[int]
+
+  DiagnosticPublishReason = enum
+    diagnosticOpen
+    diagnosticEdit
+    diagnosticBootstrap
 
 proc hasCachedAction(cache: seq[CachedAction], id: FileId): bool {.inline.} =
   let slot = id.slot
@@ -85,11 +99,65 @@ proc storeCachedAction(
     cache.setLen(slot + 1)
   cache[slot] = action
 
+proc clearCachedAction(cache: var seq[CachedAction], id: FileId) {.inline.} =
+  let slot = id.slot
+  if slot < 0 or slot >= cache.len:
+    return
+  cache[slot] = CachedAction()
+  while cache.len > 0 and
+      cache[^1].contentGeneration.value == InvalidContentGeneration.value:
+    cache.setLen(cache.len - 1)
+
 var lspEvents: Channel[LspEvent]
 var lspInputReader: Thread[void]
 var lspBootstrapBridge: Thread[void]
 var lspInputReaderStarted = false
 var lspBootstrapBridgeStarted = false
+var lspSemanticBridge: Thread[void]
+var lspSemanticBridgeStarted = false
+var lspSemanticStopRequested: Atomic[bool]
+var lspTraceEnabled = false
+
+proc traceLsp(
+    event, uri: string,
+    version: int64,
+    snapshotId: SnapshotId,
+    fileId: FileId,
+    contentGeneration: ContentGeneration,
+    dependencyGeneration: DependencyGeneration,
+    reason, count: int,
+) {.inline.} =
+  if not lspTraceEnabled:
+    return
+  stderr.writeLine(
+    "onim lsp event=" & event & " uriHash=" & $contentFingerprint(uri) & " version=" &
+      $version & " snapshot=" & $uint64(snapshotId) & " file=" & $uint32(fileId) &
+      " content=" & $uint64(contentGeneration) & " dependency=" &
+      $uint64(dependencyGeneration) & " reason=" & $reason & " count=" & $count
+  )
+
+proc traceLspRequest(
+    event: string,
+    requestId: JsonNode,
+    startedAt: MonoTime,
+    key: SemanticKey,
+    state: string,
+) {.inline.} =
+  if not lspTraceEnabled:
+    return
+  let requestHash =
+    if requestId == nil:
+      0'u64
+    else:
+      contentFingerprint($requestId)
+  let durationNs = (getMonoTime() - startedAt).inNanoseconds
+  stderr.writeLine(
+    "onim lsp request event=" & event & " requestHash=" & $requestHash & " durationNs=" &
+      $durationNs & " state=" & state & " worker=" &
+      (if lspSemanticBridgeStarted: "active" else: "idle") & " file=" &
+      $uint32(key.fileId) & " content=" & $uint64(key.contentGeneration) & " dependency=" &
+      $uint64(key.dependencyGeneration) & " surface=" & $uint64(key.surfaceGeneration)
+  )
 
 proc sendMessage(message: JsonNode) =
   let body = $message
@@ -114,6 +182,15 @@ proc sendError(id: JsonNode, code: int, messageText: string) =
   response["error"] = error
   sendMessage(response)
 
+proc terminateProcessNow(code: int) {.noreturn.} =
+  when defined(posix):
+    posix.exitnow(cint(code))
+  elif defined(windows):
+    discard winlean.terminateProcess(winlean.getCurrentProcess(), code)
+    quit(code)
+  else:
+    quit(code)
+
 proc readMessageText(): string {.gcsafe.} =
   var contentLength = -1
   var line = ""
@@ -134,13 +211,32 @@ proc readMessageText(): string {.gcsafe.} =
   except CatchableError:
     result = ""
 
+proc isExitPayload(payload: string): bool {.gcsafe.} =
+  try:
+    let message = parseJson(payload)
+    if message == nil or message.kind != JObject or not message.hasKey("method") or
+        message["method"].kind != JString or message["method"].getStr != "exit" or
+        message.hasKey("id"):
+      return false
+    if not message.hasKey("params"):
+      return true
+    let params = message["params"]
+    result =
+      params != nil and
+      (params.kind == JNull or (params.kind == JObject and params.len == 0))
+  except CatchableError:
+    discard
+
 proc readInputEvents() {.thread, gcsafe.} =
   while true:
     let payload = readMessageText()
     if payload.len == 0:
       lspEvents.send(LspEvent(kind: lspEndEvent))
       break
+    let exitPayload = isExitPayload(payload)
     lspEvents.send(LspEvent(kind: lspMessageEvent, payload: payload))
+    if exitPayload:
+      break
 
 proc bootstrapEventBridge() {.thread, gcsafe.} =
   while true:
@@ -151,11 +247,71 @@ proc bootstrapEventBridge() {.thread, gcsafe.} =
     if value.kind == bootstrapStopped:
       break
 
+proc semanticEventBridge() {.thread, gcsafe.} =
+  while true:
+    let value = receiveSemantic()
+    if value.failed and not value.fileId.valid and
+        lspSemanticStopRequested.load(moRelaxed):
+      break
+    lspEvents.send(
+      LspEvent(kind: lspSemanticEvent, payload: encodeSemanticResult(value))
+    )
+    if value.failed and not value.fileId.valid:
+      break
+
+proc startSemanticBridge(): bool =
+  if lspSemanticBridgeStarted:
+    return true
+  try:
+    createThread(lspSemanticBridge, semanticEventBridge)
+    lspSemanticBridgeStarted = true
+    true
+  except CatchableError:
+    false
+
 proc parseMessage(payload: string): JsonNode =
   try:
     parseJson(payload)
   except CatchableError:
     nil
+
+proc validRequestId(node: JsonNode): bool {.inline.} =
+  node != nil and node.kind in {JInt, JString}
+
+proc validRequestEnvelope(message: JsonNode): bool =
+  if message == nil or message.kind != JObject or not message.hasKey("jsonrpc") or
+      message["jsonrpc"].kind != JString or message["jsonrpc"].getStr != "2.0" or
+      not message.hasKey("method") or message["method"].kind != JString:
+    return false
+  if message.hasKey("id") and not validRequestId(message["id"]):
+    return false
+  if message.hasKey("params") and (
+    message["params"] == nil or message["params"].kind notin {JObject, JArray, JNull}
+  ):
+    return false
+  true
+
+proc fullDocumentChange(
+    params: JsonNode
+): tuple[valid: bool, uri: string, text: string, version: int64] =
+  if params == nil or params.kind != JObject or not params.hasKey("textDocument") or
+      not params.hasKey("contentChanges"):
+    return
+  let document = params["textDocument"]
+  let changes = params["contentChanges"]
+  if document == nil or document.kind != JObject or not document.hasKey("uri") or
+      document["uri"].kind != JString or document["uri"].getStr.len == 0 or
+      not document.hasKey("version") or document["version"].kind != JInt or
+      changes == nil or changes.kind != JArray or changes.len != 1:
+    return
+  let change = changes[0]
+  if change == nil or change.kind != JObject or not change.hasKey("text") or
+      change["text"].kind != JString or change.hasKey("range"):
+    return
+  result.valid = true
+  result.uri = document["uri"].getStr
+  result.text = change["text"].getStr
+  result.version = document["version"].getInt
 
 proc uriToPath(uriText: string): string =
   if uriText.startsWith("file://"):
@@ -188,6 +344,189 @@ proc intOption(node: JsonNode, key: string, fallback: int64): int64 =
     int64(node[key].getInt)
   else:
     fallback
+
+proc validUriValue(node: JsonNode): bool =
+  if node == nil or node.kind != JString or node.getStr.len == 0:
+    return false
+  try:
+    uriToPath(node.getStr).len > 0
+  except CatchableError:
+    false
+
+proc validTextDocumentParams(params: JsonNode): bool =
+  if params == nil or params.kind != JObject or not params.hasKey("textDocument"):
+    return false
+  let document = params["textDocument"]
+  document != nil and document.kind == JObject and document.hasKey("uri") and
+    validUriValue(document["uri"])
+
+proc validPositionValue(position: JsonNode): bool =
+  if position == nil or position.kind != JObject or not position.hasKey("line") or
+      not position.hasKey("character"):
+    return false
+  let line = position["line"]
+  let character = position["character"]
+  if line == nil or line.kind != JInt or character == nil or character.kind != JInt:
+    return false
+  line.getInt >= 0 and character.getInt >= 0 and line.getInt <= int64(high(int)) and
+    character.getInt <= int64(high(int))
+
+proc validPositionParams(params: JsonNode): bool =
+  validTextDocumentParams(params) and params.hasKey("position") and
+    validPositionValue(params["position"])
+
+proc validSelectionRangeParams(params: JsonNode): bool =
+  if not validTextDocumentParams(params) or not params.hasKey("positions") or
+      params["positions"] == nil or params["positions"].kind != JArray:
+    return false
+  for position in params["positions"].items:
+    if not validPositionValue(position):
+      return false
+  true
+
+proc validInitializeParams(params: JsonNode): bool =
+  if params == nil or params.kind != JObject:
+    return false
+  for key in ["rootUri", "rootPath"]:
+    if params.hasKey(key) and params[key] != nil and
+        params[key].kind notin {JString, JNull}:
+      return false
+  if not params.hasKey("workspaceFolders"):
+    return true
+  let folders = params["workspaceFolders"]
+  if folders == nil or folders.kind == JNull:
+    return true
+  if folders.kind != JArray:
+    return false
+  for folder in folders.items:
+    if folder == nil or folder.kind != JObject or not folder.hasKey("uri") or
+        not validUriValue(folder["uri"]):
+      return false
+  true
+
+proc validDidOpenParams(params: JsonNode): bool =
+  if not validTextDocumentParams(params):
+    return false
+  let document = params["textDocument"]
+  document.hasKey("version") and document["version"] != nil and
+    document["version"].kind == JInt and document.hasKey("text") and
+    document["text"] != nil and document["text"].kind == JString
+
+proc validDidSaveParams(params: JsonNode): bool =
+  validTextDocumentParams(params) and (
+    not params.hasKey("text") or
+    (params["text"] != nil and params["text"].kind == JString)
+  )
+
+proc validWatchedFileParams(params: JsonNode): bool =
+  if params == nil or params.kind != JObject or not params.hasKey("changes") or
+      params["changes"] == nil or params["changes"].kind != JArray:
+    return false
+  for change in params["changes"].items:
+    if change == nil or change.kind != JObject or not change.hasKey("uri") or
+        not validUriValue(change["uri"]) or not change.hasKey("type") or
+        change["type"] == nil or change["type"].kind != JInt or change["type"].getInt < 1 or
+        change["type"].getInt > 3:
+      return false
+  true
+
+proc validReferencesParams(params: JsonNode): bool =
+  if not validPositionParams(params) or not params.hasKey("context"):
+    return false
+  let context = params["context"]
+  context != nil and context.kind == JObject and context.hasKey("includeDeclaration") and
+    context["includeDeclaration"] != nil and context["includeDeclaration"].kind == JBool
+
+proc validRenameParams(params: JsonNode): bool =
+  validPositionParams(params) and params.hasKey("newName") and params["newName"] != nil and
+    params["newName"].kind == JString
+
+proc validCodeActionParams(params: JsonNode): bool =
+  if not validTextDocumentParams(params) or not params.hasKey("context"):
+    return false
+  let context = params["context"]
+  if context == nil or context.kind != JObject:
+    return false
+  if not context.hasKey("only"):
+    return true
+  let only = context["only"]
+  if only == nil or only.kind != JArray:
+    return false
+  for item in only.items:
+    if item == nil or item.kind != JString:
+      return false
+  true
+
+proc validLifecycleParams(params: JsonNode): bool =
+  params != nil and
+    (params.kind == JNull or (params.kind == JObject and params.len == 0))
+
+proc validCancelParams(params: JsonNode): bool =
+  params != nil and params.kind == JObject and params.hasKey("id") and
+    validRequestId(params["id"])
+
+proc validMethodForm(methodName: string, hasId: bool): bool =
+  case methodName
+  of "initialize", "shutdown", "textDocument/definition", "textDocument/typeDefinition",
+      "textDocument/references", "textDocument/hover", "textDocument/rename",
+      "textDocument/completion", "textDocument/documentSymbol",
+      "textDocument/documentHighlight", "textDocument/foldingRange",
+      "textDocument/selectionRange", "textDocument/signatureHelp",
+      "textDocument/semanticTokens/full", "textDocument/documentLink",
+      "textDocument/codeAction", "workspace/symbol":
+    hasId
+  of "initialized", "textDocument/didOpen", "textDocument/didChange",
+      "textDocument/didSave", "textDocument/didClose",
+      "workspace/didChangeWatchedFiles", "$/cancelRequest", "exit":
+    not hasId
+  else:
+    true
+
+proc validMethodParams(methodName: string, params: JsonNode): bool =
+  case methodName
+  of "initialize":
+    validInitializeParams(params)
+  of "initialized":
+    params != nil and params.kind == JObject
+  of "textDocument/didOpen":
+    validDidOpenParams(params)
+  of "textDocument/didChange":
+    fullDocumentChange(params).valid
+  of "textDocument/didSave":
+    validDidSaveParams(params)
+  of "textDocument/didClose":
+    validTextDocumentParams(params)
+  of "workspace/didChangeWatchedFiles":
+    validWatchedFileParams(params)
+  of "textDocument/definition", "textDocument/typeDefinition", "textDocument/hover",
+      "textDocument/completion", "textDocument/documentHighlight",
+      "textDocument/signatureHelp":
+    validPositionParams(params)
+  of "textDocument/references":
+    validReferencesParams(params)
+  of "textDocument/rename":
+    validRenameParams(params)
+  of "textDocument/documentSymbol":
+    validTextDocumentParams(params)
+  of "textDocument/documentLink":
+    validTextDocumentParams(params)
+  of "textDocument/foldingRange":
+    validTextDocumentParams(params)
+  of "textDocument/semanticTokens/full":
+    validTextDocumentParams(params)
+  of "workspace/symbol":
+    params != nil and params.kind == JObject and params.hasKey("query") and
+      params["query"] != nil and params["query"].kind == JString
+  of "textDocument/selectionRange":
+    validSelectionRangeParams(params)
+  of "textDocument/codeAction":
+    validCodeActionParams(params)
+  of "$/cancelRequest":
+    validCancelParams(params)
+  of "shutdown", "exit":
+    validLifecycleParams(params)
+  else:
+    true
 
 proc utf16Width(source: string, index, limit: int): tuple[nextIndex, units: int] =
   let first = ord(source[index])
@@ -328,7 +667,9 @@ proc nativeDiagnosticMessage(diagnostic: NativeDiagnostic): string =
   of nativeMissingProjectImport:
     "missing project import: " & diagnostic.module
 
-proc sendNativeDiagnostics(uri, source: string, diagnostics: seq[NativeDiagnostic]) =
+proc sendNativeDiagnostics(
+    uri, source: string, diagnostics: seq[NativeDiagnostic], version: int64 = -1
+) =
   let positions = initPositionIndex(source)
   var values = newJArray()
   for diagnostic in diagnostics:
@@ -344,6 +685,8 @@ proc sendNativeDiagnostics(uri, source: string, diagnostics: seq[NativeDiagnosti
 
   var params = newJObject()
   params["uri"] = %uri
+  if version >= 0:
+    params["version"] = %version
   params["diagnostics"] = values
   var message = newJObject()
   message["jsonrpc"] = %"2.0"
@@ -352,7 +695,10 @@ proc sendNativeDiagnostics(uri, source: string, diagnostics: seq[NativeDiagnosti
   sendMessage(message)
 
 proc publishNativeDiagnostics(
-    workspace: Workspace, snapshot: WorkspaceSnapshot, stdlib: StdlibMap
+    workspace: Workspace,
+    snapshot: WorkspaceSnapshot,
+    stdlib: StdlibMap,
+    reason: DiagnosticPublishReason,
 ) =
   let uri =
     if snapshot.uri.len > 0:
@@ -375,20 +721,37 @@ proc publishNativeDiagnostics(
       )
     else:
       @[]
-  if diagnostics.len == 0 and workspace.bootstrapState != workspaceBootstrapComplete:
+  traceLsp(
+    "publishDiagnostics",
+    uri,
+    snapshot.version,
+    snapshot.id,
+    snapshot.fileId,
+    snapshot.contentGeneration,
+    snapshot.dependencyGeneration,
+    ord(reason),
+    diagnostics.len,
+  )
+  if diagnostics.len == 0 and workspace.bootstrapState != workspaceBootstrapComplete and
+      reason == diagnosticOpen:
     return
-  sendNativeDiagnostics(uri, snapshot.text, diagnostics)
+  sendNativeDiagnostics(uri, snapshot.text, diagnostics, snapshot.version)
 
 proc clearNativeDiagnostics(uri: string) =
   if uri.len > 0:
+    traceLsp(
+      "clearDiagnostics", uri, -1, InvalidSnapshotId, InvalidFileId,
+      InvalidContentGeneration, InvalidDependencyGeneration, -1, 0,
+    )
     sendNativeDiagnostics(uri, "", @[])
 
-proc targetTokenLength(token: Token): int =
+proc targetTokenLength(tokens: TokenStore, token: Token): int =
   let byteLength = token.endOffset - token.startOffset
-  if byteLength == token.text.len:
-    return utf16Length(token.text)
-  if byteLength == token.text.len + 2:
-    return utf16Length(token.text) + 2
+  let text = tokens.tokenText(token)
+  if byteLength == text.len:
+    return utf16Length(text)
+  if byteLength == text.len + 2:
+    return utf16Length(text) + 2
   -1
 
 proc definitionLocation(
@@ -414,7 +777,7 @@ proc definitionLocation(
     start = positionAt(positions, source.text, token.startOffset)
     finish = positionAt(positions, source.text, token.endOffset)
   else:
-    let length = targetTokenLength(token)
+    let length = targetTokenLength(view.index.parsed.tokens, token)
     if token.line < 0 or token.column < 0 or length < 0:
       return
     start = %*{"line": token.line, "character": token.column}
@@ -451,6 +814,69 @@ proc definitionResponse(
     definitionLocation(snapshot, uriText, view, resolution.target, positions)
   if result.value == nil:
     result.value = newJNull()
+
+proc typeDefinitionResponse(params: JsonNode, workspace: Workspace): JsonNode =
+  result = newJNull()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let source = workspace.snapshotForDocument(uriText, path)
+  if not source.valid or source.index == nil:
+    return
+  let positions = initPositionIndex(source.text)
+  let offset = offsetAt(positions, source.text, valueOrEmpty(params, "position"))
+  let tokenIndex = tokenAtOffset(source.index.parsed.tokens, offset)
+  if tokenIndex < 0:
+    return
+  let resolution = resolveDefinitionAtToken(workspace, source, tokenIndex)
+  if resolution.kind != definitionResolved:
+    return
+  let declarationView = workspace.indexViewForFile(resolution.target.fileId)
+  if not declarationView.valid or declarationView.index == nil:
+    return
+  let declarationSymbol =
+    declarationView.index.symbols.symbolToken(resolution.target.nameToken)
+  if declarationSymbol >= 0 and
+      declarationView.index.symbols[declarationSymbol].kind == symbolType:
+    result =
+      definitionLocation(source, uriText, declarationView, resolution.target, positions)
+    return
+
+  let declarationSource =
+    if resolution.target.fileId.value == source.fileId.value:
+      source
+    else:
+      workspace.snapshotForFile(resolution.target.fileId)
+  if not declarationSource.valid or declarationSource.index == nil:
+    return
+  let localType =
+    workspace.resolveLocalType(declarationSource, resolution.target.nameToken)
+  if localType.info.state != typeStateResolved or
+      source.index.types.namedTypeId(localType.info.typeId) == InvalidTypeId or
+      localType.info.typeToken == InvalidTypeToken:
+    return
+  let typeSource =
+    if localType.fileId.value == declarationSource.fileId.value:
+      declarationSource
+    else:
+      workspace.snapshotForFile(localType.fileId)
+  if not typeSource.valid or typeSource.index == nil or
+      typeSource.id.value != localType.snapshotId.value or
+      typeSource.contentGeneration.value != localType.contentGeneration.value:
+    return
+  let typeResolution =
+    resolveDefinitionAtToken(workspace, typeSource, int(localType.info.typeToken))
+  if typeResolution.kind != definitionResolved:
+    return
+  let typeView = workspace.indexViewForFile(typeResolution.target.fileId)
+  result =
+    definitionLocation(source, uriText, typeView, typeResolution.target, positions)
 
 proc referenceLocation(
     uri: string, source: WorkspaceSnapshot, token: Token, positions: PositionIndex
@@ -594,6 +1020,89 @@ proc hoverResponse(
       "end": positionAt(positions, snapshot.text, token.endOffset),
     },
   }
+
+proc signatureHelpResponse(
+    params: JsonNode, workspace: Workspace, stdlib: StdlibMap
+): JsonNode =
+  result = newJNull()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let snapshot = workspace.snapshotForDocument(uriText, path)
+  if not snapshot.valid or snapshot.index == nil:
+    return
+  let positions = initPositionIndex(snapshot.text)
+  let offset = offsetAt(positions, snapshot.text, valueOrEmpty(params, "position"))
+  let info = resolveSignatureHelp(workspace, snapshot, offset, stdlib)
+  if info.state != signatureAvailable:
+    return
+  var signatures = newJArray()
+  for signature in info.signatures:
+    var parameters = newJArray()
+    for parameter in signature.parameters:
+      parameters.add %*{"label": parameter}
+    signatures.add %*{"label": signature.label, "parameters": parameters}
+  if signatures.len == 0:
+    return
+  result = %*{
+    "signatures": signatures,
+    "activeSignature": 0,
+    "activeParameter": info.activeParameter,
+  }
+
+proc semanticTokensResponse(params: JsonNode, workspace: Workspace): JsonNode =
+  result = newJObject()
+  result["data"] = newJArray()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let snapshot = workspace.snapshotForDocument(uriText, path)
+  if not snapshot.valid or snapshot.index == nil:
+    return
+  let positions = initPositionIndex(snapshot.text)
+  var previousLine = 0
+  var previousStart = 0
+  for item in semanticTokens(snapshot.index):
+    if item.token >= uint32(snapshot.index.parsed.tokens.len):
+      continue
+    let token = snapshot.index.parsed.tokens[int(item.token)]
+    if token.startOffset < 0 or token.endOffset <= token.startOffset or
+        token.endOffset > snapshot.text.len:
+      continue
+    let start = positionAt(positions, snapshot.text, token.startOffset)
+    let finish = positionAt(positions, snapshot.text, token.endOffset)
+    let line = start["line"].getInt
+    let character = start["character"].getInt
+    if finish["line"].getInt != line:
+      continue
+    let length = finish["character"].getInt - character
+    if length <= 0:
+      continue
+    let deltaLine = line - previousLine
+    let deltaStart =
+      if deltaLine == 0:
+        character - previousStart
+      else:
+        character
+    result["data"].add %deltaLine
+    result["data"].add %deltaStart
+    result["data"].add %length
+    result["data"].add %ord(item.kind)
+    result["data"].add %0
+    previousLine = line
+    previousStart = character
 
 proc appendRenameEdits(
     changes: JsonNode,
@@ -763,11 +1272,251 @@ proc documentSymbols(params: JsonNode, workspace: Workspace): JsonNode =
     let start = positionAt(positions, snapshot.text, token.startOffset)
     let finish = positionAt(positions, snapshot.text, token.endOffset)
     result.add %*{
-      "name": token.text,
+      "name": snapshot.index.parsed.tokens.tokenText(token),
       "kind": documentSymbolKind(symbol.kind),
       "range": {"start": start, "end": finish},
       "selectionRange": {"start": start, "end": finish},
     }
+
+proc workspaceSymbols(params: JsonNode, workspace: Workspace): JsonNode =
+  result = newJArray()
+  let query = identifierKey(params["query"].getStr)
+  for fileId in workspace.fileIds:
+    let snapshot = workspace.snapshotForFile(fileId)
+    if not snapshot.valid or snapshot.index == nil or
+        snapshot.path.toLowerAscii.endsWith(".nimble") or
+        snapshot.path.toLowerAscii.endsWith(".cfg"):
+      continue
+    let positions = initPositionIndex(snapshot.text)
+    let uriText =
+      if snapshot.uri.len > 0:
+        snapshot.uri
+      else:
+        fileUri(snapshot.path)
+    for symbol in snapshot.index.symbols:
+      let tokenIndex = int(symbol.nameToken)
+      if tokenIndex < 0 or tokenIndex >= snapshot.index.parsed.tokens.len:
+        continue
+      let token = snapshot.index.parsed.tokens[tokenIndex]
+      if token.kind != tkIdentifier or token.startOffset < 0 or
+          token.endOffset > snapshot.text.len or token.endOffset <= token.startOffset:
+        continue
+      let name = snapshot.index.parsed.tokens.tokenText(token)
+      if query.len > 0 and query notin identifierKey(name):
+        continue
+      let start = positionAt(positions, snapshot.text, token.startOffset)
+      let finish = positionAt(positions, snapshot.text, token.endOffset)
+      result.add %*{
+        "name": name,
+        "kind": documentSymbolKind(symbol.kind),
+        "location": {"uri": uriText, "range": {"start": start, "end": finish}},
+      }
+
+proc addDocumentLink(
+    links: var JsonNode,
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    positions: PositionIndex,
+    item: ImportInfo,
+): bool =
+  if workspace == nil or not source.valid or source.index == nil or item.synthetic or
+      item.conditional or item.module.len == 0 or item.moduleStartOffset < 0 or
+      item.moduleEndOffset <= item.moduleStartOffset or
+      item.moduleEndOffset > source.text.len:
+    return
+  let catalog = workspace.moduleCatalog()
+  if catalog == nil or not catalog.complete:
+    return
+  let resolved =
+    catalog.resolveModuleName(workspace.moduleForPath(source.path), item.module)
+  if resolved.kind != moduleResolved:
+    return
+  let targetId = workspace.resolveModule(source.fileId, item.module)
+  if not targetId.valid or targetId.value != resolved.id.value:
+    return
+  let target = workspace.indexViewForFile(targetId)
+  if not target.valid or target.path.len == 0:
+    return
+  let targetUri =
+    if target.uri.len > 0:
+      target.uri
+    else:
+      fileUri(target.path)
+  if targetUri.len == 0:
+    return
+  links.add %*{
+    "range": {
+      "start": positionAt(positions, source.text, item.moduleStartOffset),
+      "end": positionAt(positions, source.text, item.moduleEndOffset),
+    },
+    "target": targetUri,
+  }
+  true
+
+proc documentLinks(params: JsonNode, workspace: Workspace): JsonNode =
+  result = newJArray()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let snapshot = workspace.snapshotForDocument(uriText, path)
+  if not snapshot.valid or snapshot.index == nil:
+    return
+  let positions = initPositionIndex(snapshot.text)
+  for item in snapshot.index.parsed.imports:
+    discard addDocumentLink(result, workspace, snapshot, positions, item)
+  for node in snapshot.index.syntax.nodes:
+    if node.kind != syntaxInclude or node.uncertainty != {}:
+      continue
+    let parsed = parseIncludeReferences(
+      snapshot.index.parsed.tokens, snapshot.text, int(node.firstToken)
+    )
+    if parsed.uncertainty != {} or parsed.next != int(node.pastToken):
+      continue
+    for item in parsed.references:
+      discard addDocumentLink(result, workspace, snapshot, positions, item)
+
+proc documentHighlights(params: JsonNode, workspace: Workspace): JsonNode =
+  result = newJArray()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let snapshot = workspace.snapshotForDocument(uriText, path)
+  if not snapshot.valid or snapshot.index == nil:
+    return
+  let positions = initPositionIndex(snapshot.text)
+  let offset = offsetAt(positions, snapshot.text, valueOrEmpty(params, "position"))
+  if offset < 0:
+    return
+  let references = resolveSameFileReferences(workspace, snapshot, offset, true)
+  if not references.supported:
+    return
+  for tokenIndex in references.tokens:
+    if tokenIndex >= uint32(snapshot.index.parsed.tokens.len):
+      continue
+    let token = snapshot.index.parsed.tokens[int(tokenIndex)]
+    if token.startOffset < 0 or token.endOffset <= token.startOffset or
+        token.endOffset > snapshot.text.len:
+      continue
+    result.add %*{
+      "range": {
+        "start": positionAt(positions, snapshot.text, token.startOffset),
+        "end": positionAt(positions, snapshot.text, token.endOffset),
+      },
+      "kind": 1,
+    }
+
+proc foldingRanges(params: JsonNode, workspace: Workspace): JsonNode =
+  result = newJArray()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let snapshot = workspace.snapshotForDocument(uriText, path)
+  if not snapshot.valid or snapshot.index == nil:
+    return
+  for node in snapshot.index.syntax.nodes:
+    if node.kind notin {syntaxWhen, syntaxBlock, syntaxDeclaration} or
+        node.uncertainty != {}:
+      continue
+    let first = int(node.firstToken)
+    let past = int(node.pastToken)
+    if first < 0 or past <= first or past > snapshot.index.parsed.tokens.len:
+      continue
+    let startLine = snapshot.index.parsed.tokens[first].line
+    let endLine = snapshot.index.parsed.tokens[past - 1].line
+    if startLine < 0 or endLine <= startLine:
+      continue
+    result.add %*{"startLine": startLine, "endLine": endLine}
+
+proc selectionRangeItem(
+    source: string, positions: PositionIndex, startOffset, endOffset: int
+): JsonNode =
+  %*{
+    "start": positionAt(positions, source, startOffset),
+    "end": positionAt(positions, source, endOffset),
+  }
+
+proc selectionRanges(params: JsonNode, workspace: Workspace): JsonNode =
+  result = newJArray()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let snapshot = workspace.snapshotForDocument(uriText, path)
+  if not snapshot.valid or snapshot.index == nil:
+    return
+  let positions = initPositionIndex(snapshot.text)
+  for position in params["positions"].items:
+    let offset = offsetAt(positions, snapshot.text, position)
+    if offset < 0:
+      continue
+    var spans: seq[tuple[startOffset, endOffset: int]] = @[]
+    let tokenIndex = tokenContaining(snapshot.index.parsed.tokens, offset, offset)
+    if tokenIndex >= 0:
+      let token = snapshot.index.parsed.tokens[tokenIndex]
+      spans.add (token.startOffset, token.endOffset)
+      var nodeIndex = -1
+      for candidateIndex, node in snapshot.index.syntax.nodes:
+        if candidateIndex == 0 or node.firstToken > uint32(tokenIndex) or
+            node.pastToken <= uint32(tokenIndex):
+          continue
+        if nodeIndex < 0 or
+            node.pastToken - node.firstToken <
+            snapshot.index.syntax.nodes[nodeIndex].pastToken -
+            snapshot.index.syntax.nodes[nodeIndex].firstToken:
+          nodeIndex = candidateIndex
+      while nodeIndex > 0 and nodeIndex < snapshot.index.syntax.nodes.len:
+        let node = snapshot.index.syntax.nodes[nodeIndex]
+        let first = int(node.firstToken)
+        let past = int(node.pastToken)
+        if first >= 0 and past > first and past <= snapshot.index.parsed.tokens.len:
+          spans.add (
+            snapshot.index.parsed.tokens[first].startOffset,
+            snapshot.index.parsed.tokens[past - 1].endOffset,
+          )
+        let parent = int(uint32(node.parent)) - 1
+        if parent <= 0 or parent >= snapshot.index.syntax.nodes.len:
+          break
+        nodeIndex = parent
+    if spans.len == 0:
+      spans.add (0, snapshot.text.len)
+    elif spans[^1].startOffset != 0 or spans[^1].endOffset != snapshot.text.len:
+      spans.add (0, snapshot.text.len)
+    var parent: JsonNode
+    for spanIndex in countdown(spans.high, 0):
+      var item = newJObject()
+      item["range"] = selectionRangeItem(
+        snapshot.text,
+        positions,
+        spans[spanIndex].startOffset,
+        spans[spanIndex].endOffset,
+      )
+      if parent != nil:
+        item["parent"] = parent
+      parent = item
+    result.add parent
 
 proc editJson(source: string, positions: PositionIndex, edit: ImportEdit): JsonNode =
   %*{
@@ -777,6 +1526,23 @@ proc editJson(source: string, positions: PositionIndex, edit: ImportEdit): JsonN
     },
     "newText": edit.newText,
   }
+
+proc renderCodeActions(uriText, source: string, edits: seq[ImportEdit]): JsonNode =
+  if edits.len == 0:
+    return newJArray()
+  let positions = initPositionIndex(source)
+  var uriEdits = newJArray()
+  for edit in edits:
+    uriEdits.add editJson(source, positions, edit)
+  var workspaceEdit = newJObject()
+  workspaceEdit["changes"] = newJObject()
+  workspaceEdit["changes"][uriText] = uriEdits
+  var action = newJObject()
+  action["title"] = %"Organize Nim imports"
+  action["kind"] = %"source.organizeImports"
+  action["edit"] = workspaceEdit
+  result = newJArray()
+  result.add action
 
 proc initializeRoot(params: JsonNode): string =
   if params != nil and params.kind == JObject:
@@ -796,13 +1562,13 @@ proc initializeRoot(params: JsonNode): string =
   ""
 
 proc supportsOrganize(params: JsonNode): bool =
-  if params == nil or not params.hasKey("context"):
+  if params == nil or params.kind != JObject or not params.hasKey("context"):
     return true
   let context = params["context"]
-  if context.kind != JObject or not context.hasKey("only"):
+  if context == nil or context.kind != JObject or not context.hasKey("only"):
     return true
   let only = context["only"]
-  if only.kind != JArray:
+  if only == nil or only.kind != JArray:
     return true
   for item in only.items:
     if item.kind == JString and
@@ -860,6 +1626,14 @@ proc removeQueued(queued: var seq[SemanticRequest], fileId: FileId) =
       inc writeIndex
   queued.setLen(writeIndex)
 
+proc removeQueued(queued: var seq[SemanticRequest], key: SemanticKey) =
+  var writeIndex = 0
+  for request in queued:
+    if not sameSemanticKey(semanticKey(request), key):
+      queued[writeIndex] = request
+      inc writeIndex
+  queued.setLen(writeIndex)
+
 proc queueSemantic(queued: var seq[SemanticRequest], request: SemanticRequest) =
   removeQueued(queued, request.fileId)
   queued.add request
@@ -870,9 +1644,17 @@ proc dispatchSemantic(
   if pending.fileId.valid or queued.len == 0:
     return false
   let request = queued[0]
-  queued.delete(0)
-  if not submitSemantic(request):
+  if not startSemanticWorker():
     return false
+  if not submitSemantic(request):
+    stopSemanticWorker()
+    finishSemanticWorkerStop()
+    return false
+  if not startSemanticBridge():
+    stopSemanticWorker()
+    finishSemanticWorkerStop()
+    return false
+  queued.delete(0)
   pending = semanticKey(request)
   true
 
@@ -992,43 +1774,150 @@ proc acceptSemantic(
     )
   discard dispatchSemantic(queued, pending)
 
-proc drainSemantic(
-    workspace: Workspace,
-    actionCache: var seq[CachedAction],
-    pending: var SemanticKey,
-    queued: var seq[SemanticRequest],
-) =
-  var result: SemanticResult
-  while tryReceiveSemantic(result):
-    acceptSemantic(result, workspace, actionCache, pending, queued)
+proc finishPendingCodeActionsForUri(pending: var seq[PendingCodeAction], uri: string) =
+  var completed: seq[PendingCodeAction] = @[]
+  var writeIndex = 0
+  for item in pending:
+    if item.uri == uri:
+      completed.add item
+    else:
+      pending[writeIndex] = item
+      inc writeIndex
+  pending.setLen(writeIndex)
+  for item in completed:
+    sendResponse(item.id, newJArray())
 
-proc waitForSemantic(
-    key: SemanticKey,
+proc finishPendingCodeActions(
+    pending: var seq[PendingCodeAction],
     workspace: Workspace,
-    actionCache: var seq[CachedAction],
-    pending: var SemanticKey,
-    queued: var seq[SemanticRequest],
+    actionCache: seq[CachedAction],
+    value: SemanticResult,
 ): bool =
-  while true:
-    let snapshot = workspace.snapshotForFile(key.fileId)
-    if snapshot.valid and hasCachedAction(actionCache, key.fileId) and
-        actionIsCurrent(
-          cachedActionFor(actionCache, key.fileId),
-          snapshot,
-          OrganizeOptions(useStdPrefix: key.useStdPrefix),
-        ):
-      return true
-    let semanticResult = receiveSemantic()
-    if semanticResult.failed:
-      if not semanticResult.fileId.valid:
-        pending = SemanticKey()
-        queued.setLen(0)
-      else:
-        acceptSemantic(semanticResult, workspace, actionCache, pending, queued)
-      return false
-    acceptSemantic(semanticResult, workspace, actionCache, pending, queued)
+  let terminal = value.failed and not value.fileId.valid
+  let key = semanticKey(value)
+  var completed: seq[PendingCodeAction] = @[]
+  var writeIndex = 0
+  for item in pending:
+    if terminal or sameSemanticKey(item.semantic, key):
+      completed.add item
+    else:
+      pending[writeIndex] = item
+      inc writeIndex
+  pending.setLen(writeIndex)
+  for item in completed:
+    if not terminal:
+      let snapshot = workspace.snapshotForFile(item.semantic.fileId)
+      if snapshot.valid and hasCachedAction(actionCache, item.semantic.fileId) and
+          actionIsCurrent(
+            cachedActionFor(actionCache, item.semantic.fileId),
+            snapshot,
+            OrganizeOptions(useStdPrefix: item.semantic.useStdPrefix),
+          ):
+        sendResponse(
+          item.id,
+          renderCodeActions(
+            item.uri,
+            snapshot.text,
+            cachedActionFor(actionCache, item.semantic.fileId).edits,
+          ),
+        )
+        continue
+    sendResponse(item.id, newJArray())
+  terminal
 
-proc codeActions(
+proc refreshPendingCodeActions(
+    pendingCodeActions: var seq[PendingCodeAction],
+    workspace: Workspace,
+    pending: var SemanticKey,
+    queued: var seq[SemanticRequest],
+    stale: SemanticKey,
+) =
+  for index in 0 ..< pendingCodeActions.len:
+    if not sameSemanticKey(pendingCodeActions[index].semantic, stale):
+      continue
+    let options =
+      OrganizeOptions(useStdPrefix: pendingCodeActions[index].semantic.useStdPrefix)
+    let snapshot = workspace.snapshotForFile(pendingCodeActions[index].semantic.fileId)
+    if not snapshot.valid:
+      continue
+    if enqueueSemantic(snapshot, options, pending, queued):
+      pendingCodeActions[index].semantic = semanticKey(snapshot, options)
+  discard dispatchSemantic(queued, pending)
+
+proc sameRequestId(left, right: JsonNode): bool =
+  left != nil and right != nil and left.kind == right.kind and left == right
+
+proc cancelPendingCodeAction(
+    pending: var seq[PendingCodeAction],
+    queued: var seq[SemanticRequest],
+    active: var SemanticKey,
+    requestId: JsonNode,
+): tuple[found: bool, stopWorker: bool] =
+  for index, item in pending:
+    if sameRequestId(item.id, requestId):
+      let key = item.semantic
+      pending.delete(index)
+      sendError(item.id, -32800, "Request cancelled")
+      for other in pending:
+        if sameSemanticKey(other.semantic, key):
+          result.found = true
+          return
+      removeQueued(queued, key)
+      if active.fileId.valid and sameSemanticKey(active, key) and queued.len == 0:
+        active = SemanticKey()
+        result.stopWorker = true
+      result.found = true
+      return
+
+proc cancelPendingWorkspaceRequest(
+    pending: var seq[PendingWorkspaceRequest], requestId: JsonNode
+): bool =
+  for index, item in pending:
+    if sameRequestId(item.id, requestId):
+      let id = item.id
+      pending.delete(index)
+      sendError(id, -32800, "Request cancelled")
+      return true
+  false
+
+proc cancelPendingCodeActions(pending: var seq[PendingCodeAction]) =
+  for item in pending:
+    sendError(item.id, -32800, "Request cancelled")
+  pending.setLen(0)
+
+proc cancelPendingWorkspaceRequests(pending: var seq[PendingWorkspaceRequest]) =
+  for item in pending:
+    sendError(item.id, -32800, "Request cancelled")
+  pending.setLen(0)
+
+proc handleSemanticEvent(
+    payload: string,
+    workspace: Workspace,
+    actionCache: var seq[CachedAction],
+    pending: var SemanticKey,
+    queued: var seq[SemanticRequest],
+    pendingCodeActions: var seq[PendingCodeAction],
+): bool =
+  let value = decodeSemanticResult(payload)
+  let valueKey = semanticKey(value)
+  let snapshot =
+    if value.fileId.valid:
+      workspace.snapshotForFile(value.fileId)
+    else:
+      WorkspaceSnapshot()
+  let stale =
+    value.fileId.valid and not value.failed and snapshot.valid and
+    not sameSemanticKey(
+      semanticKey(snapshot, OrganizeOptions(useStdPrefix: value.useStdPrefix)), valueKey
+    )
+  acceptSemantic(value, workspace, actionCache, pending, queued)
+  if stale:
+    refreshPendingCodeActions(pendingCodeActions, workspace, pending, queued, valueKey)
+  else:
+    discard finishPendingCodeActions(pendingCodeActions, workspace, actionCache, value)
+  result = not pending.fileId.valid and queued.len == 0
+
+proc codeActionOutcome(
     params: JsonNode,
     workspace: Workspace,
     stdlib: var StdlibMap,
@@ -1036,22 +1925,21 @@ proc codeActions(
     pending: var SemanticKey,
     queued: var seq[SemanticRequest],
     options: OrganizeOptions,
-): JsonNode =
-  drainSemantic(workspace, actionCache, pending, queued)
+): tuple[response: JsonNode, deferred: bool, key: SemanticKey, uri: string] =
+  result.response = newJArray()
   if not supportsOrganize(params):
-    return newJArray()
-  let textDocument = valueOrEmpty(params, "textDocument")
-  let uriText =
-    if textDocument.hasKey("uri"):
-      textDocument["uri"].getStr
-    else:
-      ""
+    return
+  if not validTextDocumentParams(params):
+    return
+  let uriText = params["textDocument"]["uri"].getStr
   let path = uriToPath(uriText)
   if path.toLowerAscii.endsWith(".nimble") or path.toLowerAscii.endsWith(".cfg"):
-    return newJArray()
+    return
   let snapshot = workspace.snapshotForDocument(uriText, path)
   if not snapshot.valid:
-    return newJArray()
+    return
+  result.uri = uriText
+  result.key = semanticKey(snapshot, options)
   let cacheKey = snapshot.fileId
   var edits: seq[ImportEdit] = @[]
   var cacheHit = false
@@ -1065,47 +1953,11 @@ proc codeActions(
     if indexed.handled:
       edits = indexed.edits
     else:
-      let key = semanticKey(snapshot, options)
       if enqueueSemantic(snapshot, options, pending, queued):
-        discard waitForSemantic(key, workspace, actionCache, pending, queued)
-        drainSemantic(workspace, actionCache, pending, queued)
-        if hasCachedAction(actionCache, cacheKey) and
-            actionIsCurrent(cachedActionFor(actionCache, cacheKey), snapshot, options):
-          edits = cachedActionFor(actionCache, cacheKey).edits
-      else:
-        if snapshot.index != nil:
-          edits = organizeSourceWithIndex(
-            snapshot.path, snapshot.text, snapshot.index, options
-          )
-        else:
-          edits = organizeSource(snapshot.path, snapshot.text, options)
-        storeCachedAction(
-          actionCache,
-          snapshot.fileId,
-          CachedAction(
-            contentGeneration: snapshot.contentGeneration,
-            dependencyGeneration: snapshot.dependencyGeneration,
-            configGeneration: snapshot.configGeneration,
-            surfaceGeneration: snapshot.surfaceGeneration,
-            useStdPrefix: options.useStdPrefix,
-            edits: edits,
-          ),
-        )
-  if edits.len == 0:
-    return newJArray()
-  let positions = initPositionIndex(snapshot.text)
-  var workspaceEdit = newJObject()
-  var uriEdits = newJArray()
-  for edit in edits:
-    uriEdits.add editJson(snapshot.text, positions, edit)
-  workspaceEdit["changes"] = newJObject()
-  workspaceEdit["changes"][uriText] = uriEdits
-  var action = newJObject()
-  action["title"] = %"Organize Nim imports"
-  action["kind"] = %"source.organizeImports"
-  action["edit"] = workspaceEdit
-  result = newJArray()
-  result.add action
+        result.deferred = true
+        result.uri = uriText
+        return
+  result.response = renderCodeActions(uriText, snapshot.text, edits)
 
 proc scheduleBootstrap(runtime: var BootstrapRuntime, workspace: Workspace): bool =
   if workspace == nil or workspace.root.len == 0:
@@ -1130,10 +1982,10 @@ proc scheduleBootstrap(runtime: var BootstrapRuntime, workspace: Workspace): boo
 proc publishOpenNativeDiagnostics(workspace: Workspace, stdlib: StdlibMap) =
   for id in workspace.openDocumentIds:
     let snapshot = workspace.snapshotForFile(id)
-    publishNativeDiagnostics(workspace, snapshot, stdlib)
+    publishNativeDiagnostics(workspace, snapshot, stdlib, diagnosticBootstrap)
 
 proc finishPendingDefinitions(
-    workspace: Workspace, pending: var seq[PendingDefinition]
+    workspace: Workspace, pending: var seq[PendingWorkspaceRequest]
 ) =
   for item in pending:
     let response = definitionResponse(item.params, workspace)
@@ -1143,7 +1995,9 @@ proc finishPendingDefinitions(
       sendResponse(item.id, response.value)
   pending.setLen(0)
 
-proc finishPendingReferences(workspace: Workspace, pending: var seq[PendingReference]) =
+proc finishPendingReferences(
+    workspace: Workspace, pending: var seq[PendingWorkspaceRequest]
+) =
   for item in pending:
     let response = referencesResponse(item.params, workspace)
     if response.needsBootstrap:
@@ -1152,7 +2006,9 @@ proc finishPendingReferences(workspace: Workspace, pending: var seq[PendingRefer
       sendResponse(item.id, response.value)
   pending.setLen(0)
 
-proc finishPendingRenames(workspace: Workspace, pending: var seq[PendingRename]) =
+proc finishPendingRenames(
+    workspace: Workspace, pending: var seq[PendingWorkspaceRequest]
+) =
   for item in pending:
     let response = renameResponse(item.params, workspace)
     if response.needsBootstrap:
@@ -1164,9 +2020,9 @@ proc finishPendingRenames(workspace: Workspace, pending: var seq[PendingRename])
 proc handleBootstrapEvent(
     runtime: var BootstrapRuntime,
     workspace: Workspace,
-    pendingDefinitions: var seq[PendingDefinition],
-    pendingReferences: var seq[PendingReference],
-    pendingRenames: var seq[PendingRename],
+    pendingDefinitions: var seq[PendingWorkspaceRequest],
+    pendingReferences: var seq[PendingWorkspaceRequest],
+    pendingRenames: var seq[PendingWorkspaceRequest],
     stdlib: StdlibMap,
     payload: string,
 ): bool =
@@ -1192,23 +2048,26 @@ proc handleBootstrapEvent(
   accepted
 
 proc runLsp*() =
+  lspTraceEnabled = getEnv("ONIM_TRACE_LSP").len > 0
   let workspace = initWorkspace()
   var stdlib = stdlibMap()
   var actionCache: seq[CachedAction] = @[]
   var pending: SemanticKey
   var queued: seq[SemanticRequest] = @[]
-  var pendingDefinitions: seq[PendingDefinition] = @[]
-  var pendingReferences: seq[PendingReference] = @[]
-  var pendingRenames: seq[PendingRename] = @[]
+  var pendingDefinitions: seq[PendingWorkspaceRequest] = @[]
+  var pendingReferences: seq[PendingWorkspaceRequest] = @[]
+  var pendingRenames: seq[PendingWorkspaceRequest] = @[]
+  var pendingCodeActions: seq[PendingCodeAction] = @[]
   var bootstrap: BootstrapRuntime
   var options = defaultOrganizeOptions()
+  var initializeAccepted = false
   var shutdownRequested = false
   var exitRequested = false
 
   lspEvents.open()
   lspInputReaderStarted = false
   lspBootstrapBridgeStarted = false
-  discard startSemanticWorker()
+  lspSemanticBridgeStarted = false
   if startBootstrapWorker():
     createThread(lspBootstrapBridge, bootstrapEventBridge)
     lspBootstrapBridgeStarted = true
@@ -1220,21 +2079,35 @@ proc runLsp*() =
     if event.kind == lspEndEvent:
       break
     if event.kind == lspBootstrapEvent:
+      if shutdownRequested:
+        continue
       if decodeBootstrapResult(event.payload).kind != bootstrapStopped:
         discard handleBootstrapEvent(
           bootstrap, workspace, pendingDefinitions, pendingReferences, pendingRenames,
           stdlib, event.payload,
         )
       continue
+    if event.kind == lspSemanticEvent:
+      if handleSemanticEvent(
+        event.payload, workspace, actionCache, pending, queued, pendingCodeActions
+      ):
+        lspSemanticStopRequested.store(true)
+        stopSemanticWorker()
+        if lspSemanticBridgeStarted:
+          lspSemanticBridge.joinThread()
+          lspSemanticBridgeStarted = false
+        finishSemanticWorkerStop()
+        lspSemanticStopRequested.store(false)
+      continue
 
     let message = parseMessage(event.payload)
-    if message == nil or message.kind != JObject:
+    if message == nil:
+      sendError(newJNull(), -32700, "Parse error")
       continue
-    let methodName =
-      if message.hasKey("method"):
-        message["method"].getStr
-      else:
-        ""
+    if not validRequestEnvelope(message):
+      sendError(newJNull(), -32600, "Invalid Request")
+      continue
+    let methodName = message["method"].getStr
     let hasId = message.hasKey("id")
     let id =
       if hasId:
@@ -1246,8 +2119,32 @@ proc runLsp*() =
         message["params"]
       else:
         newJObject()
-    case methodName
-    of "initialize":
+    if not validMethodForm(methodName, hasId):
+      if hasId:
+        sendError(id, -32600, "Invalid Request")
+      continue
+    if shutdownRequested:
+      if methodName == "exit":
+        if validMethodParams(methodName, params):
+          exitRequested = true
+          break
+        continue
+      if hasId:
+        sendError(id, -32600, "Invalid Request")
+      continue
+    if methodName == "exit":
+      if validMethodParams(methodName, params):
+        exitRequested = true
+        break
+      continue
+    if methodName == "initialize":
+      if initializeAccepted:
+        sendError(id, -32600, "Invalid Request")
+        continue
+      if not validMethodParams(methodName, params):
+        sendError(id, -32602, "Invalid params")
+        continue
+      initializeAccepted = true
       let root = initializeRoot(params)
       if root.len > 0:
         discard workspace.prepareWorkspace(root)
@@ -1263,114 +2160,139 @@ proc runLsp*() =
       capabilities["textDocumentSync"] = sync
       capabilities["codeActionProvider"] = provider
       capabilities["definitionProvider"] = %true
+      capabilities["typeDefinitionProvider"] = %true
       capabilities["completionProvider"] = %*{"resolveProvider": false}
       capabilities["hoverProvider"] = %true
       capabilities["renameProvider"] = %*{"prepareProvider": false}
       capabilities["referencesProvider"] = %true
       capabilities["documentSymbolProvider"] = %true
+      capabilities["documentHighlightProvider"] = %true
+      capabilities["foldingRangeProvider"] = %true
+      capabilities["selectionRangeProvider"] = %true
+      capabilities["documentLinkProvider"] = %*{"resolveProvider": false}
+      capabilities["signatureHelpProvider"] =
+        %*{"triggerCharacters": ["(", ","], "retriggerCharacters": [","]}
+      var semanticTokenTypes = newJArray()
+      for kind in SemanticTokenKind:
+        semanticTokenTypes.add %semanticTokenTypeNames[kind]
+      capabilities["semanticTokensProvider"] = %*{
+        "legend": {"tokenTypes": semanticTokenTypes, "tokenModifiers": []}, "full": true
+      }
+      capabilities["workspaceSymbolProvider"] = %true
       capabilities["positionEncoding"] = %"utf-16"
       var result = newJObject()
       result["capabilities"] = capabilities
       result["serverInfo"] = %*{"name": "onim", "version": "0.1.0"}
-      if hasId:
-        sendResponse(id, result)
+      sendResponse(id, result)
       discard scheduleBootstrap(bootstrap, workspace)
+      continue
+    if not initializeAccepted:
+      if hasId:
+        sendError(id, -32002, "Server not initialized")
+      continue
+    if not validMethodParams(methodName, params):
+      if hasId:
+        sendError(id, -32602, "Invalid params")
+      continue
+    case methodName
     of "initialized":
       discard
     of "shutdown":
       shutdownRequested = true
-      if hasId:
-        sendResponse(id, newJNull())
+      cancelPendingCodeActions(pendingCodeActions)
+      cancelPendingWorkspaceRequests(pendingDefinitions)
+      cancelPendingWorkspaceRequests(pendingReferences)
+      cancelPendingWorkspaceRequests(pendingRenames)
+      pending = SemanticKey()
+      queued.setLen(0)
+      sendResponse(id, newJNull())
     of "exit":
-      exitRequested = true
-      break
+      discard
     of "textDocument/didOpen":
-      let textDocument = valueOrEmpty(params, "textDocument")
-      if textDocument.hasKey("uri") and textDocument.hasKey("text"):
-        let uriText = textDocument["uri"].getStr
-        let path = uriToPath(uriText)
-        discard workspace.openDocument(
-          uriText,
-          path,
-          textDocument["text"].getStr,
-          intOption(textDocument, "version", -1),
+      let textDocument = params["textDocument"]
+      let uriText = textDocument["uri"].getStr
+      let path = uriToPath(uriText)
+      if not workspace.isOpenDocument(path):
+        let fileId = workspace.openDocument(
+          uriText, path, textDocument["text"].getStr, textDocument["version"].getInt
         )
-        let snapshot = workspace.snapshotForDocument(uriText, path)
-        publishNativeDiagnostics(workspace, snapshot, stdlib)
-        if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled:
-          discard enqueueSemantic(snapshot, options, pending, queued)
-        discard scheduleBootstrap(bootstrap, workspace)
+        if fileId.valid:
+          let snapshot = workspace.snapshotForDocument(uriText, path)
+          if snapshot.valid:
+            finishPendingCodeActionsForUri(pendingCodeActions, uriText)
+            publishNativeDiagnostics(workspace, snapshot, stdlib, diagnosticOpen)
+            if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled:
+              discard enqueueSemantic(snapshot, options, pending, queued)
+            discard scheduleBootstrap(bootstrap, workspace)
     of "textDocument/didChange":
-      let textDocument = valueOrEmpty(params, "textDocument")
-      let uriText =
-        if textDocument.hasKey("uri"):
-          textDocument["uri"].getStr
-        else:
-          ""
-      var changedText = ""
-      var hasChangedText = false
-      if uriText.len > 0 and params.hasKey("contentChanges") and
-          params["contentChanges"].kind == JArray:
-        for change in params["contentChanges"].items:
-          if change.kind == JObject and change.hasKey("text"):
-            changedText = change["text"].getStr
-            hasChangedText = true
-      if uriText.len > 0 and hasChangedText:
-        let path = uriToPath(uriText)
-        discard workspace.changeDocument(
-          uriText, path, changedText, intOption(textDocument, "version", -1)
-        )
-        let snapshot = workspace.snapshotForDocument(uriText, path)
-        publishNativeDiagnostics(workspace, snapshot, stdlib)
-        if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled:
-          discard enqueueSemantic(snapshot, options, pending, queued)
-        discard scheduleBootstrap(bootstrap, workspace)
+      let change = fullDocumentChange(params)
+      if change.valid:
+        let path = uriToPath(change.uri)
+        if workspace.isOpenDocument(path):
+          let before = workspace.snapshotForFile(workspace.fileIdForPath(path))
+          if workspace.changeDocument(change.uri, path, change.text, change.version):
+            let snapshot = workspace.snapshotForDocument(change.uri, path)
+            if before.contentGeneration.value != snapshot.contentGeneration.value:
+              finishPendingCodeActionsForUri(pendingCodeActions, change.uri)
+              publishNativeDiagnostics(workspace, snapshot, stdlib, diagnosticEdit)
+              if not cacheIndexedAction(
+                workspace, snapshot, options, stdlib, actionCache
+              ).handled:
+                discard enqueueSemantic(snapshot, options, pending, queued)
+              discard scheduleBootstrap(bootstrap, workspace)
     of "textDocument/didClose":
-      let textDocument = valueOrEmpty(params, "textDocument")
-      if textDocument.hasKey("uri"):
-        let uriText = textDocument["uri"].getStr
-        workspace.closeDocument(uriText, uriToPath(uriText))
+      let textDocument = params["textDocument"]
+      let uriText = textDocument["uri"].getStr
+      let path = uriToPath(uriText)
+      if workspace.isOpenDocument(path):
+        let fileId = workspace.fileIdForPath(path)
+        finishPendingCodeActionsForUri(pendingCodeActions, uriText)
+        removeQueued(queued, fileId)
+        workspace.closeDocument(uriText, path)
+        clearCachedAction(actionCache, fileId)
         clearNativeDiagnostics(uriText)
         discard scheduleBootstrap(bootstrap, workspace)
     of "textDocument/didSave":
-      let textDocument = valueOrEmpty(params, "textDocument")
-      if textDocument.hasKey("uri"):
-        let uriText = textDocument["uri"].getStr
-        let path = uriToPath(uriText)
-        if params.hasKey("text") and params["text"].kind == JString:
-          discard workspace.changeDocument(uriText, path, params["text"].getStr, -1)
-        let snapshot = workspace.snapshotForDocument(uriText, path)
-        publishNativeDiagnostics(workspace, snapshot, stdlib)
-        if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled:
-          discard enqueueSemantic(snapshot, options, pending, queued)
-        discard scheduleBootstrap(bootstrap, workspace)
+      let textDocument = params["textDocument"]
+      let uriText = textDocument["uri"].getStr
+      let path = uriToPath(uriText)
+      if workspace.isOpenDocument(path) and params.hasKey("text"):
+        let before = workspace.snapshotForFile(workspace.fileIdForPath(path))
+        if workspace.changeDocument(uriText, path, params["text"].getStr, -1):
+          let snapshot = workspace.snapshotForDocument(uriText, path)
+          if before.contentGeneration.value != snapshot.contentGeneration.value:
+            finishPendingCodeActionsForUri(pendingCodeActions, uriText)
+            publishNativeDiagnostics(workspace, snapshot, stdlib, diagnosticEdit)
+            if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled:
+              discard enqueueSemantic(snapshot, options, pending, queued)
+            discard scheduleBootstrap(bootstrap, workspace)
     of "workspace/didChangeWatchedFiles":
-      let changes = valueOrEmpty(params, "changes")
-      if changes.kind == JArray:
+      let changes = params["changes"]
+      if changes.len > 0:
         for change in changes.items:
-          if change.kind != JObject or not change.hasKey("uri"):
-            continue
           let path = uriToPath(change["uri"].getStr)
-          let changeType = intOption(change, "type", 2)
-          workspace.fileChanged(path, changeType == 3)
+          workspace.fileChanged(path, change["type"].getInt == 3)
         discard scheduleBootstrap(bootstrap, workspace)
     of "textDocument/definition":
       if hasId:
         var response = definitionResponse(params, workspace)
         if response.needsBootstrap:
           if bootstrap.active:
-            pendingDefinitions.add PendingDefinition(id: id, params: params)
+            pendingDefinitions.add PendingWorkspaceRequest(id: id, params: params)
           else:
             discard workspace.bootstrapWorkspace()
             response = definitionResponse(params, workspace)
             sendResponse(id, response.value)
         else:
           sendResponse(id, response.value)
+    of "textDocument/typeDefinition":
+      if hasId:
+        sendResponse(id, typeDefinitionResponse(params, workspace))
     of "textDocument/references":
       if hasId:
         let response = referencesResponse(params, workspace)
         if response.needsBootstrap:
-          pendingReferences.add PendingReference(id: id, params: params)
+          pendingReferences.add PendingWorkspaceRequest(id: id, params: params)
           if not bootstrap.active:
             if not scheduleBootstrap(bootstrap, workspace):
               pendingReferences.setLen(pendingReferences.len - 1)
@@ -1384,7 +2306,7 @@ proc runLsp*() =
       if hasId:
         let response = renameResponse(params, workspace)
         if response.needsBootstrap:
-          pendingRenames.add PendingRename(id: id, params: params)
+          pendingRenames.add PendingWorkspaceRequest(id: id, params: params)
           if not bootstrap.active:
             if not scheduleBootstrap(bootstrap, workspace):
               pendingRenames.setLen(pendingRenames.len - 1)
@@ -1397,25 +2319,90 @@ proc runLsp*() =
     of "textDocument/documentSymbol":
       if hasId:
         sendResponse(id, documentSymbols(params, workspace))
+    of "textDocument/documentLink":
+      if hasId:
+        sendResponse(id, documentLinks(params, workspace))
+    of "textDocument/documentHighlight":
+      if hasId:
+        sendResponse(id, documentHighlights(params, workspace))
+    of "textDocument/foldingRange":
+      if hasId:
+        sendResponse(id, foldingRanges(params, workspace))
+    of "textDocument/selectionRange":
+      if hasId:
+        sendResponse(id, selectionRanges(params, workspace))
+    of "textDocument/signatureHelp":
+      if hasId:
+        sendResponse(id, signatureHelpResponse(params, workspace, stdlib))
+    of "textDocument/semanticTokens/full":
+      if hasId:
+        sendResponse(id, semanticTokensResponse(params, workspace))
+    of "workspace/symbol":
+      if hasId:
+        sendResponse(id, workspaceSymbols(params, workspace))
     of "$/cancelRequest":
-      discard
+      let requestId = params["id"]
+      let cancellation =
+        cancelPendingCodeAction(pendingCodeActions, queued, pending, requestId)
+      if cancellation.stopWorker:
+        lspSemanticStopRequested.store(true, moRelaxed)
+        discard interruptSemanticWorker()
+        stopSemanticWorker()
+        if lspSemanticBridgeStarted:
+          lspSemanticBridge.joinThread()
+          lspSemanticBridgeStarted = false
+        finishSemanticWorkerStop()
+        lspSemanticStopRequested.store(false, moRelaxed)
+      if not cancellation.found:
+        if not cancelPendingWorkspaceRequest(pendingDefinitions, requestId):
+          if not cancelPendingWorkspaceRequest(pendingReferences, requestId):
+            discard cancelPendingWorkspaceRequest(pendingRenames, requestId)
     of "textDocument/codeAction":
       if hasId:
-        sendResponse(
-          id,
-          codeActions(params, workspace, stdlib, actionCache, pending, queued, options),
+        let startedAt =
+          if lspTraceEnabled:
+            getMonoTime()
+          else:
+            MonoTime()
+        let outcome = codeActionOutcome(
+          params, workspace, stdlib, actionCache, pending, queued, options
         )
+        traceLspRequest(
+          "codeAction",
+          id,
+          startedAt,
+          outcome.key,
+          if outcome.deferred: "deferred" else: "ready",
+        )
+        if outcome.key.fileId.valid:
+          finishPendingCodeActionsForUri(pendingCodeActions, outcome.uri)
+        if outcome.deferred:
+          pendingCodeActions.add PendingCodeAction(
+            id: id, semantic: outcome.key, uri: outcome.uri
+          )
+        else:
+          sendResponse(id, outcome.response)
     else:
       if hasId:
-        sendError(id, -32601, "method not supported: " & methodName)
+        sendError(id, -32601, "Method not found")
+  if exitRequested:
+    cancelBootstrap(high(uint64))
+  lspSemanticStopRequested.store(true)
   stopSemanticWorker()
+  if lspSemanticBridgeStarted:
+    lspSemanticBridge.joinThread()
+    lspSemanticBridgeStarted = false
+  finishSemanticWorkerStop()
+  lspSemanticStopRequested.store(false)
+  if exitRequested:
+    terminateProcessNow(if shutdownRequested: 0 else: 1)
   if lspBootstrapBridgeStarted:
     stopBootstrapWorker()
     lspBootstrapBridge.joinThread()
     lspBootstrapBridgeStarted = false
-  if lspInputReaderStarted and not exitRequested:
+  if lspInputReaderStarted:
     lspInputReader.joinThread()
-  if not exitRequested:
-    lspEvents.close()
+    lspInputReaderStarted = false
+  lspEvents.close()
   if exitRequested:
     quit(if shutdownRequested: 0 else: 1)

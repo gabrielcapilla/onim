@@ -35,20 +35,26 @@ proc targetHover(
   let token = view.index.parsed.tokens[int(resolution.target.nameToken)]
   if token.kind != tkIdentifier:
     return
+  let tokenName = view.index.parsed.tokens.tokenText(token)
 
   proc localTypeText(typeSource: WorkspaceSnapshot, typeInfo: LocalTypeInfo): string =
     case typeInfo.kind
-    of localTypeBool:
-      "bool"
-    of localTypeChar:
-      "char"
-    of localTypeString:
-      "string"
-    of localTypeInt:
-      "int"
-    of localTypeUnknown:
+    of typeBool, typeChar, typeString, typeInt, typeFloat:
+      typeInfo.kind.primitiveTypeName
+    of typeSeq:
+      if not typeSource.valid or typeSource.index == nil:
+        return
+      let elementKind = typeSource.index.types.typeKind(
+        typeSource.index.types.typeBase(typeInfo.typeId)
+      )
+      let elementName = elementKind.primitiveTypeName
+      if elementName.len > 0:
+        "seq[" & elementName & "]"
+      else:
+        ""
+    of typeUnknown:
       ""
-    of localTypeNamed:
+    of typeNamed, typeRef, typeArray, typeGenericInstance:
       if not typeSource.valid or typeSource.index == nil or
           typeInfo.firstToken >= typeInfo.pastToken or
           typeInfo.pastToken > uint32(typeSource.index.parsed.tokens.len):
@@ -71,7 +77,7 @@ proc targetHover(
         declarationOrdinal >= source.index.scopes.declarations.len:
       return
     let localType = workspace.resolveLocalType(source, resolution.target.nameToken)
-    if localType.info.kind == localTypeUnknown:
+    if localType.info.state != typeStateResolved or localType.info.kind == typeUnknown:
       return
     let typeInfo = localType.info
     var typeSource = source
@@ -94,10 +100,10 @@ proc targetHover(
       of declarationLet: "let "
       of declarationVar: "var "
       of declarationConst: "const "
-    prefix & token.text & ": " & typeName
+    prefix & tokenName & ": " & typeName
 
   result.state = hoverAvailable
-  result.name = token.text
+  result.name = tokenName
   case resolution.target.kind
   of targetObjectField:
     result.kind = "field"
@@ -154,9 +160,12 @@ proc stdlibHover(
   var qualifier = ""
   let qualifierToken = source.index.qualifierIndex(uint32(tokenIndex))
   if qualifierToken >= 0:
-    qualifier = source.index.parsed.tokens[qualifierToken].text
+    qualifier =
+      source.index.parsed.tokens.tokenText(source.index.parsed.tokens[qualifierToken])
   for item in source.index.parsed.imports:
-    let candidate = stdlibCandidate(stdlib, item, token.text, qualifier)
+    let candidate = stdlibCandidate(
+      stdlib, item, source.index.parsed.tokens.tokenText(token), qualifier
+    )
     if candidate.module.len == 0:
       continue
     if result.state == hoverAvailable and result.module != candidate.module:

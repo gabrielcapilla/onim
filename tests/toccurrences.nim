@@ -7,7 +7,7 @@ import onim/syntax/lexer
 
 proc names(index: SourceIndex): seq[string] =
   for occurrence in index.occurrences.identifiers:
-    result.add index.parsed.tokens[int(occurrence.token)].text
+    result.add index.parsed.tokens.tokenText(index.parsed.tokens[int(occurrence.token)])
 
 proc hasRole(roles: set[OccurrenceRole], role: OccurrenceRole): bool =
   role in roles

@@ -1,11 +1,14 @@
 import std/strutils
+import std/sets
 
 import ../index/bindings
 import ../index/source_index
 import ../index/symbols
 import ../index/scopes
 import ../index/types
+import ../index/surfaces
 import ../session/ids
+import ../session/module_catalog
 import ../session/workspace
 import ../syntax/imports
 import ../syntax/lexer
@@ -48,6 +51,19 @@ type
 
 proc unknownResolution(kind = definitionUnknown): DefinitionResolution =
   DefinitionResolution(kind: kind)
+
+proc sameDefinitionTarget*(left, right: DefinitionTarget): bool {.inline.} =
+  left.kind == right.kind and left.snapshotId.value == right.snapshotId.value and
+    left.fileId.value == right.fileId.value and
+    left.contentGeneration.value == right.contentGeneration.value and
+    left.nameToken == right.nameToken
+
+proc typeStateForDefinition(kind: DefinitionResolutionKind): TypeState {.inline.} =
+  case kind
+  of definitionUnresolved: typeStateUnresolved
+  of definitionAmbiguous: typeStateAmbiguous
+  of definitionResolved: typeStateResolved
+  of definitionUnknown, definitionUnsupported: typeStateUnknown
 
 proc validSource(source: WorkspaceSnapshot): bool =
   source.valid and source.index != nil and
@@ -108,7 +124,7 @@ proc symbolMatches(index: SourceIndex, name: string, exportedOnly = false): seq[
       continue
     if exportedOnly and not symbol.exported:
       continue
-    if identifierKey(index.parsed.tokens[tokenIndex].text) == wanted:
+    if identifierKey(index.parsed.tokens, index.parsed.tokens[tokenIndex]) == wanted:
       result.add symbolIndex
 
 proc routineKind(kind: SourceSymbolKind): bool =
@@ -117,7 +133,7 @@ proc routineKind(kind: SourceSymbolKind): bool =
     symbolConverter,
   }
 
-proc routineHasBody[T](tokens: T, symbol: SourceSymbol): bool =
+proc routineHasBody(tokens: TokenStore, symbol: SourceSymbol): bool =
   let nameIndex = int(symbol.nameToken)
   if nameIndex < 0 or nameIndex + 1 >= tokens.len:
     return false
@@ -126,17 +142,18 @@ proc routineHasBody[T](tokens: T, symbol: SourceSymbol): bool =
     if cursor > nameIndex + 1 and tokens[cursor].line > tokens[nameIndex].line and
         tokens[cursor].column == 0:
       break
-    case tokens[cursor].text
-    of "(", "[", "{":
+    if tokens.tokenTextEquals(tokens[cursor], "(") or
+        tokens.tokenTextEquals(tokens[cursor], "[") or
+        tokens.tokenTextEquals(tokens[cursor], "{"):
       inc nesting
-    of ")", "]", "}":
+    elif tokens.tokenTextEquals(tokens[cursor], ")") or
+        tokens.tokenTextEquals(tokens[cursor], "]") or
+        tokens.tokenTextEquals(tokens[cursor], "}"):
       if nesting > 0:
         dec nesting
-    of "=":
+    elif tokens.tokenTextEquals(tokens[cursor], "="):
       if nesting == 0:
         return true
-    else:
-      discard
   false
 
 proc completeSymbol(index: SourceIndex, symbolIndex: int): bool =
@@ -200,6 +217,12 @@ proc plainImported(source: string, symbol: ImportSymbol): bool =
     return false
   source[symbol.startOffset ..< symbol.endOffset].strip(chars = {'`'}) == symbol.name
 
+proc excludedImport(item: ImportInfo, name: string): bool =
+  for excluded in item.excluded:
+    if sameIdentifier(excluded, name):
+      return true
+  false
+
 proc fromBindingState(
     source: WorkspaceSnapshot, name: string
 ): tuple[found, uncertain: bool] =
@@ -229,8 +252,10 @@ proc localDeclarationShadows*(
       if declaration.scope != scope or declaration.nameToken == uint32(tokenIndex) or
           declaration.nameToken >= uint32(source.index.parsed.tokens.len):
         continue
-      if identifierKey(source.index.parsed.tokens[int(declaration.nameToken)].text) ==
-          wanted:
+      if identifierKey(
+        source.index.parsed.tokens,
+        source.index.parsed.tokens[int(declaration.nameToken)],
+      ) == wanted:
         return true
     scope = source.index.scopes.parentScope(scope)
   false
@@ -248,16 +273,20 @@ proc importedUseSupported*(
     return false
   not source.localDeclarationShadows(tokenIndex, name)
 
-proc qualifiedMember[T](tokens: T, tokenIndex: int): tuple[qualifier, member: int] =
+proc qualifiedMember(
+    tokens: TokenStore, tokenIndex: int
+): tuple[qualifier, member: int] =
   result = (-1, -1)
-  if tokenIndex < 2 or tokens[tokenIndex - 1].text != ".":
+  if tokenIndex < 2 or not tokens.tokenTextEquals(tokens[tokenIndex - 1], "."):
     return
   let qualifier = tokenIndex - 2
   if tokens[qualifier].kind != tkIdentifier or
       tokens[qualifier].line != tokens[tokenIndex].line or (
-    qualifier > 0 and tokens[qualifier - 1].text == "." and
+    qualifier > 0 and tokens.tokenTextEquals(tokens[qualifier - 1], ".") and
     tokens[qualifier - 1].line == tokens[qualifier].line
-  ) or (tokenIndex + 1 < tokens.len and tokens[tokenIndex + 1].text == "."):
+  ) or (
+    tokenIndex + 1 < tokens.len and tokens.tokenTextEquals(tokens[tokenIndex + 1], ".")
+  ):
     return
   result = (qualifier, tokenIndex)
 
@@ -364,50 +393,65 @@ proc resolveLocalType*(
     return
   if not source.index.nativeIndexSafe() or
       local.typeToken >= uint32(source.index.parsed.tokens.len):
-    result.info = LocalTypeInfo()
+    result.info = LocalTypeInfo(state: typeStateUnknown)
     return
 
   let resolution = resolveDefinitionAtToken(workspace, source, int(local.typeToken))
-  if resolution.kind != definitionResolved or resolution.target.kind != targetDeclaration or
-      not resolution.target.fileId.valid:
-    result.info = LocalTypeInfo()
+  if resolution.kind != definitionResolved:
+    result.info = LocalTypeInfo(state: typeStateForDefinition(resolution.kind))
+    return
+  if resolution.target.kind != targetDeclaration or not resolution.target.fileId.valid:
+    result.info = LocalTypeInfo(state: typeStateUnknown)
     return
 
   var targetSource: WorkspaceSnapshot
   if resolution.target.fileId.value == source.fileId.value:
     if resolution.target.snapshotId.value != source.id.value or
         resolution.target.contentGeneration.value != source.contentGeneration.value:
-      result.info = LocalTypeInfo()
+      result.info = LocalTypeInfo(state: typeStateUnknown)
       return
     targetSource = source
   else:
     targetSource = workspace.snapshotForFile(resolution.target.fileId)
     if not targetSource.valid or targetSource.id.value != source.id.value or
         targetSource.contentGeneration.value != resolution.target.contentGeneration.value or
-        targetSource.index == nil or not targetSource.index.nativeIndexSafe():
-      result.info = LocalTypeInfo()
+        targetSource.index == nil:
+      result.info = LocalTypeInfo(state: typeStateUnknown)
       return
 
   let symbolIndex = targetSource.index.symbols.symbolToken(resolution.target.nameToken)
   if symbolIndex < 0 or symbolIndex >= targetSource.index.symbols.len:
-    result.info = LocalTypeInfo()
+    result.info = LocalTypeInfo(state: typeStateUnknown)
     return
   case targetSource.index.symbols[symbolIndex].kind
   of symbolType:
-    result.info.kind = localTypeNamed
+    if not targetSource.index.nativeIndexSafe():
+      result.info = LocalTypeInfo(state: typeStateUnknown)
+      return
+    result.info.kind = typeNamed
+    result.info.state = typeStateResolved
+  of symbolMacro, symbolTemplate:
+    result.info = LocalTypeInfo(state: typeStateGenerated)
   of symbolProc, symbolFunc:
+    if not targetSource.index.nativeIndexSafe():
+      result.info = LocalTypeInfo(state: typeStateUnknown)
+      return
     let returnInfo = targetSource.index.types.routineReturnAt(
       targetSource.index.parsed.tokens, targetSource.index.symbols, symbolIndex
     )
-    if returnInfo.kind != localTypeNamed:
-      result.info = LocalTypeInfo()
+    if returnInfo.state != typeStateResolved or
+        returnInfo.kind notin {
+          typeNamed, typeRef, typeGenericInstance, typeBool, typeChar, typeString,
+          typeInt, typeFloat, typeSeq,
+        }:
+      result.info = LocalTypeInfo(state: typeStateUnknown)
       return
     result.info = returnInfo
     result.snapshotId = targetSource.id
     result.fileId = targetSource.fileId
     result.contentGeneration = targetSource.contentGeneration
   else:
-    result.info = LocalTypeInfo()
+    result.info = LocalTypeInfo(state: typeStateUnknown)
 
 proc resolveObjectReceiver*(
     workspace: Workspace, source: WorkspaceSnapshot, receiverDeclarationToken: uint32
@@ -416,7 +460,8 @@ proc resolveObjectReceiver*(
       not source.index.bindingsReady or not source.index.nativeIndexSafe():
     return
   let localType = workspace.resolveLocalType(source, receiverDeclarationToken)
-  if localType.info.kind != localTypeNamed:
+  if localType.info.state != typeStateResolved or
+      localType.info.kind notin {typeNamed, typeRef, typeGenericInstance}:
     return
   var typeSource = source
   if localType.fileId.value != source.fileId.value:
@@ -453,6 +498,10 @@ proc resolveObjectReceiver*(
   let objectOrdinal = provider.types.objectOrdinal(typeResolution.target.nameToken)
   if objectOrdinal < 0 or objectOrdinal >= provider.types.objects.len:
     return
+  if localType.info.kind == typeGenericInstance:
+    let objectType = provider.types.objects[objectOrdinal]
+    if objectType.pastGenericParameter - objectType.firstGenericParameter != 1'u32:
+      return
   result.resolved = true
   result.typeTarget = typeResolution.target
   result.provider = provider
@@ -474,14 +523,18 @@ proc resolveObjectField(
       objectType.pastField > uint32(provider.types.fields.len):
     return unknownResolution(definitionUnsupported)
   var matched = -1
-  let wanted = source.index.parsed.tokens[memberToken].text
+  let wanted =
+    source.index.parsed.tokens.tokenText(source.index.parsed.tokens[memberToken])
   for fieldIndex in objectType.firstField ..< objectType.pastField:
     let field = provider.types.fields[int(fieldIndex)]
     if receiver.exportedOnly and field.visibility != objectFieldExported:
       continue
     if field.nameToken >= uint32(provider.parsed.tokens.len):
       return unknownResolution(definitionUnsupported)
-    if not sameIdentifier(provider.parsed.tokens[int(field.nameToken)].text, wanted):
+    if not sameIdentifier(
+      provider.parsed.tokens.tokenText(provider.parsed.tokens[int(field.nameToken)]),
+      wanted,
+    ):
       continue
     if matched >= 0:
       return unknownResolution(definitionAmbiguous)
@@ -522,6 +575,422 @@ proc resolveObjectFieldDeclaration(
     return
   unknownResolution(definitionUnsupported)
 
+proc exactTypeMatch*(
+    workspace: Workspace,
+    leftSource, rightSource: WorkspaceSnapshot,
+    left, right: LocalTypeInfo,
+): tuple[state: TypeState, matches: bool] =
+  if workspace == nil or not leftSource.valid or not rightSource.valid or
+      leftSource.index == nil or rightSource.index == nil:
+    return
+  if left.state != typeStateResolved:
+    result.state = left.state
+    return
+  if right.state != typeStateResolved:
+    result.state = right.state
+    return
+  if left.kind != right.kind:
+    result.state = typeStateResolved
+    return
+  case left.kind
+  of typeBool, typeChar, typeString, typeInt, typeFloat:
+    result.state = typeStateResolved
+    result.matches = true
+  of typeSeq:
+    let leftBase = leftSource.index.types.typeBase(left.typeId)
+    let rightBase = rightSource.index.types.typeBase(right.typeId)
+    let leftKind = leftSource.index.types.typeKind(leftBase)
+    let rightKind = rightSource.index.types.typeKind(rightBase)
+    if leftKind == typeUnknown or rightKind == typeUnknown:
+      return
+    result.state = typeStateResolved
+    result.matches = leftKind == rightKind
+  of typeArray:
+    let leftOrdinal = int(uint32(left.typeId)) - 1
+    let rightOrdinal = int(uint32(right.typeId)) - 1
+    if leftOrdinal < 0 or leftOrdinal >= leftSource.index.types.records.len or
+        rightOrdinal < 0 or rightOrdinal >= rightSource.index.types.records.len:
+      return
+    let leftRecord = leftSource.index.types.records[leftOrdinal]
+    let rightRecord = rightSource.index.types.records[rightOrdinal]
+    result.state = typeStateResolved
+    result.matches =
+      leftRecord.extent == rightRecord.extent and
+      leftSource.index.types.typeKind(leftRecord.baseType) ==
+      rightSource.index.types.typeKind(rightRecord.baseType)
+  of typeNamed, typeRef:
+    if left.typeToken == InvalidTypeToken or right.typeToken == InvalidTypeToken:
+      return
+    let leftResolution =
+      resolveDefinitionAtToken(workspace, leftSource, int(left.typeToken))
+    let rightResolution =
+      resolveDefinitionAtToken(workspace, rightSource, int(right.typeToken))
+    if leftResolution.kind != definitionResolved:
+      result.state = typeStateForDefinition(leftResolution.kind)
+      return
+    if rightResolution.kind != definitionResolved:
+      result.state = typeStateForDefinition(rightResolution.kind)
+      return
+    result.state = typeStateResolved
+    result.matches = leftResolution.target.sameDefinitionTarget(rightResolution.target)
+  of typeGenericInstance:
+    result.state = typeStateUnresolved
+  else:
+    discard
+
+type
+  UfcsFormalArityKind = enum
+    ufcsArityUnknown
+    ufcsArityFixed
+    ufcsArityVariable
+
+  UfcsCallKind = enum
+    ufcsNotCall
+    ufcsCallKnown
+    ufcsCallUncertain
+
+  UfcsTargetRecord = object
+    target: DefinitionTarget
+    arityKind: UfcsFormalArityKind
+    arity: uint32
+
+proc addUfcsTarget(
+    targets: var seq[UfcsTargetRecord],
+    target: DefinitionTarget,
+    arityKind: UfcsFormalArityKind,
+    arity: uint32,
+) =
+  for existing in targets:
+    if existing.target.sameDefinitionTarget(target):
+      return
+  targets.add UfcsTargetRecord(target: target, arityKind: arityKind, arity: arity)
+
+proc ufcsFormalArity(
+    tokens: TokenStore, scopes: ScopeIndex, first: LexicalDeclaration
+): tuple[kind: UfcsFormalArityKind, count: uint32] =
+  result.kind = ufcsArityUnknown
+  if first.kind != declarationParameter:
+    return
+  let scopeOrdinal = int(uint32(first.scope)) - 1
+  if scopeOrdinal < 0 or scopeOrdinal >= scopes.scopes.len:
+    return
+  for declaration in scopes.declarations:
+    if declaration.scope != first.scope or declaration.kind != declarationParameter:
+      continue
+    if declaration.firstToken >= declaration.pastToken or
+        declaration.pastToken > uint32(tokens.len):
+      return
+    inc result.count
+    var delimiters: seq[char] = @[]
+    for tokenIndex in int(declaration.firstToken) ..< int(declaration.pastToken):
+      let token = tokens[tokenIndex]
+      if token.kind == tkPunctuation and tokens.tokenTextLen(token) == 1:
+        let value = tokens.tokenTextChar(token, 0)
+        if isOpeningDelimiter(value):
+          delimiters.add value
+          continue
+        if isClosingDelimiter(value):
+          if delimiters.len == 0 or not matchingDelimiter(delimiters[^1], value):
+            return
+          delimiters.setLen(delimiters.len - 1)
+          continue
+        if delimiters.len == 0 and value == '=':
+          result.kind = ufcsArityVariable
+          return
+      if delimiters.len == 0 and tokens.tokenTextEquals(token, "varargs"):
+        result.kind = ufcsArityVariable
+        return
+    if delimiters.len > 0:
+      return
+  result.kind = ufcsArityFixed
+
+proc ufcsCallArity(
+    tokens: TokenStore, memberToken: int
+): tuple[kind: UfcsCallKind, count: uint32] =
+  if memberToken < 0 or memberToken + 1 >= tokens.len or
+      not tokens.tokenTextEquals(tokens[memberToken + 1], "("):
+    result.kind = ufcsNotCall
+    return
+  result.kind = ufcsCallUncertain
+  var delimiters = @['(']
+  var hasArgument = false
+  for tokenIndex in memberToken + 2 ..< tokens.len:
+    let token = tokens[tokenIndex]
+    if token.kind == tkPunctuation and tokens.tokenTextLen(token) == 1:
+      let value = tokens.tokenTextChar(token, 0)
+      if isOpeningDelimiter(value):
+        delimiters.add value
+        hasArgument = true
+        continue
+      if isClosingDelimiter(value):
+        if delimiters.len == 0 or not matchingDelimiter(delimiters[^1], value):
+          return
+        delimiters.setLen(delimiters.len - 1)
+        if delimiters.len == 0:
+          if hasArgument:
+            inc result.count
+          elif result.count > 0:
+            return
+          result.kind = ufcsCallKnown
+          return
+        continue
+      if delimiters.len == 1 and value == ',':
+        if not hasArgument:
+          return
+        inc result.count
+        hasArgument = false
+        continue
+    if delimiters.len == 1:
+      hasArgument = true
+
+proc importedUfcsName(
+    workspace: Workspace, source: WorkspaceSnapshot, provider: FileId, name: string
+): tuple[state: TypeState, visible: bool] =
+  result.state = typeStateResolved
+  if workspace == nil or not validSource(source) or source.index == nil:
+    result.state = typeStateUnknown
+    return
+  var uncertain = false
+  for item in source.index.parsed.imports:
+    if item.synthetic:
+      continue
+    let imported = workspace.resolveModule(source.fileId, item.module)
+    if not imported.valid or imported.value != provider.value:
+      continue
+    case item.form
+    of importModule:
+      if item.conditional:
+        uncertain = true
+      elif item.alias.len == 0 and not item.excludedImport(name):
+        result.visible = true
+    of fromModule:
+      if item.conditional or hasExcept(source.index.parsed, item):
+        uncertain = true
+        continue
+      for symbol in item.importedSymbols:
+        if not sameIdentifier(symbol.name, name):
+          continue
+        if plainImported(source.text, symbol):
+          result.visible = true
+        else:
+          uncertain = true
+  if not result.visible and uncertain:
+    result.state = typeStateUnresolved
+
+proc collectUfcsFromProvider(
+    workspace: Workspace,
+    source, provider, receiverSource: WorkspaceSnapshot,
+    receiver: LocalTypeInfo,
+    exactName, prefixKey: string,
+    targets: var seq[UfcsTargetRecord],
+): TypeState =
+  if not provider.valid or provider.index == nil or not provider.index.nativeIndexSafe():
+    return typeStateUnresolved
+  var view = workspace.indexViewForFile(provider.fileId)
+  if provider.fileId.value == source.fileId.value and not view.valid:
+    view = WorkspaceIndexView(
+      valid: source.valid,
+      id: source.id,
+      fileId: source.fileId,
+      contentGeneration: source.contentGeneration,
+      index: provider.index,
+    )
+  if not view.valid or view.index == nil or view.id.value != source.id.value or
+      view.contentGeneration.value != provider.contentGeneration.value:
+    return typeStateUnresolved
+  let imported = provider.fileId.value != source.fileId.value
+  for candidate in provider.index.types.ufcsProcedures:
+    if candidate.symbolOrdinal >= uint32(provider.index.symbols.len) or
+        candidate.parameterOrdinal >= uint32(provider.index.scopes.declarations.len):
+      return typeStateUnknown
+    let symbol = provider.index.symbols[int(candidate.symbolOrdinal)]
+    if symbol.nameToken >= uint32(provider.index.parsed.tokens.len) or
+        symbol.kind notin {symbolProc, symbolFunc}:
+      return typeStateUnknown
+    if imported and not symbol.exported:
+      continue
+    let name = provider.index.parsed.tokens.tokenText(
+      provider.index.parsed.tokens[int(symbol.nameToken)]
+    )
+    let key = identifierKey(name)
+    if key.len == 0 or (exactName.len > 0 and not sameIdentifier(name, exactName)) or
+        (exactName.len == 0 and prefixKey.len > 0 and not key.startsWith(prefixKey)):
+      continue
+    if imported:
+      let visibility = importedUfcsName(workspace, source, provider.fileId, name)
+      if visibility.state != typeStateResolved:
+        return visibility.state
+      if not visibility.visible:
+        continue
+    let parameter = provider.index.scopes.declarations[int(candidate.parameterOrdinal)]
+    let candidateType = provider.index.types.localTypeAt(
+      provider.index.parsed.tokens, provider.index.scopes, parameter.nameToken
+    )
+    let match =
+      exactTypeMatch(workspace, receiverSource, provider, receiver, candidateType)
+    if match.state != typeStateResolved:
+      return match.state
+    if not match.matches:
+      continue
+    let target = targetFor(source, view, int(candidate.symbolOrdinal))
+    if target.kind != definitionResolved:
+      return typeStateForDefinition(target.kind)
+    let arity =
+      ufcsFormalArity(provider.index.parsed.tokens, provider.index.scopes, parameter)
+    targets.addUfcsTarget(target.target, arity.kind, arity.count)
+  typeStateResolved
+
+proc collectUfcsTargetRecords(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    receiver: LocalTypeResolution,
+    exactName = "",
+    prefixKey = "",
+): tuple[state: TypeState, targets: seq[UfcsTargetRecord]] =
+  result.state = typeStateResolved
+  if workspace == nil or not validSource(source) or source.index == nil or
+      not source.index.nativeIndexSafe() or receiver.info.state != typeStateResolved or
+      not receiver.info.typeId.valid or receiver.info.kind == typeUnknown:
+    result.state = typeStateUnknown
+    return
+  var receiverSource = source
+  if receiver.fileId.value == source.fileId.value:
+    if receiver.snapshotId.value != source.id.value or
+        receiver.contentGeneration.value != source.contentGeneration.value:
+      result.state = typeStateUnknown
+      return
+  else:
+    receiverSource = workspace.snapshotForFile(receiver.fileId)
+    if not receiverSource.valid or receiverSource.id.value != receiver.snapshotId.value or
+        receiverSource.contentGeneration.value != receiver.contentGeneration.value or
+        receiverSource.index == nil or not receiverSource.index.nativeIndexSafe():
+      result.state = typeStateUnknown
+      return
+  let localState = collectUfcsFromProvider(
+    workspace, source, source, receiverSource, receiver.info, exactName, prefixKey,
+    result.targets,
+  )
+  if localState != typeStateResolved:
+    result.state = localState
+    return
+  var providers: seq[FileId] = @[]
+  for item in source.index.parsed.imports:
+    if item.form notin {importModule, fromModule} or item.synthetic:
+      continue
+    let provider = workspace.resolveModule(source.fileId, item.module)
+    if not provider.valid or provider.value == source.fileId.value:
+      continue
+    var known = false
+    for existing in providers:
+      if existing.value == provider.value:
+        known = true
+        break
+    if not known:
+      providers.add provider
+  if providers.len == 0:
+    return
+  if not workspace.graphComplete:
+    return
+  let catalog = workspace.moduleCatalog()
+  if catalog == nil or not catalog.complete():
+    return
+  let surfaces = workspace.projectSurface()
+  if surfaces == nil or not surfaces.valid:
+    return
+  for providerId in providers:
+    let provider = workspace.snapshotForFile(providerId)
+    let module = workspace.moduleForPath(provider.path)
+    if module.len == 0 or not surfaces.moduleKnown(module):
+      result.state = typeStateUnresolved
+      return
+    let providerState = collectUfcsFromProvider(
+      workspace, source, provider, receiverSource, receiver.info, exactName, prefixKey,
+      result.targets,
+    )
+    if providerState != typeStateResolved:
+      result.state = providerState
+      return
+
+proc collectUfcsTargets*(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    receiver: LocalTypeResolution,
+    exactName = "",
+    prefixKey = "",
+): tuple[state: TypeState, targets: seq[DefinitionTarget]] =
+  let records =
+    collectUfcsTargetRecords(workspace, source, receiver, exactName, prefixKey)
+  result.state = records.state
+  for record in records.targets:
+    result.targets.add record.target
+
+proc collectUfcsTargets*(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    receiver: LocalTypeInfo,
+    exactName = "",
+    prefixKey = "",
+): tuple[state: TypeState, targets: seq[DefinitionTarget]] =
+  let resolution = LocalTypeResolution(
+    info: receiver,
+    snapshotId: source.id,
+    fileId: source.fileId,
+    contentGeneration: source.contentGeneration,
+  )
+  let records =
+    collectUfcsTargetRecords(workspace, source, resolution, exactName, prefixKey)
+  result.state = records.state
+  for record in records.targets:
+    result.targets.add record.target
+
+proc resolveUfcsMember(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    receiverDeclarationToken: uint32,
+    memberToken: int,
+): DefinitionResolution =
+  if workspace == nil or not validSource(source) or source.index == nil or
+      receiverDeclarationToken >= uint32(source.index.parsed.tokens.len) or
+      memberToken < 0 or memberToken >= source.index.parsed.tokens.len:
+    return unknownResolution(definitionUnsupported)
+  let localType = workspace.resolveLocalType(source, receiverDeclarationToken)
+  let wanted =
+    source.index.parsed.tokens.tokenText(source.index.parsed.tokens[memberToken])
+  if wanted.len == 0:
+    return unknownResolution(definitionUnsupported)
+  let matches = collectUfcsTargetRecords(workspace, source, localType, wanted)
+  case matches.state
+  of typeStateUnresolved:
+    return unknownResolution(definitionUnresolved)
+  of typeStateAmbiguous:
+    return unknownResolution(definitionAmbiguous)
+  of typeStateUnknown, typeStateGenerated:
+    return unknownResolution(definitionUnsupported)
+  of typeStateResolved:
+    discard
+  if matches.targets.len == 0:
+    return unknownResolution(definitionUnsupported)
+  let call = ufcsCallArity(source.index.parsed.tokens, memberToken)
+  case call.kind
+  of ufcsNotCall, ufcsCallUncertain:
+    var targets: seq[DefinitionTarget] = @[]
+    for record in matches.targets:
+      targets.addTarget(record.target)
+    finishTargets(targets, unresolved = false)
+  of ufcsCallKnown:
+    if call.count == high(uint32):
+      return unknownResolution(definitionUnsupported)
+    let wantedArity = call.count + 1'u32
+    var targets: seq[DefinitionTarget] = @[]
+    for record in matches.targets:
+      if record.arityKind != ufcsArityFixed:
+        return unknownResolution(definitionUnsupported)
+      if record.arity == wantedArity:
+        targets.addTarget(record.target)
+    if targets.len == 0:
+      return unknownResolution(definitionUnsupported)
+    finishTargets(targets, unresolved = false)
+
 proc resolveDefinitionAtToken*(
     workspace: Workspace, source: WorkspaceSnapshot, tokenIndex: int
 ): DefinitionResolution =
@@ -538,7 +1007,8 @@ proc resolveDefinitionAtToken*(
   if local.kind != definitionUnknown:
     return local
 
-  let matches = symbolMatches(source.index, token.text)
+  let tokenName = source.index.parsed.tokens.tokenText(token)
+  let matches = symbolMatches(source.index, tokenName)
   let declarationIndex = source.index.symbols.symbolToken(uint32(tokenIndex))
   if declarationIndex >= 0:
     if matches.len != 1:
@@ -564,29 +1034,40 @@ proc resolveDefinitionAtToken*(
     of bindingResolved:
       let receiver =
         resolveObjectReceiver(workspace, source, qualifierBinding.declarationToken)
-      if not receiver.resolved:
-        return unknownResolution(definitionUnsupported)
-      return resolveObjectField(source, receiver, qualified.member)
+      if receiver.resolved:
+        let field = resolveObjectField(source, receiver, qualified.member)
+        if field.kind != definitionUnsupported:
+          return field
+      return resolveUfcsMember(
+        workspace, source, qualifierBinding.declarationToken, qualified.member
+      )
     of bindingAmbiguous:
       return unknownResolution(definitionAmbiguous)
     of bindingUnknown:
       if not source.importedUseSupported(
-        qualified.qualifier, source.index.parsed.tokens[qualified.qualifier].text
+        qualified.qualifier,
+        source.index.parsed.tokens.tokenText(
+          source.index.parsed.tokens[qualified.qualifier]
+        ),
       ):
         return
     return resolveQualified(
       workspace,
       source,
-      source.index.parsed.tokens[qualified.qualifier].text,
-      token.text,
+      source.index.parsed.tokens.tokenText(
+        source.index.parsed.tokens[qualified.qualifier]
+      ),
+      tokenName,
     )
   if tokenIndex + 1 < source.index.parsed.tokens.len and
-      source.index.parsed.tokens[tokenIndex + 1].text == ".":
+      source.index.parsed.tokens.tokenTextEquals(
+        source.index.parsed.tokens[tokenIndex + 1], "."
+      ):
     return
-  if not source.importedUseSupported(tokenIndex, token.text):
+  if not source.importedUseSupported(tokenIndex, tokenName):
     return
 
-  let fromState = fromBindingState(source, token.text)
+  let fromState = fromBindingState(source, tokenName)
   if matches.len > 1:
     return unknownResolution(definitionAmbiguous)
   if matches.len == 1:
@@ -609,7 +1090,7 @@ proc resolveDefinitionAtToken*(
     return
   if fromState.uncertain:
     return
-  result = resolveFrom(workspace, source, token.text)
+  result = resolveFrom(workspace, source, tokenName)
 
 proc resolveDefinition*(
     workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int

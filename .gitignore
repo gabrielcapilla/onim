@@ -15,6 +15,15 @@ tests/tsymbols
 tests/tdiagnostics
 tests/tmodules
 tests/tbootstrap
+tests/tbindings
+tests/tcompletion
+tests/tdiscovery
+tests/thover
+tests/tparser
+tests/treferences
+tests/trename
+tests/tstdlibmap
 *.onim-*.nim
 gen_stdlib_map
 PLAN.md
+ROADMAP.md

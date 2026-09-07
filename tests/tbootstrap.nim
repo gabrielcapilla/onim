@@ -64,6 +64,12 @@ suite "background workspace bootstrap":
     check workspace.dependencies(consumer).len == 1
     check workspace.dependencies(consumer)[0].value == provider.value
     check workspace.graphComplete
+    let before = workspace.snapshotForFile(provider)
+    check workspace.applyBootstrap(value)
+    let after = workspace.snapshotForFile(provider)
+    check before.contentGeneration.value == after.contentGeneration.value
+    check before.dependencyGeneration.value == after.dependencyGeneration.value
+    check before.index == after.index
 
   test "rejects a stale result without mutating the workspace":
     let root = getTempDir() / ("onim-background-stale-" & $getCurrentProcessId())

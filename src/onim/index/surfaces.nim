@@ -566,17 +566,17 @@ proc projectSurfaceInput*(module: string, index: SourceIndex): SurfaceInput =
     result.uncertainty.addOccurrenceUncertainty(reason)
   if index.includes.len > 0:
     result.uncertainty.incl surfaceInclude
-  if index.exports.len > 0:
+  if index.hasUnresolvedExports:
     result.uncertainty.incl surfaceReexport
   for symbol in index.symbols:
     if not symbol.exported or symbol.nameToken >= uint32(index.parsed.tokens.len):
       continue
     let token = index.parsed.tokens[int(symbol.nameToken)]
-    if token.kind != tkIdentifier or token.text.len == 0:
+    if token.kind != tkIdentifier or index.parsed.tokens.tokenTextLen(token) == 0:
       result.uncertainty.incl surfaceMalformed
       continue
     result.exports.add SurfaceExportInput(
-      name: token.text,
+      name: index.parsed.tokens.tokenText(token),
       kind: symbol.kind,
       kindKnown: true,
       declaredArity: -1,

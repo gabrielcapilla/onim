@@ -136,6 +136,21 @@ suite "native module surfaces":
     check index.lookup("answer").kind == surfaceResolved
     check index.lookup("private").kind == surfaceUnresolved
 
+  test "promotes certain explicit local exports":
+    let source = indexSource("proc answer() = discard\nexport answer\n")
+    check source.exports == @["answer"]
+    check not source.hasUnresolvedExports
+    check source.nativeIndexSafe
+    let input = projectSurfaceInput("project/provider", source)
+    check input.uncertainty == {}
+    check input.exports.len == 1
+    check input.exports[0].name == "answer"
+
+    let conflict = indexSource(
+      "from dependency import answer\nproc answer() = discard\nexport answer\n"
+    )
+    check conflict.hasUnresolvedExports
+
   test "rebuilds project generations without mutating predecessors":
     let first = buildProjectSurfaceIndex(
       @[

@@ -32,10 +32,19 @@ type
     contentHash: uint64
     byteLength: uint32
 
-const maxDiagnosticCacheEntries = 16
+const
+  maxDiagnosticCacheEntries = 16
+  maxDiagnosticCacheBytes = 16'u64 * 1024'u64 * 1024'u64
 
 var diagnosticCache = initTable[DiagnosticCacheKey, seq[CompilerDiagnostic]]()
 var diagnosticCacheOrder: seq[DiagnosticCacheKey] = @[]
+var diagnosticCacheBytes: uint64
+
+proc diagnosticBytes(diagnostics: openArray[CompilerDiagnostic]): uint64 =
+  for diagnostic in diagnostics:
+    result += uint64(diagnostic.name.len)
+    result += uint64(diagnostic.file.len)
+    result += uint64(diagnostic.message.len)
 
 proc extractUndeclaredName(message: string): string =
   let marker = "undeclared identifier"
@@ -335,17 +344,24 @@ proc rememberDiagnostics(
 ) =
   if key.project.len == 0 or key.target.len == 0:
     return
+  let bytes = diagnosticBytes(diagnostics)
+  if bytes > maxDiagnosticCacheBytes:
+    return
   if diagnosticCache.hasKey(key):
+    diagnosticCacheBytes -= diagnosticBytes(diagnosticCache[key])
     diagnosticCache[key] = diagnostics
     let oldIndex = diagnosticCacheOrder.find(key)
     if oldIndex >= 0:
       diagnosticCacheOrder.delete(oldIndex)
   else:
     diagnosticCache[key] = diagnostics
+  diagnosticCacheBytes += bytes
   diagnosticCacheOrder.add key
-  while diagnosticCacheOrder.len > maxDiagnosticCacheEntries:
+  while diagnosticCacheOrder.len > maxDiagnosticCacheEntries or
+      diagnosticCacheBytes > maxDiagnosticCacheBytes:
     let oldest = diagnosticCacheOrder[0]
     diagnosticCacheOrder.delete(0)
+    diagnosticCacheBytes -= diagnosticBytes(diagnosticCache[oldest])
     diagnosticCache.del oldest
 
 proc cachedCheckFile*(filePath: string, dirtyPath = ""): seq[CompilerDiagnostic] =

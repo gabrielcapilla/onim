@@ -2,6 +2,7 @@ import std/[os, strutils, unittest]
 
 import onim/index/source_index
 import onim/syntax/imports
+import onim/syntax/lexer
 import onim/syntax/parser
 
 proc countNodes(tree: PartialSyntaxTree, kind: SyntaxNodeKind): int =
@@ -19,6 +20,51 @@ proc childOf(tree: PartialSyntaxTree, kind, parentKind: SyntaxNodeKind): bool =
       return true
 
 suite "recoverable native syntax tree":
+  test "preserves source-backed lexical spans and lexical boundaries":
+    let source =
+      "\xEF\xBB\xBF# commentName\n" & "let normal_name = `strange-name`\n" &
+      "let empty = ``\n" &
+      "echo \"stringName\" \"\"\"tripleName\"\"\" r\"rawName\" ( [ ] )\n" &
+      "let café = 1\n" & "let broken = `unterminated\n"
+    let tokens = lex(source)
+    var normal = false
+    var closedStrop = false
+    var emptyStrop = false
+    var openStrop = false
+    var closedStrings = 0
+    var delimiters = 0
+    for token in tokens:
+      if tokens.tokenTextEquals(token, "normal_name"):
+        normal = token.kind == tkIdentifier and token.validIdentifier
+      elif token.isStropped:
+        if tfClosed in token.flags:
+          if tokens.tokenTextEquals(token, "strange-name"):
+            closedStrop = true
+          elif tokens.tokenTextLen(token) == 0:
+            emptyStrop = not token.validIdentifier
+        else:
+          openStrop = not token.validIdentifier
+      elif token.kind == tkString and token.isClosedString:
+        inc closedStrings
+      if token.kind == tkPunctuation and (
+        tokens.tokenTextEquals(token, "(") or tokens.tokenTextEquals(token, "[") or
+        tokens.tokenTextEquals(token, "]") or tokens.tokenTextEquals(token, ")")
+      ):
+        inc delimiters
+      check not tokens.tokenTextEquals(token, "commentName")
+      check not tokens.tokenTextEquals(token, "stringName")
+      check not tokens.tokenTextEquals(token, "rawName")
+    check tokens.len > 0
+    check tokens[0].line == 1
+    check tokens[0].column == 0
+    check tokens[0].startOffset == source.find("let normal_name")
+    check normal
+    check closedStrop
+    check emptyStrop
+    check openStrop
+    check closedStrings == 2
+    check delimiters == 4
+
   test "records imports and structural containers without duplicating lexer data":
     let source = """# header
 import std/[os, strformat]
@@ -35,7 +81,8 @@ proc main(value: int) =
     let imports = parseSourceImports(source)
     check tree.validateSyntaxTree
     check tree.importsMatch(imports)
-    check tree.isComplete
+    check not tree.isComplete
+    check parserUnsupportedStructure in tree.uncertainty
     let indexed = indexSource(source)
     check indexed.syntax.validateSyntaxTree
     check indexed.syntax.importsMatch(indexed.parsed)
@@ -72,8 +119,26 @@ proc main(value: int) =
     check childOf(tree, syntaxBlock, syntaxDeclaration)
 
     let named = parsePartialSyntax("proc main() =\n  block label:\n    discard\n")
-    check countNodes(named, syntaxBlock) == 0
+    check countNodes(named, syntaxBlock) == 1
     check parserUnsupportedStructure in named.uncertainty
+
+  test "bounds incomplete imports without phantom dependencies":
+    let source = "import goodA\nimport pkg/[part,\nimport goodB\n"
+    let tree = parsePartialSyntax(source)
+    let imports = parseSourceImports(source)
+    check tree.validateSyntaxTree
+    check not tree.isComplete
+    check parserIncomplete in tree.uncertainty
+    check tree.importNodes.len == 3
+    let middle = tree.nodes[int(uint32(tree.importNodes[1])) - 1]
+    check middle.kind == syntaxImport
+    check parserIncomplete in middle.uncertainty
+    check tree.nodes[int(uint32(tree.importNodes[0])) - 1].uncertainty == {}
+    check tree.nodes[int(uint32(tree.importNodes[2])) - 1].uncertainty == {}
+    check imports.imports.len == 2
+    check imports.imports[0].module == "goodA"
+    check imports.imports[1].module == "goodB"
+    check tree.importsMatch(imports)
 
   test "matches every checked-in import fixture":
     let root = currentSourcePath().parentDir.parentDir / "tests" / "before"

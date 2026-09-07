@@ -13,9 +13,9 @@ import ../session/paths
 const
   cacheMagic = "ONIMIDX1"
   manifestMagic = "ONIMMAN1"
-  cacheVersion = 2'u32
+  cacheVersion = 5'u32
   manifestVersion = 3'u32
-  manifestGraphVersion = 2'u32
+  manifestGraphVersion = 4'u32
   manifestDiscoveryVersion = 1'u32
   cacheEndian = 1'u8
   maxCacheBytes = 64 * 1024 * 1024
@@ -138,7 +138,13 @@ proc usableStamp*(stamp: FileStamp): bool {.inline.} =
 
 proc writeToken(stream: Stream, token: Token) =
   stream.write(uint8(ord(token.kind)))
-  writeString(stream, token.text)
+  stream.write(uint8(ord(token.keyword)))
+  var flags = 0'u8
+  if tfStropped in token.flags:
+    flags = flags or 1'u8
+  if tfClosed in token.flags:
+    flags = flags or 2'u8
+  stream.write(flags)
   writeInt(stream, token.startOffset)
   writeInt(stream, token.endOffset)
   writeInt(stream, token.line)
@@ -149,13 +155,21 @@ proc readToken(stream: Stream): Token =
   if kind > uint8(ord(high(TokenKind))):
     invalidCache("cache token kind is invalid")
   result.kind = TokenKind(kind)
-  result.text = readString(stream)
+  let keyword = stream.readUint8()
+  if keyword > uint8(ord(high(NimKeyword))):
+    invalidCache("cache token keyword is invalid")
+  result.keyword = NimKeyword(keyword)
+  let flags = stream.readUint8()
+  if flags > 3'u8:
+    invalidCache("cache token flags are invalid")
+  if (flags and 1'u8) != 0:
+    result.flags.incl tfStropped
+  if (flags and 2'u8) != 0:
+    result.flags.incl tfClosed
   result.startOffset = readInt(stream)
   result.endOffset = readInt(stream)
   result.line = readInt(stream)
   result.column = readInt(stream)
-  if result.kind == tkIdentifier and not isStropped(result):
-    result.keyword = keywordId(result.text)
 
 proc writeImportSymbol(stream: Stream, symbol: ImportSymbol) =
   writeString(stream, symbol.name)
@@ -234,10 +248,27 @@ proc readImport(stream: Stream): ImportInfo =
 proc validSpan(startOffset, endOffset, sourceLength: int): bool =
   startOffset >= 0 and endOffset >= startOffset and endOffset <= sourceLength
 
-proc validateToken(token: Token, sourceLength: int) =
+proc validateToken(token: Token, source: string, sourceLength: int) =
   if not validSpan(token.startOffset, token.endOffset, sourceLength) or token.line < 0 or
       token.column < 0:
     invalidCache("cache token range is invalid")
+  if tfStropped in token.flags and token.kind != tkIdentifier:
+    invalidCache("cache token strop flag is invalid")
+  if tfClosed in token.flags and token.kind notin {tkIdentifier, tkString}:
+    invalidCache("cache token closure flag is invalid")
+  if token.kind == tkIdentifier and not isStropped(token) and tfClosed in token.flags:
+    invalidCache("cache identifier closure flag is invalid")
+  if token.kind == tkIdentifier:
+    if isStropped(token):
+      if token.startOffset >= sourceLength or source[token.startOffset] != '`' or
+          token.endOffset - token.startOffset < 2 or
+          tfClosed in token.flags and source[token.endOffset - 1] != '`' or
+          token.keyword != kwNone:
+        invalidCache("cache stropped token is invalid")
+    elif token.keyword != keywordIdAt(source, token.startOffset, token.endOffset):
+      invalidCache("cache token keyword does not match source")
+  elif token.keyword != kwNone:
+    invalidCache("cache non-identifier keyword is invalid")
 
 proc validateImport(item: ImportInfo, sourceLength: int) =
   if not validSpan(item.startOffset, item.endOffset, sourceLength) or
@@ -262,9 +293,13 @@ proc validateSourceSymbol[T](symbol: SourceSymbol, tokens: T, previousToken: uin
 proc writeSourceIndex(stream: Stream, index: SourceIndex) =
   if index == nil:
     invalidCache("cannot serialize an empty source index")
+  let source = index.parsed.tokens.sourceText
+  if source.len != index.byteLength or contentFingerprint(source) != index.contentHash:
+    invalidCache("source index buffer does not match fingerprint")
   stream.write(index.contentHash)
   writeInt(stream, index.byteLength)
   writeInt(stream, index.tokenCount)
+  writeString(stream, source)
 
   writeCount(stream, index.parsed.tokens.len, maxRecordCount)
   for token in index.parsed.tokens:
@@ -279,6 +314,7 @@ proc writeSourceIndex(stream: Stream, index: SourceIndex) =
   writeStringSet(stream, index.parsed.qualifiedNames)
   writeStrings(stream, index.imports)
   writeStrings(stream, index.exports)
+  writeFlag(stream, index.hasUnresolvedExports)
   writeStrings(stream, index.includes)
   writeCount(stream, index.symbols.len, min(maxRecordCount, index.parsed.tokens.len))
   for symbol in index.symbols:
@@ -293,14 +329,21 @@ proc readSourceIndex(
   result.tokenCount = readInt(stream)
   if result.contentHash != expectedHash or result.byteLength != expectedLength:
     invalidCache("cache source fingerprint does not match")
+  let source = readString(stream)
+  if source.len != expectedLength or contentFingerprint(source) != expectedHash:
+    invalidCache("cache source buffer does not match fingerprint")
 
   let tokenCount = readCount(stream, maxRecordCount)
   var tokens = newSeqOfCap[Token](tokenCount)
+  var previousEnd = 0
   for _ in 0 ..< tokenCount:
     let token = readToken(stream)
-    validateToken(token, expectedLength)
+    validateToken(token, source, expectedLength)
+    if token.startOffset < previousEnd:
+      invalidCache("cache token order is invalid")
     tokens.add token
-  result.parsed.tokens = initTokenStore(tokens)
+    previousEnd = token.endOffset
+  result.parsed.tokens = initTokenStore(source, tokens)
   if result.tokenCount != tokenCount:
     invalidCache("cache token count does not match")
 
@@ -316,6 +359,7 @@ proc readSourceIndex(
   result.parsed.qualifiedNames = readStringSet(stream)
   result.imports = readStrings(stream)
   result.exports = readStrings(stream)
+  result.hasUnresolvedExports = readFlag(stream)
   result.includes = readStrings(stream)
   let symbolCount = readCount(stream, min(maxRecordCount, tokenCount))
   result.symbols = newSeqOfCap[SourceSymbol](symbolCount)
@@ -325,7 +369,7 @@ proc readSourceIndex(
     validateSourceSymbol(symbol, result.parsed.tokens, previousToken)
     result.symbols.add symbol
     previousToken = symbol.nameToken
-  result.syntax = parsePartialSyntax(result.parsed.tokens)
+  result.syntax = parsePartialSyntax(result.parsed.tokens, source)
   if not result.syntax.validateSyntaxTree or
       not result.syntax.importsMatch(result.parsed):
     invalidCache("cache syntax tree is invalid")

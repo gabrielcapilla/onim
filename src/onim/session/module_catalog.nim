@@ -45,20 +45,22 @@ proc canonicalModuleName*(module: string): string =
     normalized = normalized.replace("//", "/")
   prefix & normalized
 
-proc pathString(token: Token): string =
-  if token.kind != tkString or token.text.len < 2:
+proc pathString(tokens: TokenStore, token: Token): string =
+  if token.kind != tkString or tokens.tokenTextLen(token) < 2:
     return ""
-  let quote = token.text[0]
-  if (quote != '"' and quote != char(39)) or token.text[^1] != quote:
+  let quote = tokens.tokenTextChar(token, 0)
+  if (quote != '"' and quote != char(39)) or
+      tokens.tokenTextChar(token, tokens.tokenTextLen(token) - 1) != quote:
     return ""
-  token.text[1 ..< token.text.len - 1]
+  result = tokens.tokenText(token)
+  result = result[1 ..< result.len - 1]
 
-proc tokenPathValue(token: Token): string =
-  let quoted = pathString(token)
+proc tokenPathValue(tokens: TokenStore, token: Token): string =
+  let quoted = pathString(tokens, token)
   if quoted.len > 0:
     return quoted
   if token.kind == tkIdentifier and token.keyword == kwNone:
-    return token.text
+    return tokens.tokenText(token)
 
 proc addRoot(catalog: ModuleCatalog, path: string) =
   let root = canonicalPath(path)
@@ -86,16 +88,16 @@ proc addNimbleRoots(catalog: ModuleCatalog, configPath: string): bool =
   let tokens = lex(source)
   var sawSourceDirectory = false
   for index, token in tokens:
-    if token.kind != tkIdentifier or token.text != "srcDir":
+    if token.kind != tkIdentifier or not tokens.tokenTextEquals(token, "srcDir"):
       continue
     sawSourceDirectory = true
     var cursor = index + 1
     while cursor < tokens.len and tokens[cursor].line == token.line and
-        tokens[cursor].text != "=":
+        not tokens.tokenTextEquals(tokens[cursor], "="):
       inc cursor
-    if cursor + 1 >= tokens.len or tokens[cursor].text != "=":
+    if cursor + 1 >= tokens.len or not tokens.tokenTextEquals(tokens[cursor], "="):
       return false
-    let value = pathString(tokens[cursor + 1])
+    let value = pathString(tokens, tokens[cursor + 1])
     if value.len == 0:
       return false
     catalog.addConfiguredRoot(configPath, value)
@@ -109,12 +111,14 @@ proc addNimConfigRoots(catalog: ModuleCatalog, configPath: string) =
     return
   let tokens = lex(source)
   for index, token in tokens:
-    if token.kind != tkIdentifier or token.text != "path":
+    if token.kind != tkIdentifier or not tokens.tokenTextEquals(token, "path"):
       continue
-    if index + 2 >= tokens.len or
-        (tokens[index + 1].text != ":" and tokens[index + 1].text != "="):
+    if index + 2 >= tokens.len or (
+      not tokens.tokenTextEquals(tokens[index + 1], ":") and
+      not tokens.tokenTextEquals(tokens[index + 1], "=")
+    ):
       continue
-    let value = tokenPathValue(tokens[index + 2])
+    let value = tokenPathValue(tokens, tokens[index + 2])
     if value.len > 0:
       catalog.addConfiguredRoot(configPath, value)
 

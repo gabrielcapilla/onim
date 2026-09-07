@@ -174,10 +174,11 @@ proc importedNameUsed(
     source: string, imports: SourceImports, item: ImportInfo, name: string
 ): bool =
   for tokenIndex, token in imports.tokens:
-    if token.kind != tkIdentifier or token.text != name or
+    if token.kind != tkIdentifier or not imports.tokens.tokenTextEquals(token, name) or
         token.startOffset <= item.endOffset or imports.tokenInsideImport(token):
       continue
-    if tokenIndex > 0 and imports.tokens[tokenIndex - 1].text == ".":
+    if tokenIndex > 0 and
+        imports.tokens.tokenTextEquals(imports.tokens[tokenIndex - 1], "."):
       continue
     if name in imports.localDefinitions:
       return true
@@ -470,7 +471,8 @@ proc findUsageToken(info: SourceImports, diagnostic: CompilerDiagnostic): int =
   var best = -1
   var bestDistance = high(int)
   for index, token in info.tokens:
-    if token.kind != tkIdentifier or token.text != diagnostic.name:
+    if token.kind != tkIdentifier or
+        not info.tokens.tokenTextEquals(token, diagnostic.name):
       continue
     let distance =
       abs(token.line - diagnostic.line) * 10000 + abs(token.column - diagnostic.column)
@@ -481,15 +483,14 @@ proc findUsageToken(info: SourceImports, diagnostic: CompilerDiagnostic): int =
 
 proc callArity(info: SourceImports, source: string, tokenIndex: int): int =
   if tokenIndex < 0 or tokenIndex + 1 >= info.tokens.len or
-      info.tokens[tokenIndex + 1].text != "(":
+      not info.tokens.tokenTextEquals(info.tokens[tokenIndex + 1], "("):
     return -1
   var depth = 0
   var commas = 0
   for index in tokenIndex + 1 ..< info.tokens.len:
-    let text = info.tokens[index].text
-    if text == "(":
+    if info.tokens.tokenTextEquals(info.tokens[index], "("):
       inc depth
-    elif text == ")":
+    elif info.tokens.tokenTextEquals(info.tokens[index], ")"):
       dec depth
       if depth == 0:
         let content =
@@ -499,7 +500,7 @@ proc callArity(info: SourceImports, source: string, tokenIndex: int): int =
         if content.len == 0:
           return 0
         return commas + 1
-    elif depth == 1 and text == ",":
+    elif depth == 1 and info.tokens.tokenTextEquals(info.tokens[index], ","):
       inc commas
   -1
 
@@ -508,9 +509,12 @@ proc qualifiedMember(
 ): tuple[qualifier, member: string] =
   let tokenIndex = findUsageToken(info, diagnostic)
   if tokenIndex >= 0 and tokenIndex + 2 < info.tokens.len and
-      info.tokens[tokenIndex + 1].text == "." and
+      info.tokens.tokenTextEquals(info.tokens[tokenIndex + 1], ".") and
       info.tokens[tokenIndex + 2].kind == tkIdentifier:
-    return (info.tokens[tokenIndex].text, info.tokens[tokenIndex + 2].text)
+    return (
+      info.tokens.tokenText(info.tokens[tokenIndex]),
+      info.tokens.tokenText(info.tokens[tokenIndex + 2]),
+    )
   ("", "")
 
 proc mergeIncludedNames(target: var SourceImports, source: SourceImports) =
@@ -552,7 +556,8 @@ proc importsAvailableFromIncluded(
     if not token.isKeyword(kwInclude) or tokenIndex + 1 >= info.tokens.len:
       continue
     let includeToken = info.tokens[tokenIndex + 1]
-    var includeName = includeToken.text.strip(chars = {'"', '\'', '`'})
+    var includeName =
+      info.tokens.tokenText(includeToken).strip(chars = {'"', '\'', '`'})
     if includeName.len == 0:
       continue
     if not includeName.endsWith(".nim"):
@@ -1045,6 +1050,7 @@ proc forBindingState(
 ): NativeBindingState =
   if index == nil:
     return nativeUnknown
+  let wanted = identifierKey(name)
   for forIndex, forToken in index.parsed.tokens:
     if not forToken.hasKeywordRole(roleForBinding):
       continue
@@ -1054,11 +1060,13 @@ proc forBindingState(
     while cursor < index.parsed.tokens.len and
         index.parsed.tokens[cursor].line == forToken.line:
       let token = index.parsed.tokens[cursor]
-      if token.text == "in" or token.text == "=" or token.text == ":":
+      if index.parsed.tokens.tokenTextEquals(token, "in") or
+          index.parsed.tokens.tokenTextEquals(token, "=") or
+          index.parsed.tokens.tokenTextEquals(token, ":"):
         separator = cursor
         break
       if token.kind == tkIdentifier and not isNimKeyword(token) and
-          sameIdentifier(token.text, name):
+          identifierKey(index.parsed.tokens, token) == wanted:
         foundName = true
       inc cursor
     if not foundName:
@@ -1069,7 +1077,7 @@ proc forBindingState(
       cursor = separator + 1
       while cursor < index.parsed.tokens.len and
           index.parsed.tokens[cursor].line == forToken.line and
-          index.parsed.tokens[cursor].text != ":"
+          not index.parsed.tokens.tokenTextEquals(index.parsed.tokens[cursor], ":")
       :
         inc cursor
       if tokenIndex >= cursor:
@@ -1098,8 +1106,8 @@ proc nativeBinding(
   for symbol in index.symbols:
     let symbolIndex = int(symbol.nameToken)
     if symbolIndex < 0 or symbolIndex >= index.parsed.tokens.len or
-        index.parsed.tokens[symbolIndex].column != 0 or
-        not sameIdentifier(index.parsed.tokens[symbolIndex].text, name):
+        identifierKey(index.parsed.tokens, index.parsed.tokens[symbolIndex]) !=
+        identifierKey(name):
       continue
     found = true
     if symbolIndex >= tokenIndex:
@@ -1110,7 +1118,8 @@ proc nativeBinding(
   for declaration in index.scopes.declarations:
     let declarationIndex = int(declaration.nameToken)
     if declarationIndex < 0 or declarationIndex >= index.parsed.tokens.len or
-        not sameIdentifier(index.parsed.tokens[declarationIndex].text, name) or
+        identifierKey(index.parsed.tokens, index.parsed.tokens[declarationIndex]) !=
+        identifierKey(name) or
         not index.scopes.isScopeAncestor(declaration.scope, occurrenceScope):
       continue
     found = true
@@ -1135,11 +1144,13 @@ proc nativeNameUse(
     if tokenIndex < 0 or tokenIndex >= index.parsed.tokens.len:
       continue
     let token = index.parsed.tokens[tokenIndex]
-    if token.startOffset <= itemEnd or not sameIdentifier(token.text, name):
+    if token.startOffset <= itemEnd or
+        identifierKey(index.parsed.tokens, token) != identifierKey(name):
       continue
-    if tokenIndex > 0 and index.parsed.tokens[tokenIndex - 1].text == ".":
+    if tokenIndex > 0 and
+        index.parsed.tokens.tokenTextEquals(index.parsed.tokens[tokenIndex - 1], "."):
       continue
-    case nativeBinding(info, index, token.text, tokenIndex)
+    case nativeBinding(info, index, name, tokenIndex)
     of nativeBound:
       discard
     of nativeUnknown:
@@ -1271,32 +1282,40 @@ proc nativeModuleUsed(
     if token.startOffset <= item.endOffset:
       continue
 
-    if tokenIndex >= 2 and index.parsed.tokens[tokenIndex - 1].text == ".":
+    if tokenIndex >= 2 and
+        index.parsed.tokens.tokenTextEquals(index.parsed.tokens[tokenIndex - 1], "."):
       let qualifierIndex = tokenIndex - 2
       let qualifierToken = index.parsed.tokens[qualifierIndex]
-      if qualifierToken.kind == tkIdentifier and
-          (qualifierIndex == 0 or index.parsed.tokens[qualifierIndex - 1].text != ".") and
-          sameIdentifier(qualifierToken.text, qualifier):
-        let binding = nativeBinding(info, index, qualifierToken.text, qualifierIndex)
+      if qualifierToken.kind == tkIdentifier and (
+        qualifierIndex == 0 or
+        not index.parsed.tokens.tokenTextEquals(
+          index.parsed.tokens[qualifierIndex - 1], "."
+        )
+      ) and sameIdentifier(index.parsed.tokens.tokenText(qualifierToken), qualifier):
+        let binding = nativeBinding(
+          info, index, index.parsed.tokens.tokenText(qualifierToken), qualifierIndex
+        )
         if binding == nativeUnknown:
           return nativeModuleUseUnknown
         if binding == nativeNoBinding:
           return nativeModuleUseFound
       continue
 
-    if tokenIndex > 0 and index.parsed.tokens[tokenIndex - 1].text == "." or
+    if tokenIndex > 0 and
+        index.parsed.tokens.tokenTextEquals(index.parsed.tokens[tokenIndex - 1], ".") or
         tokenIndex + 1 < index.parsed.tokens.len and
-        index.parsed.tokens[tokenIndex + 1].text == ".":
+        index.parsed.tokens.tokenTextEquals(index.parsed.tokens[tokenIndex + 1], "."):
       continue
-    let binding = nativeBinding(info, index, token.text, tokenIndex)
+    let name = index.parsed.tokens.tokenText(token)
+    let binding = nativeBinding(info, index, name, tokenIndex)
     if binding == nativeUnknown:
       return nativeModuleUseUnknown
     if binding == nativeNoBinding:
       let use =
         if module.startsWith("std/"):
-          nativeUnqualifiedUse(stdlib, token.text, module)
+          nativeUnqualifiedUse(stdlib, name, module)
         else:
-          nativeProjectModuleUse(project, catalog, owner, token.text, module)
+          nativeProjectModuleUse(project, catalog, owner, name, module)
       if use != nativeModuleUseNone:
         return use
   nativeModuleUseNone
@@ -1372,30 +1391,37 @@ proc nativeImportAdditions(
       continue
     let token = index.parsed.tokens[tokenIndex]
 
-    var name = token.text
+    var name = index.parsed.tokens.tokenText(token)
     var qualifier = ""
-    if tokenIndex >= 2 and index.parsed.tokens[tokenIndex - 1].text == ".":
+    if tokenIndex >= 2 and
+        index.parsed.tokens.tokenTextEquals(index.parsed.tokens[tokenIndex - 1], "."):
       let qualifierIndex = tokenIndex - 2
       if qualifierIndex < 0 or index.parsed.tokens[qualifierIndex].kind != tkIdentifier or
-          (qualifierIndex > 0 and index.parsed.tokens[qualifierIndex - 1].text == "."):
+      (
+        qualifierIndex > 0 and
+        index.parsed.tokens.tokenTextEquals(
+          index.parsed.tokens[qualifierIndex - 1], "."
+        )
+      ):
         continue
-      qualifier = index.parsed.tokens[qualifierIndex].text
+      qualifier = index.parsed.tokens.tokenText(index.parsed.tokens[qualifierIndex])
       let binding = nativeBinding(info, index, qualifier, qualifierIndex)
       if binding == nativeBound:
         continue
       if binding == nativeUnknown:
         result.safe = false
         return
-    elif tokenIndex > 0 and index.parsed.tokens[tokenIndex - 1].text == "." or
+    elif tokenIndex > 0 and
+        index.parsed.tokens.tokenTextEquals(index.parsed.tokens[tokenIndex - 1], ".") or
         tokenIndex + 1 < index.parsed.tokens.len and
-        index.parsed.tokens[tokenIndex + 1].text == ".":
+        index.parsed.tokens.tokenTextEquals(index.parsed.tokens[tokenIndex + 1], "."):
       continue
 
     let resolved = stdlib.resolveUniqueCandidate(
       name, qualifier, callArity(info, source, tokenIndex)
     )
     if qualifier.len == 0:
-      let binding = nativeBinding(info, index, token.text, tokenIndex)
+      let binding = nativeBinding(info, index, name, tokenIndex)
       if binding == nativeBound:
         continue
       if binding == nativeUnknown:
@@ -1476,25 +1502,32 @@ proc tryOrganizeSourceWithIndex*(
   let info = index.parsed
   let nativeRemovals =
     nativeImportRemovalPlan(info, index, stdlib, project, catalog, owner)
+  var removalPlan = nativeRemovals.plan
+  var additions: tuple[safe: bool, candidates: seq[PlannedImport]]
   if nativeRemovals.state != nativeRemovalReady:
-    return
+    if info.imports.len > 0 or index.includes.len > 0 or index.hasUnresolvedExports:
+      return
+    additions =
+      nativeImportAdditions(source, info, index, stdlib, project, catalog, owner)
+    if not additions.safe or additions.candidates.len == 0:
+      return
+  else:
+    additions =
+      nativeImportAdditions(source, info, index, stdlib, project, catalog, owner)
+    if not additions.safe:
+      result.handled = false
+      return
   result.handled = true
-  let activeInfo = activeImportInfo(info, nativeRemovals.plan)
+  let activeInfo = activeImportInfo(info, removalPlan)
   let newline = if source.contains("\r\n"): "\r\n" else: "\n"
-  let additions =
-    nativeImportAdditions(source, activeInfo, index, stdlib, project, catalog, owner)
-  if not additions.safe:
-    result.handled = false
-    return
   result.edits = renderImportAdditions(
     source, activeInfo, additions.candidates, stdlib, options, newline
   )
-  var removals = unusedImportEdits(
-    source, info, nativeRemovals.plan, stdlib, options.useStdPrefix, newline
-  )
+  var removals =
+    unusedImportEdits(source, info, removalPlan, stdlib, options.useStdPrefix, newline)
   if additions.candidates.len == 0:
     let grouped = groupedStdRemovalEdits(
-      source, info, nativeRemovals.plan, stdlib, options.useStdPrefix, newline
+      source, info, removalPlan, stdlib, options.useStdPrefix, newline
     )
     if grouped.len > 0:
       removals = combineImportEdits(grouped, removals)

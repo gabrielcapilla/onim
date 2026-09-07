@@ -2,7 +2,7 @@
 
 version = "0.1.0"
 author = "Gabriel Capilla"
-description = "A standalone Nim language server with indexed import organization"
+description = "A standalone Nim language server"
 license = "MIT"
 srcDir = "src"
 bin = @["onim"]
@@ -10,7 +10,7 @@ installFiles = @["stdlib_map.json", "stdlib_map.bin"]
 
 # Dependencies
 
-requires "nim >= 2.0.0"
+requires "nim >= 2.2.0"
 
 # Tasks
 

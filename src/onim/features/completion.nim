@@ -97,7 +97,7 @@ proc memberContext(index: SourceIndex, byteOffset: int): MemberContext =
     dotToken = candidate - 1
     result.replaceStart = token.startOffset
     result.replaceEnd = byteOffset
-  elif token.kind == tkPunctuation and token.text == ".":
+  elif token.kind == tkPunctuation and index.parsed.tokens.tokenTextEquals(token, "."):
     dotToken = candidate
     result.replaceStart = byteOffset
     result.replaceEnd = byteOffset
@@ -106,7 +106,7 @@ proc memberContext(index: SourceIndex, byteOffset: int): MemberContext =
 
   if dotToken < 0 or dotToken >= index.parsed.tokens.len or
       index.parsed.tokens[dotToken].kind != tkPunctuation or
-      index.parsed.tokens[dotToken].text != ".":
+      not index.parsed.tokens.tokenTextEquals(index.parsed.tokens[dotToken], "."):
     if memberToken >= 0:
       return
     result.state = memberContextInvalid
@@ -119,9 +119,10 @@ proc memberContext(index: SourceIndex, byteOffset: int): MemberContext =
       index.parsed.tokens[qualifierToken].kind != tkIdentifier or
       not index.parsed.tokens[qualifierToken].validIdentifier or
       index.parsed.tokens[qualifierToken].isStropped or
-      isNimKeyword(index.parsed.tokens[qualifierToken].text) or
+      index.parsed.tokens[qualifierToken].isNimKeyword or
       index.parsed.tokens[qualifierToken].endOffset != dot.startOffset or (
-    qualifierToken > 0 and index.parsed.tokens[qualifierToken - 1].text == "." and
+    qualifierToken > 0 and
+    index.parsed.tokens.tokenTextEquals(index.parsed.tokens[qualifierToken - 1], ".") and
     index.parsed.tokens[qualifierToken - 1].line == dot.line
   ):
     result.state = memberContextInvalid
@@ -129,7 +130,7 @@ proc memberContext(index: SourceIndex, byteOffset: int): MemberContext =
   if memberToken >= 0:
     let member = index.parsed.tokens[memberToken]
     if member.line != dot.line or member.startOffset != dot.endOffset or
-        not member.validIdentifier or member.isStropped or isNimKeyword(member.text):
+        not member.validIdentifier or member.isStropped or member.isNimKeyword:
       result.state = memberContextInvalid
       return
 
@@ -137,7 +138,7 @@ proc memberContext(index: SourceIndex, byteOffset: int): MemberContext =
   result.qualifierToken = qualifierToken
   result.prefix =
     if memberToken >= 0:
-      index.parsed.tokens[memberToken].text
+      index.parsed.tokens.tokenText(index.parsed.tokens[memberToken])
     else:
       ""
 
@@ -155,14 +156,17 @@ proc completionContext(index: SourceIndex, tokenIndex: int): bool =
     return false
   let token = index.parsed.tokens[tokenIndex]
   if token.kind != tkIdentifier or not token.validIdentifier or token.isStropped or
-      isNimKeyword(token.text) or token.text.len == 0 or
+      token.isNimKeyword or index.parsed.tokens.tokenTextLen(token) == 0 or
       index.parsed.tokenInsideImport(token) or index.declarationToken(
     uint32(tokenIndex)
   ):
     return false
-  if (tokenIndex > 0 and index.parsed.tokens[tokenIndex - 1].text == ".") or (
+  if (
+    tokenIndex > 0 and
+    index.parsed.tokens.tokenTextEquals(index.parsed.tokens[tokenIndex - 1], ".")
+  ) or (
     tokenIndex + 1 < index.parsed.tokens.len and
-    index.parsed.tokens[tokenIndex + 1].text == "."
+    index.parsed.tokens.tokenTextEquals(index.parsed.tokens[tokenIndex + 1], ".")
   ):
     return false
   index.occurrences.rolesForToken(uint32(tokenIndex)) == {occurrenceReference}
@@ -176,14 +180,15 @@ proc importedQualifier(item: ImportInfo): string {.inline.} =
 proc moduleDeclarationShadows(index: SourceIndex, tokenIndex: int): bool =
   if index == nil or tokenIndex < 0 or tokenIndex >= index.parsed.tokens.len:
     return true
-  let wanted = identifierKey(index.parsed.tokens[tokenIndex].text)
+  let wanted = identifierKey(index.parsed.tokens, index.parsed.tokens[tokenIndex])
   if wanted.len == 0:
     return true
   for symbol in index.symbols:
     if symbol.nameToken == uint32(tokenIndex) or
         symbol.nameToken >= uint32(index.parsed.tokens.len):
       continue
-    if identifierKey(index.parsed.tokens[int(symbol.nameToken)].text) == wanted:
+    if identifierKey(index.parsed.tokens, index.parsed.tokens[int(symbol.nameToken)]) ==
+        wanted:
       return true
   false
 
@@ -352,13 +357,13 @@ proc appendVisible(
       return false
     let token = index.parsed.tokens[nameIndex]
     if token.kind != tkIdentifier or not token.validIdentifier or token.isStropped or
-        isNimKeyword(token.text):
+        token.isNimKeyword:
       return false
     let distance = distances.getOrDefault(uint32(declaration.scope), high(uint32))
     if distance == high(uint32) or
         not index.scopes.isScopeAncestor(declaration.scope, active):
       continue
-    let key = identifierKey(token.text)
+    let key = identifierKey(index.parsed.tokens, token)
     if key.len == 0:
       return false
     let scopeOrdinal = declaration.scope.scopeOrdinal
@@ -373,7 +378,7 @@ proc appendVisible(
       continue
 
     let item = CompletionItem(
-      label: token.text,
+      label: index.parsed.tokens.tokenText(token),
       kind:
         if declaration.kind == declarationConst:
           completionConstant
@@ -410,8 +415,61 @@ proc appendObjectFields(
       continue
     let token = index.parsed.tokens[tokenIndex]
     if not appendCompletionCandidate(
-      token.text, completionField, prefixKey, candidates, candidateByName
+      index.parsed.tokens.tokenText(token),
+      completionField,
+      prefixKey,
+      candidates,
+      candidateByName,
     ):
+      return false
+  true
+
+proc appendUfcsCandidate(
+    name, prefixKey: string,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+): bool =
+  let key = identifierKey(name)
+  if key.len == 0 or (prefixKey.len > 0 and not key.startsWith(prefixKey)):
+    return true
+  if candidateByName.hasKey(key) and
+      candidates[candidateByName[key]].item.kind == completionField:
+    return true
+  appendCompletionCandidate(
+    name, completionMethod, prefixKey, candidates, candidateByName
+  )
+
+proc appendUfcsMembers(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    receiver: LocalTypeResolution,
+    prefixKey: string,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+): bool =
+  let matches = collectUfcsTargets(workspace, source, receiver, prefixKey = prefixKey)
+  if matches.state != typeStateResolved:
+    return false
+  for target in matches.targets:
+    var view = workspace.indexViewForFile(target.fileId)
+    if target.fileId.value == source.fileId.value and not view.valid:
+      view = WorkspaceIndexView(
+        valid: source.valid,
+        id: source.id,
+        fileId: source.fileId,
+        contentGeneration: source.contentGeneration,
+        index: source.index,
+      )
+    if not view.valid or view.index == nil or
+        target.nameToken >= uint32(view.index.parsed.tokens.len):
+      return false
+    let symbolIndex = view.index.symbols.symbolToken(target.nameToken)
+    if symbolIndex < 0 or symbolIndex >= view.index.symbols.len:
+      return false
+    let name = view.index.parsed.tokens.tokenText(
+      view.index.parsed.tokens[int(target.nameToken)]
+    )
+    if not appendUfcsCandidate(name, prefixKey, candidates, candidateByName):
       return false
   true
 
@@ -424,18 +482,29 @@ proc completeLocalMembers(
   if workspace == nil or not source.valid or source.index == nil or
       not source.index.bindingsReady or not source.index.nativeIndexSafe():
     return
-  let receiver = resolveObjectReceiver(workspace, source, declarationToken)
-  if not receiver.resolved:
+  let localType = workspace.resolveLocalType(source, declarationToken)
+  if localType.info.state != typeStateResolved or not localType.info.typeId.valid:
     return
-  let visibility = if receiver.exportedOnly: fieldsExported else: fieldsAll
-  let objectType = receiver.provider.types.objects[int(receiver.objectOrdinal)]
   var candidates: seq[VisibleCompletion] = @[]
   var candidateByName = initTable[string, int]()
-  if not appendObjectFields(
-    receiver.provider,
-    objectType,
+  let receiver = resolveObjectReceiver(workspace, source, declarationToken)
+  if receiver.resolved:
+    let visibility = if receiver.exportedOnly: fieldsExported else: fieldsAll
+    let objectType = receiver.provider.types.objects[int(receiver.objectOrdinal)]
+    if not appendObjectFields(
+      receiver.provider,
+      objectType,
+      identifierKey(context.prefix),
+      visibility,
+      candidates,
+      candidateByName,
+    ):
+      return
+  if not appendUfcsMembers(
+    workspace,
+    source,
+    localType,
     identifierKey(context.prefix),
-    visibility,
     candidates,
     candidateByName,
   ):
@@ -477,7 +546,7 @@ proc completeLocals*(source: WorkspaceSnapshot, byteOffset: int): CompletionResu
   if not source.index.appendVisible(
     active,
     uint32(tokenIndex),
-    source.index.parsed.tokens[tokenIndex].text,
+    source.index.parsed.tokens.tokenText(source.index.parsed.tokens[tokenIndex]),
     distances,
     candidates,
     candidateByName,
@@ -507,7 +576,9 @@ proc completeModuleMembers(
   if context.state != memberContextReady or not source.index.bindingsReady or
       not source.index.nativeIndexSafe():
     return
-  let qualifier = source.index.parsed.tokens[context.qualifierToken].text
+  let qualifier = source.index.parsed.tokens.tokenText(
+    source.index.parsed.tokens[context.qualifierToken]
+  )
   if not source.importedUseSupported(context.qualifierToken, qualifier):
     return
   if source.index.moduleDeclarationShadows(context.qualifierToken):

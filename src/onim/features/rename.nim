@@ -85,12 +85,12 @@ proc fromBindings(
       sourceToken: uint32(sourceToken), bindingToken: uint32(bindingToken)
     )
     while cursor < tokens.len and tokens[cursor].endOffset <= item.endOffset and
-        tokens[cursor].text != ",":
+        not tokens.tokenTextEquals(tokens[cursor], ","):
       if tokens[cursor].isKeyword(kwExcept):
         result.valid = false
         return
       inc cursor
-    if cursor < tokens.len and tokens[cursor].text == ",":
+    if cursor < tokens.len and tokens.tokenTextEquals(tokens[cursor], ","):
       inc cursor
 
 proc addMatch(matches: var seq[ReferenceMatch], match: ReferenceMatch) =
@@ -122,7 +122,7 @@ proc addFromImportMatches(
         return false
       for binding in bindings.bindings:
         let token = dependent.index.parsed.tokens[int(binding.sourceToken)]
-        if sameIdentifier(token.text, targetName):
+        if sameIdentifier(dependent.index.parsed.tokens.tokenText(token), targetName):
           matches.addMatch ReferenceMatch(
             fileId: dependent.fileId,
             contentGeneration: dependent.contentGeneration,
@@ -139,7 +139,9 @@ proc moduleNameCollision(
     if symbol.nameToken == target.nameToken or
         symbol.nameToken >= uint32(view.index.parsed.tokens.len):
       continue
-    if identifierKey(view.index.parsed.tokens[int(symbol.nameToken)].text) == newKey:
+    if identifierKey(
+      view.index.parsed.tokens, view.index.parsed.tokens[int(symbol.nameToken)]
+    ) == newKey:
       return true
   false
 
@@ -159,11 +161,11 @@ proc importedBindingCollision(
     let moduleId = workspace.resolveModule(source.fileId, item.module)
     for binding in parsed.bindings:
       let bindingToken = source.index.parsed.tokens[int(binding.bindingToken)]
-      if identifierKey(bindingToken.text) != newKey:
+      if identifierKey(source.index.parsed.tokens, bindingToken) != newKey:
         continue
       let sourceToken = source.index.parsed.tokens[int(binding.sourceToken)]
       if moduleId.value == target.fileId.value and
-          sameIdentifier(sourceToken.text, targetName):
+          sameIdentifier(source.index.parsed.tokens.tokenText(sourceToken), targetName):
         continue
       return true
   false
@@ -200,7 +202,9 @@ proc importedModuleCollision(
         if not symbol.exported or
             symbol.nameToken >= uint32(view.index.parsed.tokens.len):
           continue
-        if identifierKey(view.index.parsed.tokens[int(symbol.nameToken)].text) == newKey:
+        if identifierKey(
+          view.index.parsed.tokens, view.index.parsed.tokens[int(symbol.nameToken)]
+        ) == newKey:
           return true
     else:
       if stdlib == nil:
@@ -215,8 +219,10 @@ proc importedModuleCollision(
 
 proc qualifiedMember(source: WorkspaceSnapshot, tokenIndex: uint32): bool =
   let index = int(tokenIndex)
-  index > 0 and source.index.parsed.tokens[index - 1].text == "." and
-    occurrenceMember in source.index.occurrences.rolesForToken(tokenIndex)
+  index > 0 and
+    source.index.parsed.tokens.tokenTextEquals(
+      source.index.parsed.tokens[index - 1], "."
+    ) and occurrenceMember in source.index.occurrences.rolesForToken(tokenIndex)
 
 proc validateMatches(
     workspace: Workspace,
@@ -240,7 +246,7 @@ proc validateMatches(
     return false
   let targetToken = targetView.index.parsed.tokens[int(target.nameToken)]
   if targetToken.kind != tkIdentifier or not validIdentifier(targetToken) or
-      identifierKey(targetToken.text) != oldKey:
+      identifierKey(targetView.index.parsed.tokens, targetToken) != oldKey:
     return false
   let targetSymbolIndex = targetView.index.symbols.symbolToken(target.nameToken)
   let exported =
@@ -269,7 +275,7 @@ proc validateMatches(
       return false
     let token = current.index.parsed.tokens[int(match.tokenIndex)]
     if token.kind != tkIdentifier or not validIdentifier(token) or
-        identifierKey(token.text) != oldKey:
+        identifierKey(current.index.parsed.tokens, token) != oldKey:
       return false
     if newKey == oldKey or current.qualifiedMember(match.tokenIndex):
       continue
@@ -321,7 +327,9 @@ proc resolveRename*(
   if not targetView.valid or targetView.index == nil or
       references.target.nameToken >= uint32(targetView.index.parsed.tokens.len):
     return
-  let targetName = targetView.index.parsed.tokens[int(references.target.nameToken)].text
+  let targetName = targetView.index.parsed.tokens.tokenText(
+    targetView.index.parsed.tokens[int(references.target.nameToken)]
+  )
   let targetSymbolIndex =
     targetView.index.symbols.symbolToken(references.target.nameToken)
   if targetSymbolIndex >= 0 and targetView.index.symbols[targetSymbolIndex].exported and

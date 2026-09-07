@@ -31,7 +31,9 @@ proc declarationName(
     index: SourceIndex, declaration: LexicalDeclaration
 ): string {.inline.} =
   if declaration.nameToken < uint32(index.parsed.tokens.len):
-    return identifierKey(index.parsed.tokens[int(declaration.nameToken)].text)
+    return identifierKey(
+      index.parsed.tokens, index.parsed.tokens[int(declaration.nameToken)]
+    )
 
 proc declarationIndexAt(index: SourceIndex, token: uint32): int =
   for declarationIndex, declaration in index.scopes.declarations:
@@ -60,10 +62,14 @@ proc bindingsReady*(index: SourceIndex): bool =
       discard
     of uncertaintyUnsupportedSyntax:
       for tokenIndex, token in index.parsed.tokens:
-        if token.kind == tkPunctuation and operatorPunctuation(token.text):
+        if token.kind == tkPunctuation and
+            operatorPunctuation(index.parsed.tokens, token):
           continue
-        if token.text == "{" and tokenIndex + 1 < index.parsed.tokens.len and
-            index.parsed.tokens[tokenIndex + 1].text == ".":
+        if index.parsed.tokens.tokenTextEquals(token, "{") and
+            tokenIndex + 1 < index.parsed.tokens.len and
+            index.parsed.tokens.tokenTextEquals(
+              index.parsed.tokens[tokenIndex + 1], "."
+            ):
           return false
     else:
       return false
@@ -82,7 +88,7 @@ proc resolveBinding*(index: SourceIndex, tokenIndex: uint32): BindingResolution 
       return ambiguous()
     return resolved(tokenIndex)
 
-  let wanted = identifierKey(token.text)
+  let wanted = identifierKey(index.parsed.tokens, token)
   if wanted.len == 0:
     return
   var scope = index.scopes.innermostScopeAt(tokenIndex)
@@ -117,7 +123,7 @@ proc implicitNameKind*(index: SourceIndex, tokenIndex: uint32): ImplicitNameKind
     return implicitNone
   let token = index.parsed.tokens[int(tokenIndex)]
   if token.kind != tkIdentifier or isStropped(token) or
-      identifierKey(token.text) != "result":
+      identifierKey(index.parsed.tokens, token) != "result":
     return implicitNone
   if index.inRoutineScope(tokenIndex): implicitResult else: implicitNone
 

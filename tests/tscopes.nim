@@ -5,11 +5,13 @@ import onim/index/source_index
 
 proc declarationNames(index: SourceIndex): seq[string] =
   for declaration in index.scopes.declarations:
-    result.add index.parsed.tokens[int(declaration.nameToken)].text
+    result.add index.parsed.tokens.tokenText(
+      index.parsed.tokens[int(declaration.nameToken)]
+    )
 
 proc tokenNamed(index: SourceIndex, wanted: string): uint32 =
   for tokenIndex, token in index.parsed.tokens:
-    if token.text == wanted:
+    if index.parsed.tokens.tokenTextEquals(token, wanted):
       return uint32(tokenIndex)
   high(uint32)
 
@@ -65,7 +67,8 @@ proc second(value: int) =
     let declaration = index.scopes.declarations[0].nameToken
     var uses: seq[uint32] = @[]
     for tokenIndex, token in index.parsed.tokens:
-      if token.text == "useName" and uint32(tokenIndex) != declaration:
+      if index.parsed.tokens.tokenTextEquals(token, "useName") and
+          uint32(tokenIndex) != declaration:
         uses.add uint32(tokenIndex)
     check uses.len == 2
     check uses[0] < declaration
@@ -79,6 +82,15 @@ proc second(value: int) =
     let generic = indexSource("proc generic[T](value: T) = discard\n")
     check generic.scopes.scopes.len == 1
     check scopeUnsupportedHeader in generic.scopes.uncertainty
+
+    let genericReturn = indexSource(
+      """type Box[T] = object
+  value: T
+proc makeBox(): Box[int] = discard
+"""
+    )
+    check scopeUnsupportedHeader notin genericReturn.scopes.uncertainty
+    check genericReturn.nativeIndexSafe()
 
     let noParameters = indexSource("proc noParameters = discard\n")
     check noParameters.scopes.scopes.len == 1

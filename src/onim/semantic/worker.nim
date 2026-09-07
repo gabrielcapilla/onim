@@ -1,4 +1,4 @@
-import std/[json, osproc, streams]
+import std/[atomics, json, monotimes, osproc, streams, times]
 import std/os except FileId
 
 import ../features/organize
@@ -36,6 +36,13 @@ var child: Process
 var resultLines: Channel[string]
 var reader: Thread[pointer]
 var started = false
+var semanticPending: Atomic[bool]
+
+const semanticReceiveTimeoutMs = 5_000
+
+proc traceSemanticWorker(event: string) {.inline.} =
+  if getEnv("ONIM_TRACE_WORKERS").len > 0:
+    stderr.writeLine("onim semantic worker: " & event)
 
 proc readLineFromWorker(stream: Stream, line: var string): bool {.gcsafe.} =
   # Stream is owned by the child-process handle until the reader thread joins.
@@ -47,7 +54,7 @@ proc readWorker(arg: pointer) {.thread.} =
   while true:
     var line = ""
     if not readLineFromWorker(stream, line):
-      resultLines.send($(%*{"kind": "workerError"}))
+      discard resultLines.trySend($(%*{"kind": "workerError"}))
       break
     # The embedded compiler can write informational diagnostics to stderr.
     # stderr is merged into this pipe so it cannot fill an unread descriptor;
@@ -67,7 +74,7 @@ proc workerString(node: JsonNode, name: string): string =
       node[name].kind == JString:
     result = node[name].getStr
 
-proc decodeResult(line: string): SemanticResult =
+proc decodeSemanticResult*(line: string): SemanticResult =
   try:
     let node = parseJson(line)
     if node.kind != JObject or not node.hasKey("kind") or node["kind"].kind != JString or
@@ -101,6 +108,26 @@ proc decodeResult(line: string): SemanticResult =
   except CatchableError:
     result.failed = true
 
+proc encodeSemanticResult*(value: SemanticResult): string =
+  var response = newJObject()
+  response["kind"] = %"result"
+  response["fileId"] = %int64(uint32(value.fileId))
+  response["contentGeneration"] = %int64(uint64(value.contentGeneration))
+  response["dependencyGeneration"] = %int64(uint64(value.dependencyGeneration))
+  response["configGeneration"] = %int64(uint64(value.configGeneration))
+  response["surfaceGeneration"] = %int64(uint64(value.surfaceGeneration))
+  response["failed"] = %value.failed
+  response["useStdPrefix"] = %value.useStdPrefix
+  var responseEdits = newJArray()
+  for edit in value.edits:
+    responseEdits.add %*{
+      "startOffset": edit.startOffset,
+      "endOffset": edit.endOffset,
+      "newText": edit.newText,
+    }
+  response["edits"] = responseEdits
+  $response
+
 proc sendWorker(node: JsonNode): bool =
   if not started or child == nil:
     return false
@@ -115,6 +142,8 @@ proc sendWorker(node: JsonNode): bool =
 proc startSemanticWorker*(): bool =
   if started:
     return true
+  child = nil
+  var resultLinesOpened = false
   try:
     child = startProcess(
       getAppFilename(),
@@ -124,32 +153,63 @@ proc startSemanticWorker*(): bool =
     )
     if child == nil:
       return false
-    resultLines.open()
+    resultLines.open(2)
+    resultLinesOpened = true
+    semanticPending.store(false, moRelaxed)
     createThread(reader, readWorker, cast[pointer](child.outputStream))
     started = true
+    traceSemanticWorker("start")
     true
   except CatchableError:
     if child != nil:
       try:
+        child.kill()
+      except CatchableError:
+        discard
+      try:
+        discard child.waitForExit()
+      except CatchableError:
+        discard
+      try:
         child.close
       except CatchableError:
         discard
+      child = nil
+    if resultLinesOpened:
+      resultLines.close()
+      resultLines = default(Channel[string])
+    started = false
     false
 
 proc submitSemantic*(request: SemanticRequest): bool =
   if request.kind != semanticOrganize:
     return sendWorker(%*{"kind": "stop"})
-  sendWorker %*{
-    "kind": "organize",
-    "fileId": uint32(request.fileId),
-    "path": request.path,
-    "source": request.source,
-    "contentGeneration": uint64(request.contentGeneration),
-    "dependencyGeneration": uint64(request.dependencyGeneration),
-    "configGeneration": uint64(request.configGeneration),
-    "surfaceGeneration": uint64(request.surfaceGeneration),
-    "useStdPrefix": request.useStdPrefix,
-  }
+  let sent = sendWorker(
+    %*{
+      "kind": "organize",
+      "fileId": uint32(request.fileId),
+      "path": request.path,
+      "source": request.source,
+      "contentGeneration": uint64(request.contentGeneration),
+      "dependencyGeneration": uint64(request.dependencyGeneration),
+      "configGeneration": uint64(request.configGeneration),
+      "surfaceGeneration": uint64(request.surfaceGeneration),
+      "useStdPrefix": request.useStdPrefix,
+    }
+  )
+  if sent:
+    semanticPending.store(true, moRelaxed)
+  sent
+
+proc interruptSemanticWorker*(): bool =
+  if not started or child == nil:
+    return false
+  try:
+    traceSemanticWorker("interrupt")
+    child.kill()
+    true
+  except CatchableError:
+    false
 
 proc tryReceiveSemantic*(value: var SemanticResult): bool =
   if not started:
@@ -157,26 +217,55 @@ proc tryReceiveSemantic*(value: var SemanticResult): bool =
   let received = resultLines.tryRecv()
   if not received.dataAvailable:
     return false
-  value = decodeResult(received.msg)
+  value = decodeSemanticResult(received.msg)
   true
 
 proc receiveSemantic*(): SemanticResult =
   if not started:
     result.failed = true
     return
-  result = decodeResult(resultLines.recv())
+  if not semanticPending.load(moRelaxed):
+    result = decodeSemanticResult(resultLines.recv())
+    return
+  let startedAt = getMonoTime()
+  while true:
+    let received = resultLines.tryRecv()
+    if received.dataAvailable:
+      semanticPending.store(false, moRelaxed)
+      result = decodeSemanticResult(received.msg)
+      return
+    if (getMonoTime() - startedAt).inNanoseconds >=
+        int64(semanticReceiveTimeoutMs) * 1_000_000:
+      semanticPending.store(false, moRelaxed)
+      result.failed = true
+      return
+    sleep(10)
 
 proc stopSemanticWorker*() =
   if not started:
     return
   discard submitSemantic(SemanticRequest(kind: semanticStop))
+  if child != nil:
+    let exitCode = child.waitForExit(1_000)
+    if exitCode < 0:
+      child.kill()
+      discard child.waitForExit()
   reader.joinThread()
-  try:
-    child.close
-  except CatchableError:
-    discard
+  if child != nil:
+    try:
+      child.close
+    except CatchableError:
+      discard
+  child = nil
+  traceSemanticWorker("reap")
+
+proc finishSemanticWorkerStop*() =
+  if not started:
+    return
   resultLines.close()
+  resultLines = default(Channel[string])
   started = false
+  traceSemanticWorker("stop")
 
 proc runSemanticWorkerProcess*() =
   while true:
@@ -211,26 +300,25 @@ proc runSemanticWorkerProcess*() =
     except CatchableError:
       failed = true
 
-    var response = newJObject()
-    response["kind"] = %"result"
-    response["fileId"] = %workerInteger(request, "fileId")
-    response["contentGeneration"] = %workerInteger(request, "contentGeneration")
-    response["dependencyGeneration"] = %workerInteger(request, "dependencyGeneration")
-    response["configGeneration"] = %workerInteger(request, "configGeneration")
-    response["surfaceGeneration"] = %workerInteger(request, "surfaceGeneration")
-    response["failed"] = %failed
-    response["useStdPrefix"] =
-      if request.hasKey("useStdPrefix") and request["useStdPrefix"].kind == JBool:
-        %request["useStdPrefix"].getBool
-      else:
-        %false
-    var responseEdits = newJArray()
-    for edit in edits:
-      responseEdits.add %*{
-        "startOffset": edit.startOffset,
-        "endOffset": edit.endOffset,
-        "newText": edit.newText,
-      }
-    response["edits"] = responseEdits
-    stdout.writeLine($response)
+    let useStdPrefix =
+      request.hasKey("useStdPrefix") and request["useStdPrefix"].kind == JBool and
+      request["useStdPrefix"].getBool
+    stdout.writeLine(
+      encodeSemanticResult(
+        SemanticResult(
+          failed: failed,
+          fileId: FileId(uint32(workerInteger(request, "fileId"))),
+          contentGeneration:
+            ContentGeneration(uint64(workerInteger(request, "contentGeneration"))),
+          dependencyGeneration:
+            DependencyGeneration(uint64(workerInteger(request, "dependencyGeneration"))),
+          configGeneration:
+            ConfigGeneration(uint64(workerInteger(request, "configGeneration"))),
+          surfaceGeneration:
+            SurfaceGeneration(uint64(workerInteger(request, "surfaceGeneration"))),
+          useStdPrefix: useStdPrefix,
+          edits: edits,
+        )
+      )
+    )
     stdout.flushFile()

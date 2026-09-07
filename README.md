@@ -6,7 +6,7 @@ Onim is active development software. It is not yet a complete replacement for ev
 
 ## Build
 
-Requirements: Nim 2.0 or newer, Nimble, and `nph` for formatting Nim files.
+Requirements: Nim 2.2 or newer, Nimble, and `nph` for formatting Nim files.
 
 ```sh
 nimble build
@@ -57,6 +57,7 @@ Merge these keys into `~/.config/zed/settings.json` and keep the existing `nph` 
 - [Zed setup](docs/zed.md)
 - [Usage and supported behavior](docs/usage.md)
 - [Architecture](docs/architecture.md)
+- [Capabilities and measurements](docs/capabilities.md)
 - [Development](docs/development.md)
 - [Known limitations](docs/known-limitations.md)
 

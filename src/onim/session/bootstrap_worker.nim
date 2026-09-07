@@ -60,6 +60,10 @@ var bootstrapState = bootstrapWorkerStopped
 var bootstrapCancelGeneration: Atomic[uint64]
 var bootstrapStopRequested: Atomic[bool]
 
+proc traceBootstrapWorker(event: string) {.inline.} =
+  if getEnv("ONIM_TRACE_WORKERS").len > 0:
+    stderr.writeLine("onim bootstrap worker: " & event)
+
 proc workerInteger(node: JsonNode, name: string): int64 {.gcsafe.} =
   if node != nil and node.kind == JObject and node.hasKey(name) and
       node[name].kind == JInt:
@@ -244,9 +248,15 @@ proc buildBootstrap(request: BootstrapRequest): BootstrapResult {.gcsafe.} =
     let indexed =
       indexDiskSource(request.root, path, stamp, previous, request.jobGeneration)
     if not indexed.valid:
+      if cancellationRequested(request.jobGeneration):
+        result.kind = bootstrapCancelled
       return
     indexes[ordinal] = indexed.index
     stamps[ordinal] = indexed.stamp
+
+  if cancellationRequested(request.jobGeneration):
+    result.kind = bootstrapCancelled
+    return
 
   var moduleFiles = newSeqOfCap[ModuleFile](paths.len)
   for ordinal, path in paths:
@@ -281,9 +291,6 @@ proc buildBootstrap(request: BootstrapRequest): BootstrapResult {.gcsafe.} =
         stamp: stamps[ordinal],
       )
       file.unresolved = file.addReferences(index.imports, catalog, paths)
-      if index.exports.len > 0:
-        file.unresolved =
-          file.unresolved or file.addReferences(index.exports, catalog, paths)
       if index.includes.len > 0:
         file.unresolved =
           file.unresolved or file.addReferences(index.includes, catalog, paths)
@@ -415,15 +422,26 @@ proc bootstrapLoop() {.thread.} =
 proc startBootstrapWorker*(): bool =
   if bootstrapState == bootstrapWorkerRunning:
     return true
+  var requestsOpened = false
+  var resultsOpened = false
   try:
     bootstrapRequests.open(1)
+    requestsOpened = true
     bootstrapResults.open()
+    resultsOpened = true
     bootstrapCancelGeneration.store(0'u64)
     bootstrapStopRequested.store(false)
     createThread(bootstrapThread, bootstrapLoop)
     bootstrapState = bootstrapWorkerRunning
+    traceBootstrapWorker("start")
     true
   except CatchableError:
+    if requestsOpened:
+      bootstrapRequests.close()
+      bootstrapRequests = default(Channel[BootstrapRequest])
+    if resultsOpened:
+      bootstrapResults.close()
+      bootstrapResults = default(Channel[string])
     bootstrapState = bootstrapWorkerStopped
     false
 
@@ -436,6 +454,7 @@ proc submitBootstrap*(request: BootstrapRequest): bool =
 
 proc cancelBootstrap*(jobGeneration: uint64) =
   if bootstrapState == bootstrapWorkerRunning:
+    traceBootstrapWorker("cancel")
     bootstrapCancelGeneration.store(jobGeneration)
 
 proc tryReceiveBootstrap*(value: var BootstrapResult): bool =
@@ -465,3 +484,4 @@ proc stopBootstrapWorker*() =
   bootstrapRequests = default(Channel[BootstrapRequest])
   bootstrapResults = default(Channel[string])
   bootstrapState = bootstrapWorkerStopped
+  traceBootstrapWorker("reap")

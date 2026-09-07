@@ -74,12 +74,14 @@ proc show(value: ref Person) =
   var character = 'x'
   const text = "hello"
   let count = 42
+  let numbers = @[1, 2, 3]
   discard value
   discard made
   discard flag
   discard character
   discard text
   discard count
+  discard numbers
 """
     check hoverFor(source, "value").signature == "value: ref Person"
     check hoverFor(source, "made").signature == "let made: Person"
@@ -87,6 +89,33 @@ proc show(value: ref Person) =
     check hoverFor(source, "character").signature == "var character: char"
     check hoverFor(source, "text").signature == "const text: string"
     check hoverFor(source, "count").signature == "let count: int"
+    check hoverFor(source, "numbers").signature == "let numbers: seq[int]"
+
+  test "reports explicit primitive sequence annotations":
+    let source = """proc show() =
+  let numbers: seq[int] = @[]
+  discard numbers
+"""
+    check hoverFor(source, "numbers").signature == "let numbers: seq[int]"
+
+  test "reports explicit primitive array annotations":
+    let source = """proc show() =
+  let values: array[4, int] = default(array[4, int])
+  discard values
+"""
+    check hoverFor(source, "values").signature == "let values: array[4, int]"
+
+  test "keeps array-return calls and array literals conservative":
+    let source = """proc make(): array[3, int] = default(array[3, int])
+
+proc show() =
+  let values = make()
+  let literal = [1, 2]
+  discard values
+  discard literal
+"""
+    check hoverFor(source, "values").signature.len == 0
+    check hoverFor(source, "literal").signature.len == 0
 
   test "propagates direct procedure and function return types":
     let source = """type Person = object
@@ -152,13 +181,18 @@ proc show() =
   let prefixed = r"raw"
   let missing = nil
   let compound = 1 + 2
+  let mixed = @[1, "x"]
+  let empty = @[]
   discard unary
   discard floating
   discard prefixed
   discard missing
   discard compound
+  discard mixed
+  discard empty
 """
-    for name in ["unary", "floating", "prefixed", "missing", "compound"]:
+    check hoverFor(source, "floating").signature == "let floating: float"
+    for name in ["unary", "prefixed", "missing", "compound", "mixed", "empty"]:
       let info = hoverFor(source, name)
       check info.state == hoverAvailable
       check info.name == name

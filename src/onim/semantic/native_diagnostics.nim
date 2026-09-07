@@ -132,9 +132,13 @@ proc addMissingDiagnostic(
   )
 
 proc addUndeclaredDiagnostic(
-    diagnostics: var seq[NativeDiagnostic], seen: var HashSet[string], token: Token
+    diagnostics: var seq[NativeDiagnostic],
+    seen: var HashSet[string],
+    tokens: TokenStore,
+    token: Token,
 ): bool =
-  let key = identifierKey(token.text)
+  let name = tokens.tokenText(token)
+  let key = identifierKey(tokens, token)
   if key.len == 0 or key in seen:
     return false
   seen.incl key
@@ -142,7 +146,7 @@ proc addUndeclaredDiagnostic(
     kind: nativeUndeclaredIdentifier,
     startOffset: token.startOffset,
     endOffset: token.endOffset,
-    name: token.text,
+    name: name,
   )
   true
 
@@ -164,15 +168,15 @@ proc nativeMissingDiagnostics(
         occurrence.roles.contains(occurrenceQualifier):
       continue
     let token = index.parsed.tokens[tokenIndex]
+    let tokenName = index.parsed.tokens.tokenText(token)
     let binding = index.resolveBinding(occurrence.token)
     if binding.state != bindingUnknown or
         index.implicitNameKind(occurrence.token) != implicitNone:
       continue
-    if providesUnqualified(index.parsed, stdlib, project, catalog, owner, token.text):
+    if providesUnqualified(index.parsed, stdlib, project, catalog, owner, tokenName):
       continue
-    let resolved = stdlib.resolveUniqueCandidate(token.text, "", -1)
-    let projectResolved =
-      project.resolveSurfaceReference(catalog, token.text, "", owner)
+    let resolved = stdlib.resolveUniqueCandidate(tokenName, "", -1)
+    let projectResolved = project.resolveSurfaceReference(catalog, tokenName, "", owner)
     if project != nil and projectResolved.candidates.len > 0 and
         projectResolved.kind in {surfaceUnknown, surfaceAmbiguous}:
       continue
@@ -187,36 +191,41 @@ proc nativeMissingDiagnostics(
       if projectModule.len > 0 and not sameModule(projectModule, module):
         continue
       addMissingDiagnostic(
-        result, seen, token, token.text, module, nativeMissingStdlibImport
+        result, seen, token, tokenName, module, nativeMissingStdlibImport
       )
     of candidateResolutionMissing:
       let module = project.moduleForResolution(projectResolved)
       if module.len > 0:
         addMissingDiagnostic(
-          result, seen, token, token.text, module, nativeMissingProjectImport
+          result, seen, token, tokenName, module, nativeMissingProjectImport
         )
     of candidateResolutionAmbiguous:
       discard
     if mode == nativeImportsAndNames and resolved.state == candidateResolutionMissing and
         projectResolved.kind == surfaceUnknown:
-      discard addUndeclaredDiagnostic(result, seen, token)
+      discard addUndeclaredDiagnostic(result, seen, index.parsed.tokens, token)
 
   for qualified in index.occurrences.qualified:
     let qualifierIndex = int(qualified.qualifierToken)
     let memberIndex = int(qualified.memberToken)
     if qualifierIndex < 0 or memberIndex < 0 or memberIndex >= index.parsed.tokens.len or
         qualifierIndex >= index.parsed.tokens.len or
-        qualifierIndex > 0 and index.parsed.tokens[qualifierIndex - 1].text == ".":
+        qualifierIndex > 0 and
+        index.parsed.tokens.tokenTextEquals(
+          index.parsed.tokens[qualifierIndex - 1], "."
+        ):
       continue
     let qualifier = index.parsed.tokens[qualifierIndex]
     let member = index.parsed.tokens[memberIndex]
+    let qualifierName = index.parsed.tokens.tokenText(qualifier)
+    let memberName = index.parsed.tokens.tokenText(member)
     let binding = index.resolveBinding(qualified.qualifierToken)
-    if binding.state != bindingUnknown or localName(index.parsed, qualifier.text) or
-        index.parsed.providesQualifier(qualifier.text):
+    if binding.state != bindingUnknown or localName(index.parsed, qualifierName) or
+        index.parsed.providesQualifier(qualifierName):
       continue
-    let resolved = stdlib.resolveUniqueCandidate(member.text, qualifier.text, -1)
+    let resolved = stdlib.resolveUniqueCandidate(memberName, qualifierName, -1)
     let projectResolved =
-      project.resolveSurfaceReference(catalog, member.text, qualifier.text, owner)
+      project.resolveSurfaceReference(catalog, memberName, qualifierName, owner)
     if project != nil and projectResolved.kind in {surfaceUnknown, surfaceAmbiguous}:
       continue
     case resolved.state
@@ -230,13 +239,13 @@ proc nativeMissingDiagnostics(
       if projectModule.len > 0 and not sameModule(projectModule, module):
         continue
       addMissingDiagnostic(
-        result, seen, qualifier, member.text, module, nativeMissingStdlibImport
+        result, seen, qualifier, memberName, module, nativeMissingStdlibImport
       )
     of candidateResolutionMissing:
       let module = project.moduleForResolution(projectResolved)
       if module.len > 0:
         addMissingDiagnostic(
-          result, seen, qualifier, member.text, module, nativeMissingProjectImport
+          result, seen, qualifier, memberName, module, nativeMissingProjectImport
         )
     of candidateResolutionAmbiguous:
       discard

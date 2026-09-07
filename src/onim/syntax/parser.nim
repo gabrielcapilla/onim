@@ -17,6 +17,7 @@ type
   ParserUncertainty* = enum
     parserMalformed
     parserUnbalanced
+    parserIncomplete
     parserUnsupportedStructure
     parserNestedDeclaration
 
@@ -25,6 +26,7 @@ type
     parent*: SyntaxNodeId
     firstToken*: uint32
     pastToken*: uint32
+    uncertainty*: set[ParserUncertainty]
 
   PartialSyntaxTree* = object
     tokens*: TokenStore
@@ -44,27 +46,35 @@ proc nodeIndex(id: SyntaxNodeId): int {.inline.} =
   int(uint32(id)) - 1
 
 proc addNode(
-    tree: var PartialSyntaxTree, kind: SyntaxNodeKind, firstToken, pastToken: int
+    tree: var PartialSyntaxTree,
+    kind: SyntaxNodeKind,
+    firstToken, pastToken: int,
+    uncertainty: set[ParserUncertainty],
 ): SyntaxNodeId =
   tree.nodes.add SyntaxNode(
     kind: kind,
     parent: InvalidSyntaxNodeId,
     firstToken: uint32(firstToken),
     pastToken: uint32(pastToken),
+    uncertainty: uncertainty,
   )
   SyntaxNodeId(uint32(tree.nodes.len))
 
-proc statementStart[T](tokens: T, index: int): bool {.inline.} =
+proc statementStart(tokens: TokenStore, index: int): bool {.inline.} =
   if index <= 0:
     return true
   let previous = tokens[index - 1]
   let current = tokens[index]
   if previous.line == current.line:
-    return previous.text == ";"
-  previous.text != "," and previous.text != "/" and previous.text != "." and
-    previous.text != "\\"
+    return tokens.tokenTextEquals(previous, ";")
+  if current.isModuleStatementStart:
+    return current.column <= previous.column
+  not tokens.tokenTextEquals(previous, ",") and not tokens.tokenTextEquals(
+    previous, "/"
+  ) and not tokens.tokenTextEquals(previous, ".") and
+    not tokens.tokenTextEquals(previous, "\\")
 
-proc blockEnd[T](tokens: T, start: int): int =
+proc blockEnd*[T](tokens: T, start: int): int =
   let baseColumn = tokens[start].column
   var index = start + 1
   while index < tokens.len:
@@ -76,9 +86,9 @@ proc blockEnd[T](tokens: T, start: int): int =
 proc declarationStart(token: Token): bool {.inline.} =
   token.hasKeywordRole(roleDeclaration) and not token.hasKeywordRole(roleForBinding)
 
-proc hasToken[T](tokens: T, first, past: int, wanted: string): bool {.inline.} =
+proc hasToken(tokens: TokenStore, first, past: int, wanted: string): bool {.inline.} =
   for index in first ..< past:
-    if tokens[index].text == wanted:
+    if tokens.tokenTextEquals(tokens[index], wanted):
       return true
   false
 
@@ -90,9 +100,9 @@ proc validNodeRange(tree: PartialSyntaxTree, node: SyntaxNode): bool {.inline.} 
 proc isContainer(kind: SyntaxNodeKind): bool {.inline.} =
   kind in {syntaxWhen, syntaxBlock, syntaxDeclaration}
 
-proc unnamedBlockHeader[T](tokens: T, index: int): bool {.inline.} =
+proc unnamedBlockHeader(tokens: TokenStore, index: int): bool {.inline.} =
   index + 1 < tokens.len and tokens[index + 1].line == tokens[index].line and
-    tokens[index + 1].text == ":"
+    tokens.tokenTextEquals(tokens[index + 1], ":")
 
 proc assignParents(tree: var PartialSyntaxTree) =
   if tree.nodes.len < 2:
@@ -117,9 +127,21 @@ proc applyLexicalUncertainty(tree: var PartialSyntaxTree) =
     of lexicalUnexpectedDelimiter, lexicalUnclosedDelimiter:
       tree.uncertainty.incl parserUnbalanced
 
-proc parsePartialSyntax*(tokens: TokenStore): PartialSyntaxTree =
+proc mapStatementUncertainty(
+    uncertainty: set[StatementUncertainty]
+): set[ParserUncertainty] =
+  for reason in uncertainty:
+    case reason
+    of statementIncomplete:
+      result.incl parserIncomplete
+    of statementUnbalanced:
+      result.incl parserUnbalanced
+    of statementUnsupported:
+      result.incl parserUnsupportedStructure
+
+proc parsePartialSyntax*(tokens: TokenStore, source = ""): PartialSyntaxTree =
   result.tokens = tokens
-  result.root = result.addNode(syntaxModule, 0, result.tokens.len)
+  result.root = result.addNode(syntaxModule, 0, result.tokens.len, {})
   result.applyLexicalUncertainty()
 
   var index = 0
@@ -137,49 +159,65 @@ proc parsePartialSyntax*(tokens: TokenStore): PartialSyntaxTree =
 
     var kind = syntaxModule
     var past = index + 1
+    var nodeUncertainty: set[ParserUncertainty] = {}
     if token.isKeyword(kwImport):
       kind = syntaxImport
-      past = statementEnd(result.tokens, index)
-      if past <= index + 1 or (
+      let statement = statementRange(result.tokens, index)
+      past = statement.past
+      nodeUncertainty = mapStatementUncertainty(statement.uncertainty)
+      if statementHasMissingOperand(result.tokens, index, past):
+        nodeUncertainty.incl parserIncomplete
+      elif past <= index + 1 or (
         index + 1 < past and result.tokens[index + 1].kind != tkIdentifier and
-        result.tokens[index + 1].text != "\""
+        not result.tokens.tokenTextEquals(result.tokens[index + 1], "\"")
       ):
-        result.uncertainty.incl parserUnsupportedStructure
+        nodeUncertainty.incl parserUnsupportedStructure
     elif token.isKeyword(kwFrom):
       kind = syntaxFromImport
-      past = statementEnd(result.tokens, index)
-      if not hasToken(result.tokens, index + 1, past, "import"):
-        result.uncertainty.incl parserUnsupportedStructure
+      let statement = statementRange(result.tokens, index)
+      past = statement.past
+      nodeUncertainty = mapStatementUncertainty(statement.uncertainty)
+      if not result.tokens.fromStatementComplete(index, past):
+        nodeUncertainty.incl parserIncomplete
     elif token.isKeyword(kwWhen):
       kind = syntaxWhen
-      past = blockEnd(result.tokens, index)
+      let statement = blockEnd(result.tokens, index)
+      past = statement
       if not hasToken(result.tokens, index + 1, min(past, result.tokens.len), ":"):
-        result.uncertainty.incl parserUnsupportedStructure
+        nodeUncertainty.incl parserUnsupportedStructure
     elif token.isKeyword(kwBlock):
       if unnamedBlockHeader(result.tokens, index):
         kind = syntaxBlock
         past = blockEnd(result.tokens, index)
       else:
-        result.uncertainty.incl parserUnsupportedStructure
+        kind = syntaxBlock
+        past = blockEnd(result.tokens, index)
+        nodeUncertainty.incl parserUnsupportedStructure
     elif token.isKeyword(kwInclude):
       kind = syntaxInclude
-      past = statementEnd(result.tokens, index)
+      let parsed = parseIncludeReferences(result.tokens, source, index)
+      past = parsed.next
+      nodeUncertainty = mapStatementUncertainty(parsed.uncertainty)
     elif token.isKeyword(kwExport):
       kind = syntaxExport
-      past = statementEnd(result.tokens, index)
+      let parsed = parseExportNames(result.tokens, index)
+      past = parsed.next
+      nodeUncertainty = mapStatementUncertainty(parsed.uncertainty)
     elif token.declarationStart:
       kind = syntaxDeclaration
       past = blockEnd(result.tokens, index)
       if token.column > 0:
-        result.uncertainty.incl parserNestedDeclaration
+        nodeUncertainty.incl parserNestedDeclaration
       if token.hasKeywordRole(roleRoutine) and
           not hasToken(result.tokens, index + 1, min(past, result.tokens.len), "="):
-        result.uncertainty.incl parserUnsupportedStructure
+        nodeUncertainty.incl parserUnsupportedStructure
 
     if past <= index or past > result.tokens.len:
-      result.uncertainty.incl parserUnsupportedStructure
+      nodeUncertainty.incl parserUnsupportedStructure
       past = min(result.tokens.len, index + 1)
-    let node = result.addNode(kind, index, past)
+    for reason in nodeUncertainty:
+      result.uncertainty.incl reason
+    let node = result.addNode(kind, index, past, nodeUncertainty)
     case kind
     of syntaxImport, syntaxFromImport:
       result.importNodes.add node
@@ -195,7 +233,7 @@ proc parsePartialSyntax*(tokens: TokenStore): PartialSyntaxTree =
   result.assignParents()
 
 proc parsePartialSyntax*(source: string): PartialSyntaxTree =
-  parsePartialSyntax(initTokenStore(lex(source)))
+  parsePartialSyntax(lex(source), source)
 
 proc isComplete*(tree: PartialSyntaxTree): bool {.inline.} =
   tree.uncertainty == {}
@@ -242,6 +280,20 @@ proc sameImportNode(
   formMatches and tree.tokens[first].startOffset == item.startOffset and
     tree.tokens[past - 1].endOffset == item.endOffset
 
+proc overlapsUncertainImportNode(tree: PartialSyntaxTree, item: ImportInfo): bool =
+  for nodeId in tree.importNodes:
+    let node = tree.nodes[nodeIndex(nodeId)]
+    if node.uncertainty == {}:
+      continue
+    let first = int(node.firstToken)
+    let past = int(node.pastToken)
+    if first < 0 or past <= first or past > tree.tokens.len:
+      continue
+    let nodeStart = tree.tokens[first].startOffset
+    let nodeEnd = tree.tokens[past - 1].endOffset
+    if item.startOffset < nodeEnd and nodeStart < item.endOffset:
+      return true
+
 proc hasSameImportShape(imports: SourceImports, itemIndex: int): bool {.inline.} =
   let item = imports.imports[itemIndex]
   if item.synthetic:
@@ -259,6 +311,8 @@ proc importsMatch*(tree: PartialSyntaxTree, current: SourceImports): bool =
     return false
   var distinctImports = 0
   for index, item in current.imports:
+    if tree.overlapsUncertainImportNode(item):
+      return false
     if not hasSameImportShape(current, index):
       inc distinctImports
       var found = false
@@ -268,10 +322,16 @@ proc importsMatch*(tree: PartialSyntaxTree, current: SourceImports): bool =
           break
       if not found:
         return false
-  if distinctImports != tree.importNodes.len:
+  var certainImportNodes = 0
+  for nodeId in tree.importNodes:
+    if tree.nodes[nodeIndex(nodeId)].uncertainty == {}:
+      inc certainImportNodes
+  if distinctImports != certainImportNodes:
     return false
   for nodeId in tree.importNodes:
     let node = tree.nodes[nodeIndex(nodeId)]
+    if node.uncertainty != {}:
+      continue
     var found = false
     for item in current.imports:
       if tree.sameImportNode(node, item):

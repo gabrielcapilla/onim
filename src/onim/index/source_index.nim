@@ -28,6 +28,7 @@ type
     occurrences*: OccurrenceIndex
     imports*: seq[string]
     exports*: seq[string]
+    hasUnresolvedExports*: bool
     includes*: seq[string]
     nativeSafety: NativeIndexSafety
 
@@ -46,21 +47,6 @@ proc contentFingerprint*(source: string): uint64 =
   for character in source:
     fingerprint = (fingerprint xor uint64(ord(character))) * 1099511628211'u64
   fingerprint
-
-proc canonicalReference(module: string): string =
-  result = module.strip(chars = {'"', '\'', '`'})
-  result = result.replace('\\', '/')
-  var prefix = ""
-  if result.len > 3 and result.startsWith("../"):
-    prefix = "../"
-    result = result[3 .. ^1]
-  elif result.len > 2 and result.startsWith("./"):
-    prefix = "./"
-    result = result[2 .. ^1]
-  result = result.replace('.', '/')
-  while result.contains("//"):
-    result = result.replace("//", "/")
-  result = prefix & result
 
 proc addUnique(values: var seq[string], value: string) =
   if value.len == 0:
@@ -126,7 +112,7 @@ proc moduleAliasesSafe(info: SourceImports): bool =
 proc deriveNativeIndexSafety(
     info: SourceImports, index: SourceIndex
 ): NativeIndexSafety =
-  if index == nil or index.includes.len > 0 or index.exports.len > 0 or
+  if index == nil or index.includes.len > 0 or index.hasUnresolvedExports or
       not info.moduleAliasesSafe:
     return nativeSafetyRejected
   for reason in index.scopes.uncertainty:
@@ -143,16 +129,19 @@ proc deriveNativeIndexSafety(
       for tokenIndex, token in index.parsed.tokens:
         if info.tokenInsideImport(token):
           continue
-        if token.kind == tkPunctuation and operatorPunctuation(token.text) and
-            token.text != "=":
-          if token.text == "*" and (
+        if sequenceLiteralStart(info.tokens, tokenIndex):
+          continue
+        if token.kind == tkPunctuation and operatorPunctuation(info.tokens, token) and
+            not info.tokens.tokenTextEquals(token, "="):
+          if info.tokens.tokenTextEquals(token, "*") and (
             index.types.objectFieldExportMarker(uint32(tokenIndex)) or
             index.parsed.tokens.isExportMarker(tokenIndex)
           ):
             continue
           return nativeSafetyRejected
-        if token.text == "{" and tokenIndex + 1 < index.parsed.tokens.len and
-            index.parsed.tokens[tokenIndex + 1].text == ".":
+        if info.tokens.tokenTextEquals(token, "{") and
+            tokenIndex + 1 < index.parsed.tokens.len and
+            info.tokens.tokenTextEquals(index.parsed.tokens[tokenIndex + 1], "."):
           return nativeSafetyRejected
     else:
       return nativeSafetyRejected
@@ -190,15 +179,8 @@ proc classifyIncrementalEdit(
       oldIndex.includeReference(tokenIndex):
     result.kind = incrementalUnsupported
     return
-  let newText = newSource[token.startOffset ..< token.endOffset]
-  let replacement = Token(
-    kind: tkIdentifier,
-    text: newText,
-    startOffset: token.startOffset,
-    endOffset: token.endOffset,
-    line: token.line,
-    column: token.column,
-  )
+  var replacement = token
+  replacement.keyword = keywordIdAt(newSource, token.startOffset, token.endOffset)
   if not validIdentifier(replacement) or isNimKeyword(replacement) or
       isStropped(replacement):
     result.kind = incrementalUnsupported
@@ -225,13 +207,13 @@ proc removeUsageRoles(summary: var UsageSummary, roles: set[OccurrenceRole]) =
   if occurrenceExport in roles and summary.exportCount > 0:
     dec summary.exportCount
 
-proc replacementRepresentative[T](
-    index: SourceIndex, tokens: T, tokenIndex: int, wanted: string
+proc replacementRepresentative(
+    index: SourceIndex, tokens: TokenStore, tokenIndex: int, wanted: string
 ): uint32 =
   for occurrence in index.occurrences.identifiers:
     let candidate = int(occurrence.token)
     if candidate != tokenIndex and candidate < tokens.len and
-        identifierKey(tokens[candidate].text) == wanted:
+        identifierKey(tokens, tokens[candidate]) == wanted:
       return occurrence.token
   high(uint32)
 
@@ -256,8 +238,9 @@ proc patchUsage(
   for index, summary in updated.occurrences.usage:
     if summary.representativeToken >= uint32(oldIndex.parsed.tokens.len):
       return false
-    let key =
-      identifierKey(oldIndex.parsed.tokens[int(summary.representativeToken)].text)
+    let key = identifierKey(
+      oldIndex.parsed.tokens, oldIndex.parsed.tokens[int(summary.representativeToken)]
+    )
     if key == oldKey:
       oldUsage = index
     elif key == newKey:
@@ -293,16 +276,19 @@ proc cloneIncrementalIndex(oldIndex: SourceIndex, source: string): SourceIndex =
   result.contentHash = contentFingerprint(source)
   result.byteLength = source.len
   result.tokenCount = oldIndex.tokenCount
-  # The parsed sets, import records, and token store are immutable for this
-  # fast path. The changed token receives a copy-on-write block below.
+  # The parsed sets and import records are immutable for this fast path. The
+  # successor owns the new source while sharing the token metadata.
   result.parsed = oldIndex.parsed
+  result.parsed.tokens = oldIndex.parsed.tokens.rebindSource(source)
   result.syntax = oldIndex.syntax
+  result.syntax.tokens = result.parsed.tokens
   result.symbols = oldIndex.symbols
   result.scopes = oldIndex.scopes
   result.types = oldIndex.types
   result.occurrences = oldIndex.occurrences
   result.imports = oldIndex.imports
   result.exports = oldIndex.exports
+  result.hasUnresolvedExports = oldIndex.hasUnresolvedExports
   result.includes = oldIndex.includes
   result.nativeSafety = oldIndex.nativeSafety
 
@@ -314,14 +300,9 @@ proc tryIndexSourceIncremental*(
     return
   result = cloneIncrementalIndex(oldIndex, source)
   let oldToken = oldIndex.parsed.tokens[edit.tokenIndex]
-  let newText = source[oldToken.startOffset ..< oldToken.endOffset]
-  var updatedToken = oldToken
-  updatedToken.text = newText
-  updatedToken.keyword = keywordId(newText)
-  result.parsed.tokens = result.parsed.tokens.withToken(edit.tokenIndex, updatedToken)
-  result.syntax.tokens = result.parsed.tokens
-  let oldKey = identifierKey(oldToken.text)
-  let newKey = identifierKey(newText)
+  let oldKey = identifierKey(oldIndex.parsed.tokens, oldToken)
+  let newKey =
+    identifierKey(result.parsed.tokens, result.parsed.tokens[edit.tokenIndex])
   if not result.patchUsage(oldIndex, edit.tokenIndex, oldKey, newKey):
     return nil
   # The edit proof is deliberately narrow: one equal-length, non-keyword
@@ -331,38 +312,106 @@ proc tryIndexSourceIncremental*(
   # source scan. The complete index path remains the fallback for every edit
   # outside this proof.
 
-proc collectExportReferences[T](tokens: T, start: int): seq[string] =
+proc collectExportReferences(tokens: TokenStore, start, finish: int): seq[string] =
   var cursor = start + 1
-  while cursor < tokens.len:
+  while cursor < finish:
     if tokens[cursor].isKeyword(kwExcept):
       break
-    if tokens[cursor].text == ",":
+    if tokens.tokenTextEquals(tokens[cursor], ","):
       inc cursor
       continue
     if tokens[cursor].kind != tkIdentifier:
       break
 
-    var reference = tokens[cursor].text
+    var reference = tokens.tokenText(tokens[cursor])
     inc cursor
-    while cursor + 1 < tokens.len and
-        (tokens[cursor].text == "/" or tokens[cursor].text == ".") and
-        tokens[cursor + 1].kind == tkIdentifier
+    while cursor + 1 < finish and (
+      tokens.tokenTextEquals(tokens[cursor], "/") or
+      tokens.tokenTextEquals(tokens[cursor], ".")
+    ) and tokens[cursor + 1].kind == tkIdentifier
     :
-      reference.add tokens[cursor].text
-      reference.add tokens[cursor + 1].text
+      reference.add tokens.tokenText(tokens[cursor])
+      reference.add tokens.tokenText(tokens[cursor + 1])
       inc cursor, 2
     addUnique(result, canonicalReference(reference))
-    if cursor >= tokens.len or tokens[cursor].text != ",":
+    if cursor >= finish or not tokens.tokenTextEquals(tokens[cursor], ","):
       break
+
+proc importedExportConflict(info: SourceImports, name: string): bool =
+  let wanted = identifierKey(name)
+  if wanted.len == 0:
+    return true
+  for item in info.imports:
+    if item.form == fromModule:
+      for imported in item.imported:
+        if identifierKey(imported) == wanted:
+          return true
+    else:
+      let qualifier =
+        if item.alias.len > 0:
+          item.alias
+        else:
+          moduleLeaf(item.module)
+      if identifierKey(qualifier) == wanted:
+        return true
+  false
+
+proc moduleLevelSymbol(index: SourceIndex, symbol: SourceSymbol): bool =
+  let nameToken = int(symbol.nameToken)
+  if nameToken < 0 or nameToken >= index.parsed.tokens.len:
+    return false
+  for nodeId in index.syntax.declarationNodes:
+    let node = index.syntax.nodes[int(uint32(nodeId)) - 1]
+    let first = int(node.firstToken)
+    if first < 0 or first >= index.parsed.tokens.len or
+        index.parsed.tokens[first].column != 0 or
+        index.parsed.tokens[nameToken].line != index.parsed.tokens[first].line:
+      continue
+    if nameToken >= first and nameToken < int(node.pastToken):
+      return true
+  false
+
+proc resolveLocalExports(index: SourceIndex) =
+  for node in index.syntax.nodes:
+    if node.kind != syntaxExport:
+      continue
+    let start = int(node.firstToken)
+    if node.uncertainty != {} or start < 0 or start >= index.parsed.tokens.len or
+        index.parsed.tokens[start].column != 0:
+      index.hasUnresolvedExports = true
+      continue
+    let parsed = parseExportNames(index.parsed.tokens, start)
+    if parsed.uncertainty != {} or parsed.next != int(node.pastToken):
+      index.hasUnresolvedExports = true
+      continue
+    for name in parsed.names:
+      if index.parsed.importedExportConflict(name):
+        index.hasUnresolvedExports = true
+        continue
+      var match = -1
+      var matches = 0
+      let wanted = identifierKey(name)
+      for symbolIndex, symbol in index.symbols:
+        if not index.moduleLevelSymbol(symbol):
+          continue
+        let tokenIndex = int(symbol.nameToken)
+        if index.parsed.tokens.identifierKey(index.parsed.tokens[tokenIndex]) == wanted:
+          inc matches
+          match = symbolIndex
+      if matches == 1:
+        index.symbols[match].exported = true
+      else:
+        index.hasUnresolvedExports = true
 
 proc indexSource*(source: string): SourceIndex {.gcsafe.} =
   new(result)
   result.contentHash = contentFingerprint(source)
   result.byteLength = source.len
   result.parsed = parseSourceImports(source)
-  result.syntax = parsePartialSyntax(result.parsed.tokens)
+  result.syntax = parsePartialSyntax(result.parsed.tokens, source)
   result.tokenCount = result.parsed.tokens.len
   result.symbols = indexSymbols(source, result.parsed.tokens)
+  result.resolveLocalExports()
   result.scopes =
     indexScopes(result.parsed.tokens, result.symbols, result.byteLength, result.syntax)
   result.types = indexTypes(result.parsed.tokens, result.symbols, result.scopes)
@@ -371,20 +420,25 @@ proc indexSource*(source: string): SourceIndex {.gcsafe.} =
   for item in result.parsed.imports:
     addUnique(result.imports, canonicalReference(item.module))
 
-  for tokenIndex, token in result.parsed.tokens:
-    if token.isKeyword(kwExport):
-      for reference in collectExportReferences(result.parsed.tokens, tokenIndex):
+  for node in result.syntax.nodes:
+    if node.kind == syntaxExport and node.uncertainty == {}:
+      for reference in collectExportReferences(
+        result.parsed.tokens, int(node.firstToken), int(node.pastToken)
+      ):
         addUnique(result.exports, reference)
 
-  for tokenIndex, token in result.parsed.tokens:
-    if not token.isKeyword(kwInclude) or tokenIndex + 1 >= result.parsed.tokens.len:
+  for node in result.syntax.nodes:
+    if node.kind != syntaxInclude or node.uncertainty != {}:
       continue
-    var includeName = canonicalReference(result.parsed.tokens[tokenIndex + 1].text)
-    if includeName.len == 0:
+    let parsed =
+      parseIncludeReferences(result.parsed.tokens, source, int(node.firstToken))
+    if parsed.uncertainty != {} or parsed.next != int(node.pastToken):
       continue
-    if not includeName.endsWith(".nim"):
-      includeName.add ".nim"
-    addUnique(result.includes, includeName)
+    for reference in parsed.references:
+      var includeName = reference.module
+      if not includeName.endsWith(".nim"):
+        includeName.add ".nim"
+      addUnique(result.includes, includeName)
 
   result.imports.sort
   result.includes.sort

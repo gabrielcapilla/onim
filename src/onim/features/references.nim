@@ -24,11 +24,6 @@ type
     target*: DefinitionTarget
     matches*: seq[ReferenceMatch]
 
-proc sameTarget(left, right: DefinitionTarget): bool {.inline.} =
-  left.fileId.value == right.fileId.value and
-    left.contentGeneration.value == right.contentGeneration.value and
-    left.nameToken == right.nameToken and left.kind == right.kind
-
 proc compareReferenceMatches*(left, right: ReferenceMatch): int =
   result = cmp(left.fileId.value, right.fileId.value)
   if result == 0:
@@ -65,13 +60,16 @@ proc resolveSameFileReferences*(
   if includeDeclaration:
     result.tokens.add selected.target.nameToken
 
-  let wanted =
-    identifierKey(source.index.parsed.tokens[int(selected.target.nameToken)].text)
+  let wanted = identifierKey(
+    source.index.parsed.tokens,
+    source.index.parsed.tokens[int(selected.target.nameToken)],
+  )
   for occurrence in source.index.occurrences.identifiers:
     let occurrenceIndex = int(occurrence.token)
     if occurrenceIndex == int(selected.target.nameToken) or
-        identifierKey(source.index.parsed.tokens[occurrenceIndex].text) != wanted or
-        occurrenceMember in occurrence.roles:
+        identifierKey(
+          source.index.parsed.tokens, source.index.parsed.tokens[occurrenceIndex]
+        ) != wanted or occurrenceMember in occurrence.roles:
       continue
     let binding = source.index.resolveBinding(occurrence.token)
     if binding.state == bindingResolved and
@@ -129,7 +127,9 @@ proc resolveReferences*(
   let targetSymbolIndex = targetView.index.symbols.symbolToken(result.target.nameToken)
   if targetSymbolIndex < 0 or not targetView.index.symbols[targetSymbolIndex].exported:
     return
-  let targetName = targetView.index.parsed.tokens[int(result.target.nameToken)].text
+  let targetName = targetView.index.parsed.tokens.tokenText(
+    targetView.index.parsed.tokens[int(result.target.nameToken)]
+  )
 
   var candidateFiles: seq[FileId] = @[result.target.fileId]
   for dependent in workspace.dependents(result.target.fileId):
@@ -172,13 +172,16 @@ proc resolveReferences*(
         continue
       let occurrenceIndex = int(occurrence.token)
       if occurrenceIndex < 0 or occurrenceIndex >= candidate.index.parsed.tokens.len or
-          identifierKey(candidate.index.parsed.tokens[occurrenceIndex].text) != targetKey:
+          identifierKey(
+            candidate.index.parsed.tokens,
+            candidate.index.parsed.tokens[occurrenceIndex],
+          ) != targetKey:
         continue
       let resolution = resolveDefinitionAtToken(workspace, candidate, occurrenceIndex)
       if resolution.kind != definitionResolved:
         result.resetResult()
         return
-      if resolution.target.sameTarget(result.target):
+      if resolution.target.sameDefinitionTarget(result.target):
         result.matches.add ReferenceMatch(
           fileId: candidate.fileId,
           contentGeneration: candidate.contentGeneration,

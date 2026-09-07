@@ -1,4 +1,4 @@
-import std/[algorithm, strutils, tables]
+import std/[algorithm, tables]
 
 import ../syntax/imports
 import ../syntax/lexer
@@ -43,8 +43,7 @@ type
     uncertainty*: set[OccurrenceUncertainty]
 
 proc malformedIdentifierToken(token: Token): bool {.inline.} =
-  token.kind == tkIdentifier and token.text.len == 0 or
-    (token.kind == tkIdentifier and not validIdentifier(token))
+  token.kind == tkIdentifier and not validIdentifier(token)
 
 proc declarationKeyword(token: Token): bool {.inline.} =
   token.hasKeywordRole(roleDeclaration)
@@ -57,7 +56,7 @@ proc markImportSpans(parsed: SourceImports, excluded: var seq[bool]) =
       if token.startOffset >= item.startOffset and token.endOffset <= item.endOffset:
         excluded[index] = true
 
-proc markDeclarationNames[T](tokens: T, excluded: var seq[bool]) =
+proc markDeclarationNames(tokens: TokenStore, excluded: var seq[bool]) =
   ## Exclude the small set of declaration heads understood by the existing
   ## source index. Unsupported nested declarations still force fallback.
   var index = 0
@@ -69,7 +68,7 @@ proc markDeclarationNames[T](tokens: T, excluded: var seq[bool]) =
 
     var cursor = index + 1
     if token.hasKeywordRole(roleRoutine):
-      if cursor < tokens.len and tokens[cursor].text == "*":
+      if cursor < tokens.len and tokens.tokenTextEquals(tokens[cursor], "*"):
         inc cursor
       if cursor < tokens.len and tokens[cursor].kind == tkIdentifier:
         excluded[cursor] = true
@@ -77,14 +76,17 @@ proc markDeclarationNames[T](tokens: T, excluded: var seq[bool]) =
         token.hasKeywordRole(roleValueDeclaration):
       let declarationLine = token.line
       while cursor < tokens.len and tokens[cursor].line == declarationLine:
-        if tokens[cursor].text == ":" or tokens[cursor].text == "=":
+        if tokens.tokenTextEquals(tokens[cursor], ":") or
+            tokens.tokenTextEquals(tokens[cursor], "="):
           break
         if tokens[cursor].kind == tkIdentifier and not isNimKeyword(tokens[cursor]):
           excluded[cursor] = true
         inc cursor
     elif token.hasKeywordRole(roleForBinding):
-      while cursor < tokens.len and tokens[cursor].text != "in" and
-          tokens[cursor].text != "=" and tokens[cursor].text != ":":
+      while cursor < tokens.len and not tokens.tokenTextEquals(tokens[cursor], "in") and
+          not tokens.tokenTextEquals(tokens[cursor], "=") and
+          not tokens.tokenTextEquals(tokens[cursor], ":")
+      :
         if tokens[cursor].kind == tkIdentifier and not isNimKeyword(tokens[cursor]):
           excluded[cursor] = true
         inc cursor
@@ -93,9 +95,9 @@ proc markDeclarationNames[T](tokens: T, excluded: var seq[bool]) =
         excluded[cursor] = true
     inc index
 
-proc operatorPunctuation*(text: string): bool {.inline.} =
-  text.len == 1 and
-    text[0] in {
+proc operatorPunctuation*(tokens: TokenStore, token: Token): bool {.inline.} =
+  tokens.tokenTextLen(token) == 1 and
+    tokens.tokenTextChar(token, 0) in {
       '+', '-', '*', '/', '\\', '<', '>', '=', '@', '$', '~', '&', '%', '!', '?', '^',
       '|',
     }
@@ -130,14 +132,16 @@ proc markUncertainty(
         result.uncertainty.incl uncertaintyGenerated
       if declarationKeyword(token):
         result.uncertainty.incl uncertaintyDeclarationOrder
-    elif not excluded[index] and operatorPunctuation(token.text):
-      if token.text == "=" and parsed.tokens.isRoutineHeaderEquals(index):
+    elif not excluded[index] and operatorPunctuation(parsed.tokens, token):
+      if parsed.tokens.tokenTextEquals(token, "=") and
+          parsed.tokens.isRoutineHeaderEquals(index):
         continue
       if parsed.tokens.isExportMarker(index):
         continue
       result.uncertainty.incl uncertaintyUnsupportedSyntax
-    elif not excluded[index] and token.text == "{" and index + 1 < parsed.tokens.len and
-        parsed.tokens[index + 1].text == ".":
+    elif not excluded[index] and parsed.tokens.tokenTextEquals(token, "{") and
+        index + 1 < parsed.tokens.len and
+        parsed.tokens.tokenTextEquals(parsed.tokens[index + 1], "."):
       result.uncertainty.incl uncertaintyUnsupportedSyntax
 
   for token in parsed.tokens:
@@ -145,22 +149,22 @@ proc markUncertainty(
       result.uncertainty.incl uncertaintyInclude
       break
 
-proc exportUse[T](tokens: T, index: int): bool =
+proc exportUse(tokens: TokenStore, index: int): bool =
   var cursor = index - 1
   while cursor >= 0 and tokens[cursor].line == tokens[index].line and
-      tokens[cursor].text != ";":
+      not tokens.tokenTextEquals(tokens[cursor], ";"):
     if tokens[cursor].isKeyword(kwExport):
       return true
     dec cursor
 
-proc addUsage[T](
+proc addUsage(
     index: var OccurrenceIndex,
     lookup: var Table[string, int],
-    tokens: T,
+    tokens: TokenStore,
     occurrence: IdentifierOccurrence,
 ) =
   let tokenIndex = int(occurrence.token)
-  let key = identifierKey(tokens[tokenIndex].text)
+  let key = identifierKey(tokens, tokens[tokenIndex])
   var summaryIndex: int
   if lookup.hasKey(key):
     summaryIndex = lookup[key]
@@ -178,12 +182,12 @@ proc addUsage[T](
     inc summary.exportCount
   index.usage[summaryIndex] = summary
 
-proc sortUsage*[T](index: var OccurrenceIndex, tokens: T) =
+proc sortUsage*(index: var OccurrenceIndex, tokens: TokenStore) =
   index.usage.sort(
     proc(left, right: UsageSummary): int =
       cmp(
-        identifierKey(tokens[int(left.representativeToken)].text),
-        identifierKey(tokens[int(right.representativeToken)].text),
+        identifierKey(tokens, tokens[int(left.representativeToken)]),
+        identifierKey(tokens, tokens[int(right.representativeToken)]),
       )
   )
 
@@ -223,10 +227,12 @@ proc indexOccurrences*(
       continue
     included[tokenIndex] = true
     roles[tokenIndex] = {occurrenceReference}
-    if tokenIndex > 1 and parsed.tokens[tokenIndex - 1].text == "." and
+    if tokenIndex > 1 and
+        parsed.tokens.tokenTextEquals(parsed.tokens[tokenIndex - 1], ".") and
         included[tokenIndex - 2]:
       roles[tokenIndex].incl occurrenceMember
-    if tokenIndex + 2 < tokenCount and parsed.tokens[tokenIndex + 1].text == "." and
+    if tokenIndex + 2 < tokenCount and
+        parsed.tokens.tokenTextEquals(parsed.tokens[tokenIndex + 1], ".") and
         validIdentifier(parsed.tokens[tokenIndex + 2]) and not excluded[tokenIndex + 2] and
         not isNimKeyword(parsed.tokens[tokenIndex + 2]):
       roles[tokenIndex].incl occurrenceQualifier
@@ -239,7 +245,8 @@ proc indexOccurrences*(
 
   for tokenIndex in 0 ..< tokenCount:
     if not included[tokenIndex] or tokenIndex + 2 >= tokenCount or
-        parsed.tokens[tokenIndex + 1].text != "." or not included[tokenIndex + 2]:
+        not parsed.tokens.tokenTextEquals(parsed.tokens[tokenIndex + 1], ".") or
+        not included[tokenIndex + 2]:
       continue
     result.qualified.add QualifiedOccurrence(
       qualifierToken: uint32(tokenIndex), memberToken: uint32(tokenIndex + 2)
@@ -249,32 +256,39 @@ proc indexOccurrences*(
 proc isComplete*(index: OccurrenceIndex): bool =
   index.uncertainty == {}
 
-proc usageFor*[T](index: OccurrenceIndex, tokens: T, name: string): UsageSummary =
-  let wanted = identifierKey(name)
-  if wanted.len == 0:
-    return
-  var first = 0
-  var past = index.usage.len
-  while first < past:
-    let middle = (first + past) div 2
-    let summary = index.usage[middle]
-    if summary.representativeToken >= uint32(tokens.len):
-      return
-    let key = identifierKey(tokens[int(summary.representativeToken)].text)
-    if key < wanted:
-      first = middle + 1
-    else:
-      past = middle
-  if first < index.usage.len:
-    let summary = index.usage[first]
-    if summary.representativeToken < uint32(tokens.len) and
-        identifierKey(tokens[int(summary.representativeToken)].text) == wanted:
-      return summary
+template usagePosition(
+    index: OccurrenceIndex, tokens: TokenStore, wanted: string
+): int =
+  block:
+    var usageFirst = 0
+    var usagePast = index.usage.len
+    while wanted.len > 0 and usageFirst < usagePast:
+      let usageMiddle = (usageFirst + usagePast) div 2
+      let usageSummary = index.usage[usageMiddle]
+      if usageSummary.representativeToken >= uint32(tokens.len):
+        usageFirst = index.usage.len
+        usagePast = usageFirst
+      else:
+        let usageKey =
+          identifierKey(tokens, tokens[int(usageSummary.representativeToken)])
+        if usageKey < wanted:
+          usageFirst = usageMiddle + 1
+        else:
+          usagePast = usageMiddle
+    if usageFirst < index.usage.len and
+        index.usage[usageFirst].representativeToken < uint32(tokens.len) and
+        identifierKey(tokens, tokens[int(index.usage[usageFirst].representativeToken)]) ==
+        wanted: usageFirst else: -1
 
-proc hasUsage*[T](index: OccurrenceIndex, tokens: T, name: string): bool =
+proc usageFor*(index: OccurrenceIndex, tokens: TokenStore, name: string): UsageSummary =
+  let position = usagePosition(index, tokens, identifierKey(name))
+  if position >= 0:
+    return index.usage[position]
+
+proc hasUsage*(index: OccurrenceIndex, tokens: TokenStore, name: string): bool =
   index.usageFor(tokens, name).referenceCount > 0
 
-proc validateOccurrences*[T](index: OccurrenceIndex, tokens: T): bool =
+proc validateOccurrences*(index: OccurrenceIndex, tokens: TokenStore): bool =
   var occurrenceByToken = newSeq[bool](tokens.len)
   var previousToken = high(uint32)
   for occurrence in index.identifiers:
@@ -291,7 +305,7 @@ proc validateOccurrences*[T](index: OccurrenceIndex, tokens: T): bool =
     if pair.qualifierToken >= uint32(tokens.len) or
         pair.memberToken >= uint32(tokens.len) or pair.qualifierToken >= pair.memberToken or
         pair.memberToken != pair.qualifierToken + 2'u32 or
-        tokens[int(pair.qualifierToken) + 1].text != "." or
+        not tokens.tokenTextEquals(tokens[int(pair.qualifierToken) + 1], ".") or
         not occurrenceByToken[int(pair.qualifierToken)] or
         not occurrenceByToken[int(pair.memberToken)] or
         (previousQualifier != high(uint32) and pair.qualifierToken <= previousQualifier):
@@ -299,12 +313,22 @@ proc validateOccurrences*[T](index: OccurrenceIndex, tokens: T): bool =
     previousQualifier = pair.qualifierToken
 
   var previousKey = ""
-  var expected = initTable[string, UsageSummary]()
+  var observed = newSeq[UsageSummary](index.usage.len)
+  for usageIndex, summary in index.usage:
+    if summary.representativeToken >= uint32(tokens.len):
+      return false
+    let key = identifierKey(tokens, tokens[int(summary.representativeToken)])
+    if previousKey.len > 0 and key <= previousKey:
+      return false
+    previousKey = key
+    observed[usageIndex].representativeToken = summary.representativeToken
+
   for occurrence in index.identifiers:
-    let key = identifierKey(tokens[int(occurrence.token)].text)
-    if not expected.hasKey(key):
-      expected[key] = UsageSummary(representativeToken: occurrence.token)
-    var summary = expected[key]
+    let key = identifierKey(tokens, tokens[int(occurrence.token)])
+    let position = usagePosition(index, tokens, key)
+    if position < 0:
+      return false
+    var summary = observed[position]
     inc summary.referenceCount
     if occurrenceQualifier in occurrence.roles:
       inc summary.qualifierCount
@@ -312,17 +336,14 @@ proc validateOccurrences*[T](index: OccurrenceIndex, tokens: T): bool =
       inc summary.memberCount
     if occurrenceExport in occurrence.roles:
       inc summary.exportCount
-    expected[key] = summary
+    observed[position] = summary
 
-  if expected.len != index.usage.len:
-    return false
-  for summary in index.usage:
-    if summary.representativeToken >= uint32(tokens.len):
-      return false
-    let key = identifierKey(tokens[int(summary.representativeToken)].text)
-    if previousKey.len > 0 and key <= previousKey:
-      return false
-    previousKey = key
-    if not expected.hasKey(key) or expected[key] != summary:
+  for usageIndex, summary in index.usage:
+    let actual = observed[usageIndex]
+    if actual.representativeToken != summary.representativeToken or
+        actual.referenceCount != summary.referenceCount or
+        actual.qualifierCount != summary.qualifierCount or
+        actual.memberCount != summary.memberCount or
+        actual.exportCount != summary.exportCount:
       return false
   true

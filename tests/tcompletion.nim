@@ -325,11 +325,20 @@ proc main() =
     let shadowPath = root / "stdlib_shadow.nim"
     let provider = """proc answer*() = discard
 proc another*() = discard
+proc scale*(value: int) = discard
+proc makeValues*(): seq[int] = nil
+proc total*(values: seq[int]) = discard
 proc private() = discard
 """
     let consumer = """import provider as p
+from provider import scale, total
 proc main() =
   p.an
+proc use(value: int) =
+  value.sc
+proc useValues() =
+  let values = p.makeValues()
+  values.to
 """
     writeFile(providerPath, provider)
     writeFile(consumerPath, consumer)
@@ -363,6 +372,18 @@ proc main() =
     check projectResult.items.anyIt(it.label == "another")
     check not projectResult.items.anyIt(it.label == "private")
     check projectResult.items.anyIt(it.kind == completionFunction)
+
+    let ufcsOffset = consumer.find("value.sc") + "value.sc".len
+    let ufcsResult = completeAt(workspace, consumerSnapshot, ufcsOffset, stdlib)
+    check ufcsResult.state == completionAvailable
+    check ufcsResult.items.mapIt(it.label) == @["scale"]
+    check ufcsResult.items[0].kind == completionMethod
+
+    let sequenceOffset = consumer.find("values.to") + "values.to".len
+    let sequenceResult = completeAt(workspace, consumerSnapshot, sequenceOffset, stdlib)
+    check sequenceResult.state == completionAvailable
+    check sequenceResult.items.mapIt(it.label) == @["total"]
+    check sequenceResult.items[0].kind == completionMethod
 
     let shadowId = workspace.fileIdForPath(shadowPath)
     let shadowSnapshot = workspace.snapshotForFile(shadowId)
@@ -456,7 +477,7 @@ proc use() =
     old*: string
     private: int
     age*: int
-proc makePerson*(): Person = discard
+proc makePerson*(): ref Person = discard
 """
     let consumer = """import provider as model
 proc show(value: ref model.Person; raw: ptr model.Person) =
@@ -507,7 +528,7 @@ proc show(value: Person) =
     let valueOffset = consumer.find("value.") + "value.".len
     let valueResult = completeAt(workspace, consumerSnapshot, valueOffset, stdlib)
     check valueResult.state == completionAvailable
-    check valueResult.items.mapIt(it.label) == @["age", "old"]
+    check valueResult.items.mapIt(it.label) == @["age", "old", "show"]
     check not valueResult.items.anyIt(it.label == "private")
 
     let rawOffset = consumer.find("raw.ag") + "raw.ag".len
@@ -551,7 +572,7 @@ proc show(value: Person) =
     let reloadedSnapshot = reloaded.snapshotForFile(reloadedId)
     let reloadedResult = completeAt(reloaded, reloadedSnapshot, valueOffset, stdlib)
     check reloadedResult.state == completionAvailable
-    check reloadedResult.items.mapIt(it.label) == @["age", "old"]
+    check reloadedResult.items.mapIt(it.label) == @["age", "old", "show"]
     let reloadedReturnedOffset = consumer.find("returned.ol") + "returned.ol".len
     let reloadedReturned =
       completeAt(reloaded, reloadedSnapshot, reloadedReturnedOffset, stdlib)
@@ -569,7 +590,7 @@ proc makePerson*(): Person = discard
     let refreshed = workspace.snapshotForFile(consumerId)
     let refreshedResult = completeAt(workspace, refreshed, valueOffset, stdlib)
     check refreshedResult.state == completionAvailable
-    check refreshedResult.items.mapIt(it.label) == @["age", "new"]
+    check refreshedResult.items.mapIt(it.label) == @["age", "new", "show"]
     check not refreshedResult.items.anyIt(it.label == "old")
     let returnedDotOffset = consumer.find("returned.") + "returned.".len
     let refreshedReturned = completeAt(workspace, refreshed, returnedDotOffset, stdlib)
@@ -591,6 +612,38 @@ proc show(person: Person) =
     check result.items[0].kind == completionField
     check result.replaceStart == source.rfind("na")
     check result.replaceEnd == result.replaceStart + 2
+
+  test "completes exact UFCS members and preserves field precedence":
+    let primitive = """proc scaled(value: int) = discard
+proc show(value: int) =
+  value.sc
+"""
+    let primitiveResult = memberCompletionAt(primitive, "value.sc")
+    check primitiveResult.state == completionAvailable
+    check primitiveResult.items.mapIt(it.label) == @["scaled"]
+    check primitiveResult.items[0].kind == completionMethod
+
+    let field = """type Item = object
+  size*: int
+
+proc size(value: Item) = discard
+proc show(item: Item) =
+  item.si
+"""
+    let fieldResult = memberCompletionAt(field, "item.si")
+    check fieldResult.state == completionAvailable
+    check fieldResult.items.mapIt(it.label) == @["size"]
+    check fieldResult.items[0].kind == completionField
+
+    let overloads = """proc choose(value: int; amount: int) = discard
+proc choose(value: int; amount: string) = discard
+proc show(value: int) =
+  value.ch
+"""
+    let overloadResult = memberCompletionAt(overloads, "value.ch")
+    check overloadResult.state == completionAvailable
+    check overloadResult.items.mapIt(it.label) == @["choose"]
+    check overloadResult.items[0].kind == completionMethod
 
   test "supports ref, ptr, constructors, and lexical type shadowing":
     let source = """type
@@ -633,7 +686,18 @@ proc show(shared: Shared; raw: ptr Raw; person: Person) =
 proc show(value: Box[int]) =
   value.va
 """
-    check memberCompletionAt(generic, "value.va").state == completionUnsupported
+    let genericResult = memberCompletionAt(generic, "value.va")
+    check genericResult.state == completionAvailable
+    check genericResult.items.mapIt(it.label) == @["value"]
+    check genericResult.items[0].kind == completionField
+
+    let invalidGeneric = """type Plain = object
+  value: int
+
+proc show(value: Plain[int]) =
+  value.va
+"""
+    check memberCompletionAt(invalidGeneric, "value.va").state == completionUnsupported
 
     let variant = """type
   Variant = object
@@ -674,3 +738,17 @@ proc show(os: Unknown) =
   os.walkD
 """
     check memberCompletionAt(unknownLocal, "os.walkD").state == completionUnsupported
+
+    let nestedReference = """type
+  Person = object
+    name: string
+
+proc show(value: ref ref Person) =
+  value.na
+"""
+    check memberCompletionAt(nestedReference, "value.na").state == completionUnsupported
+
+    let primitiveArray = """proc show(value: array[4, int]) =
+  value.na
+"""
+    check memberCompletionAt(primitiveArray, "value.na").state == completionUnsupported

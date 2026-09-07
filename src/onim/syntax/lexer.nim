@@ -6,6 +6,10 @@ type
     tkString
     tkPunctuation
 
+  TokenFlag* = enum
+    tfStropped
+    tfClosed
+
   NimKeyword* = enum
     kwNone
     kwAddr
@@ -98,7 +102,7 @@ type
   Token* = object
     kind*: TokenKind
     keyword*: NimKeyword
-    text*: string
+    flags*: set[TokenFlag]
     startOffset*: int
     endOffset*: int
     line*: int
@@ -114,22 +118,32 @@ type
     kind*: LexicalIssueKind
     tokenIndex*: uint32
 
-const tokenBlockLength* = 64
-
 type
   TokenBase = ref object
     values: seq[Token]
-
-  TokenBlock = ref object
-    values: array[tokenBlockLength, Token]
-
-  TokenOverrides = ref object
-    blocks: seq[TokenBlock]
+    source: string
 
   TokenStore* = object
     base: TokenBase
-    overrides: TokenOverrides
-    count: int
+
+const keywordSpellings: array[NimKeyword, string] = [
+  "", "addr", "and", "as", "asm", "atomic", "bind", "block", "break", "case", "cast",
+  "concept", "const", "continue", "converter", "defer", "discard", "distinct", "div",
+  "do", "elif", "else", "end", "enum", "except", "export", "finally", "for", "from",
+  "func", "generic", "if", "import", "in", "include", "interface", "is", "isnot",
+  "iterator", "let", "macro", "method", "mixin", "mod", "nil", "not", "object", "of",
+  "or", "out", "proc", "ptr", "raise", "ref", "return", "shl", "shr", "static",
+  "template", "try", "tuple", "type", "using", "var", "when", "while", "with",
+  "without", "xor", "yield",
+]
+
+proc spanEquals(source: string, start, past: int, wanted: string): bool {.inline.} =
+  if start < 0 or past < start or past > source.len or past - start != wanted.len:
+    return false
+  for index in 0 ..< wanted.len:
+    if source[start + index] != wanted[index]:
+      return false
+  true
 
 proc identifierKey*(value: string): string =
   ## Nim's style-insensitive identifier key for the ASCII spelling common to
@@ -151,23 +165,86 @@ proc identifierKey*(value: string): string =
 proc sameIdentifier*(left, right: string): bool =
   identifierKey(left) == identifierKey(right)
 
-proc initTokenStore*(tokens: sink seq[Token]): TokenStore =
+proc initTokenStore*(source: string, tokens: sink seq[Token]): TokenStore =
   new(result.base)
   result.base.values = tokens
-  result.count = tokens.len
+  result.base.source = source
+
+proc rebindSource*(tokens: TokenStore, source: string): TokenStore =
+  new(result.base)
+  result.base.values =
+    if tokens.base == nil:
+      @[]
+    else:
+      tokens.base.values
+  result.base.source = source
+
+proc sourceText*(tokens: TokenStore): string {.inline.} =
+  if tokens.base != nil:
+    result = tokens.base.source
+
+proc tokenTextBounds(
+    tokens: TokenStore, token: Token
+): tuple[first, past: int] {.inline.} =
+  if tokens.base == nil:
+    return
+  result.first = token.startOffset
+  result.past = token.endOffset
+  if tfStropped in token.flags:
+    inc result.first
+    if tfClosed in token.flags:
+      dec result.past
+  if result.first < 0 or result.past < result.first or
+      result.past > tokens.base.source.len:
+    result = (0, 0)
+
+proc tokenTextLen*(tokens: TokenStore, token: Token): int {.inline.} =
+  let bounds = tokens.tokenTextBounds(token)
+  bounds.past - bounds.first
+
+proc tokenTextChar*(tokens: TokenStore, token: Token, index: int): char {.inline.} =
+  let bounds = tokens.tokenTextBounds(token)
+  if index < 0 or bounds.first + index >= bounds.past:
+    raise newException(IndexDefect, "token text index out of bounds")
+  tokens.base.source[bounds.first + index]
+
+proc tokenTextEquals*(
+    tokens: TokenStore, token: Token, wanted: string
+): bool {.inline.} =
+  if tokens.base == nil:
+    return false
+  let bounds = tokens.tokenTextBounds(token)
+  spanEquals(tokens.base.source, bounds.first, bounds.past, wanted)
+
+proc tokenText*(tokens: TokenStore, token: Token): string =
+  let bounds = tokens.tokenTextBounds(token)
+  if bounds.first < bounds.past:
+    result = tokens.base.source[bounds.first ..< bounds.past]
+
+proc identifierKey*(tokens: TokenStore, token: Token): string =
+  let bounds = tokens.tokenTextBounds(token)
+  if bounds.first >= bounds.past:
+    return
+  result = newStringOfCap(bounds.past - bounds.first)
+  result.add tokens.base.source[bounds.first]
+  for index in bounds.first + 1 ..< bounds.past:
+    let character = tokens.base.source[index]
+    if character == '_':
+      continue
+    if character >= 'A' and character <= 'Z':
+      result.add char(ord(character) + (ord('a') - ord('A')))
+    else:
+      result.add character
 
 proc len*(tokens: TokenStore): int {.inline.} =
-  tokens.count
+  if tokens.base == nil: 0 else: tokens.base.values.len
 
 proc high*(tokens: TokenStore): int {.inline.} =
-  tokens.count - 1
+  tokens.len - 1
 
 proc `[]`*(tokens: TokenStore, index: int): lent Token {.inline.} =
-  if index < 0 or index >= tokens.count:
+  if index < 0 or index >= tokens.len:
     raise newException(IndexDefect, "token index out of bounds")
-  let blockIndex = index div tokenBlockLength
-  if tokens.overrides != nil and tokens.overrides.blocks[blockIndex] != nil:
-    return tokens.overrides.blocks[blockIndex].values[index mod tokenBlockLength]
   tokens.base.values[index]
 
 proc tokenContaining*(tokens: TokenStore, startOffset, endOffset: int): int =
@@ -191,136 +268,35 @@ proc tokenAtOffset*(tokens: TokenStore, offset: int): int =
 
 iterator items*(tokens: TokenStore): lent Token =
   var index = 0
-  while index < tokens.count:
+  while index < tokens.len:
     yield tokens[index]
     inc index
 
 iterator pairs*(tokens: TokenStore): (int, lent Token) =
   var index = 0
-  while index < tokens.count:
+  while index < tokens.len:
     yield (index, tokens[index])
     inc index
 
-proc copyDirectory(tokens: TokenStore): TokenOverrides =
-  new(result)
-  let blockCount = (tokens.count + tokenBlockLength - 1) div tokenBlockLength
-  result.blocks = newSeq[TokenBlock](blockCount)
-  if tokens.overrides != nil:
-    for index in 0 ..< blockCount:
-      result.blocks[index] = tokens.overrides.blocks[index]
-
-proc copyBlock(tokens: TokenStore, blockIndex: int): TokenBlock =
-  new(result)
-  let first = blockIndex * tokenBlockLength
-  let past = min(tokens.count, first + tokenBlockLength)
-  for index in first ..< past:
-    result.values[index - first] = tokens[index]
-
-proc withToken*(tokens: TokenStore, index: int, token: sink Token): TokenStore =
-  if index < 0 or index >= tokens.count:
-    raise newException(IndexDefect, "token index out of bounds")
-  result = tokens
-  result.overrides = copyDirectory(tokens)
-  let blockIndex = index div tokenBlockLength
-  result.overrides.blocks[blockIndex] = copyBlock(tokens, blockIndex)
-  result.overrides.blocks[blockIndex].values[index mod tokenBlockLength] = token
-
-proc toSeq*(tokens: TokenStore): seq[Token] =
-  result = newSeqOfCap[Token](tokens.count)
-  for token in tokens:
-    result.add token
-
 proc `==`*(left, right: TokenStore): bool =
-  if left.count != right.count:
+  if left.len != right.len or left.sourceText != right.sourceText:
     return false
-  for index in 0 ..< left.count:
+  for index in 0 ..< left.len:
     if left[index] != right[index]:
       return false
   true
-
-proc `==`*(left: TokenStore, right: openArray[Token]): bool =
-  if left.count != right.len:
-    return false
-  for index in 0 ..< left.count:
-    if left[index] != right[index]:
-      return false
-  true
-
-proc `==`*(left: openArray[Token], right: TokenStore): bool =
-  right == left
 
 proc keywordId*(text: string): NimKeyword {.inline.} =
-  case text
-  of "addr": kwAddr
-  of "and": kwAnd
-  of "as": kwAs
-  of "asm": kwAsm
-  of "atomic": kwAtomic
-  of "bind": kwBind
-  of "block": kwBlock
-  of "break": kwBreak
-  of "case": kwCase
-  of "cast": kwCast
-  of "concept": kwConcept
-  of "const": kwConst
-  of "continue": kwContinue
-  of "converter": kwConverter
-  of "defer": kwDefer
-  of "discard": kwDiscard
-  of "distinct": kwDistinct
-  of "div": kwDiv
-  of "do": kwDo
-  of "elif": kwElif
-  of "else": kwElse
-  of "end": kwEnd
-  of "enum": kwEnum
-  of "except": kwExcept
-  of "export": kwExport
-  of "finally": kwFinally
-  of "for": kwFor
-  of "from": kwFrom
-  of "func": kwFunc
-  of "generic": kwGeneric
-  of "if": kwIf
-  of "import": kwImport
-  of "in": kwIn
-  of "include": kwInclude
-  of "interface": kwInterface
-  of "is": kwIs
-  of "isnot": kwIsnot
-  of "iterator": kwIterator
-  of "let": kwLet
-  of "macro": kwMacro
-  of "method": kwMethod
-  of "mixin": kwMixin
-  of "mod": kwMod
-  of "nil": kwNil
-  of "not": kwNot
-  of "object": kwObject
-  of "of": kwOf
-  of "or": kwOr
-  of "out": kwOut
-  of "proc": kwProc
-  of "ptr": kwPtr
-  of "raise": kwRaise
-  of "ref": kwRef
-  of "return": kwReturn
-  of "shl": kwShl
-  of "shr": kwShr
-  of "static": kwStatic
-  of "template": kwTemplate
-  of "try": kwTry
-  of "tuple": kwTuple
-  of "type": kwType
-  of "using": kwUsing
-  of "var": kwVar
-  of "when": kwWhen
-  of "while": kwWhile
-  of "with": kwWith
-  of "without": kwWithout
-  of "xor": kwXor
-  of "yield": kwYield
-  else: kwNone
+  for keyword in NimKeyword:
+    if keyword != kwNone and text == keywordSpellings[keyword]:
+      return keyword
+  kwNone
+
+proc keywordIdAt*(source: string, start, past: int): NimKeyword {.inline.} =
+  for keyword in NimKeyword:
+    if keyword != kwNone and spanEquals(source, start, past, keywordSpellings[keyword]):
+      return keyword
+  kwNone
 
 proc keywordRoles*(keyword: NimKeyword): set[KeywordRole] {.inline.} =
   case keyword
@@ -366,15 +342,10 @@ proc tokenSpan(token: Token): int {.inline.} =
   token.endOffset - token.startOffset
 
 proc isStropped*(token: Token): bool {.inline.} =
-  token.kind == tkIdentifier and token.text.len > 0 and
-    tokenSpan(token) >= token.text.len + 1
+  token.kind == tkIdentifier and tfStropped in token.flags
 
 proc keywordOf*(token: Token): NimKeyword {.inline.} =
-  if token.keyword != kwNone:
-    return token.keyword
-  if token.kind == tkIdentifier and not isStropped(token):
-    return keywordId(token.text)
-  kwNone
+  token.keyword
 
 proc isKeyword*(token: Token, wanted: NimKeyword): bool {.inline.} =
   token.kind == tkIdentifier and not isStropped(token) and keywordOf(token) == wanted
@@ -383,15 +354,16 @@ proc hasKeywordRole*(token: Token, role: KeywordRole): bool {.inline.} =
   let keyword = keywordOf(token)
   keyword != kwNone and role in keywordRoles(keyword)
 
-proc isExportMarker*[T](tokens: T, index: int): bool {.inline.} =
-  if index <= 0 or index >= tokens.len or tokens[index].text != "*" or
+proc isExportMarker*(tokens: TokenStore, index: int): bool {.inline.} =
+  if index <= 0 or index >= tokens.len or not tokens.tokenTextEquals(tokens[index], "*") or
       tokens[index - 1].kind != tkIdentifier or
       tokens[index - 1].line != tokens[index].line:
     return false
   var cursor = index - 2
   while cursor >= 0:
     if tokens[cursor].line == tokens[index].line:
-      if tokens[cursor].text == "=" or tokens[cursor].text == ";":
+      if tokens.tokenTextEquals(tokens[cursor], "=") or
+          tokens.tokenTextEquals(tokens[cursor], ";"):
         return false
       if tokens[cursor].hasKeywordRole(roleDeclaration):
         return true
@@ -402,12 +374,13 @@ proc isExportMarker*[T](tokens: T, index: int): bool {.inline.} =
     dec cursor
   false
 
-proc isRoutineHeaderEquals*[T](tokens: T, index: int): bool {.inline.} =
-  if index <= 0 or index >= tokens.len or tokens[index].text != "=":
+proc isRoutineHeaderEquals*(tokens: TokenStore, index: int): bool {.inline.} =
+  if index <= 0 or index >= tokens.len or not tokens.tokenTextEquals(tokens[index], "="):
     return false
   var cursor = index - 1
   while cursor >= 0 and tokens[cursor].line == tokens[index].line:
-    if tokens[cursor].text == "=" or tokens[cursor].text == ";":
+    if tokens.tokenTextEquals(tokens[cursor], "=") or
+        tokens.tokenTextEquals(tokens[cursor], ";"):
       return false
     if tokens[cursor].hasKeywordRole(roleRoutine):
       return not tokens[cursor].hasKeywordRole(roleGenerated)
@@ -415,24 +388,14 @@ proc isRoutineHeaderEquals*[T](tokens: T, index: int): bool {.inline.} =
   false
 
 proc validIdentifier*(token: Token): bool {.inline.} =
-  if token.kind != tkIdentifier or token.text.len == 0:
+  if token.kind != tkIdentifier or token.endOffset <= token.startOffset:
     return false
-  let span = tokenSpan(token)
-  span == token.text.len or span == token.text.len + 2
+  if isStropped(token):
+    return tfClosed in token.flags and tokenSpan(token) > 2
+  true
 
 proc isClosedString*(token: Token): bool {.inline.} =
-  if token.kind != tkString or token.text.len < 2:
-    return false
-  let triple =
-    token.text.len >= 3 and token.text[0] == '"' and token.text[1] == '"' and
-    token.text[2] == '"'
-  if triple:
-    return
-      token.text.len >= 6 and token.text[^3] == '"' and token.text[^2] == '"' and
-      token.text[^1] == '"'
-  (token.text[0] == '"' or token.text[0] == char(39)) and token.text[^1] == token.text[
-    0
-  ]
+  token.kind == tkString and tfClosed in token.flags
 
 proc matchingDelimiter*(opening, closing: char): bool {.inline.} =
   case closing
@@ -467,9 +430,9 @@ proc lexicalIssues*(tokens: TokenStore): seq[LexicalIssue] =
         kind: lexicalUnclosedString, tokenIndex: uint32(tokenIndex)
       )
 
-    if token.kind != tkPunctuation or token.text.len != 1:
+    if token.kind != tkPunctuation or tokens.tokenTextLen(token) != 1:
       continue
-    let value = token.text[0]
+    let value = tokens.tokenTextChar(token, 0)
     if isOpeningDelimiter(value):
       delimiters.add LexicalDelimiter(value: value, tokenIndex: uint32(tokenIndex))
     elif isClosingDelimiter(value):
@@ -514,7 +477,7 @@ proc skipQuoted(
     column: var int,
     quote: char,
     triple: bool,
-) =
+): bool =
   if triple:
     for _ in 0 ..< 3:
       if position < source.len:
@@ -534,10 +497,10 @@ proc skipQuoted(
           source[position + 1] == quote and source[position + 2] == quote:
         for _ in 0 ..< 3:
           advance(source, position, line, column)
-        break
+        return true
     elif source[position] == quote:
       advance(source, position, line, column)
-      break
+      return true
 
     advance(source, position, line, column)
 
@@ -563,7 +526,8 @@ proc skipComment(source: string, position: var int, line: var int, column: var i
     while position < source.len and source[position] != '\n':
       advance(source, position, line, column)
 
-proc lex*(source: string): seq[Token] =
+proc lex*(source: string): TokenStore =
+  var values: seq[Token] = @[]
   var position = 0
   var line = 0
   var column = 0
@@ -583,15 +547,17 @@ proc lex*(source: string): seq[Token] =
       let tokenLine = line
       let tokenColumn = column
       advance(source, position, line, column)
-      let contentStart = position
       while position < source.len and source[position] != '`':
         advance(source, position, line, column)
-      let contentEnd = position
-      if position < source.len:
+      let closed = position < source.len
+      if closed:
         advance(source, position, line, column)
-      result.add Token(
+      var flags: set[TokenFlag] = {tfStropped}
+      if closed:
+        flags.incl tfClosed
+      values.add Token(
         kind: tkIdentifier,
-        text: source[contentStart ..< contentEnd],
+        flags: flags,
         startOffset: start,
         endOffset: position,
         line: tokenLine,
@@ -604,10 +570,13 @@ proc lex*(source: string): seq[Token] =
       let triple =
         c == '"' and position + 2 < source.len and source[position + 1] == '"' and
         source[position + 2] == '"'
-      skipQuoted(source, position, line, column, c, triple)
-      result.add Token(
+      let closed = skipQuoted(source, position, line, column, c, triple)
+      var flags: set[TokenFlag] = {}
+      if closed:
+        flags.incl tfClosed
+      values.add Token(
         kind: tkString,
-        text: source[start ..< position],
+        flags: flags,
         startOffset: start,
         endOffset: position,
         line: tokenLine,
@@ -623,17 +592,16 @@ proc lex*(source: string): seq[Token] =
         let triple =
           position + 2 < source.len and source[position + 1] == '"' and
           source[position + 2] == '"'
-        skipQuoted(source, position, line, column, '"', triple)
+        discard skipQuoted(source, position, line, column, '"', triple)
       else:
         let start = position
         let tokenLine = line
         let tokenColumn = column
         while position < source.len and isIdentifierContinue(source[position]):
           advance(source, position, line, column)
-        result.add Token(
+        values.add Token(
           kind: tkIdentifier,
-          keyword: keywordId(source[start ..< position]),
-          text: source[start ..< position],
+          keyword: keywordIdAt(source, start, position),
           startOffset: start,
           endOffset: position,
           line: tokenLine,
@@ -644,14 +612,15 @@ proc lex*(source: string): seq[Token] =
       let tokenLine = line
       let tokenColumn = column
       advance(source, position, line, column)
-      result.add Token(
+      values.add Token(
         kind: tkPunctuation,
-        text: source[start ..< position],
         startOffset: start,
         endOffset: position,
         line: tokenLine,
         column: tokenColumn,
       )
+
+  initTokenStore(source, values)
 
 proc lineEndOffset*(source: string, offset: int): int =
   var position = max(0, min(offset, source.len))

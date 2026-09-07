@@ -39,6 +39,8 @@ nimble bench
 
 Treat benchmark output as evidence for a fixed workload only. It does not establish a universal latency or memory guarantee. Reproduce memory or process-lifetime reports with a named project, a fixed sequence of LSP messages, and resident-memory/process-tree measurements before changing the architecture.
 
+For protocol evidence, set `ONIM_TRACE_LSP=1`; it emits diagnostic publication events with a hashed URI, versions, numeric snapshot generations, reason, and count, plus code-action request events with a hashed request ID, generations, duration, result state, and worker state. It never emits source text or paths. Set `ONIM_TRACE_WORKERS=1` to trace semantic/bootstrap worker start, cancellation, interruption, and reap events. Both are disabled by default.
+
 ## Source layout
 
 The source tree is grouped by responsibility under `src/onim`. Tests are grouped by feature and index boundary under `tests`; fixtures for source transformations are under `tests/before` and `tests/after`. Keep public workflow documentation in `README.md` or `docs/`, and keep implementation contracts close to the owning module.

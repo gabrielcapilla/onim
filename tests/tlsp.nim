@@ -1,7 +1,11 @@
-import std/[json, os, osproc, streams, strutils, unittest]
+import std/[json, os, osproc, streams, strutils, times, unittest]
 
 proc sendMessage(input: Stream, message: JsonNode) =
   let body = $message
+  input.write("Content-Length: " & $body.len & "\r\n\r\n" & body)
+  input.flush
+
+proc sendRaw(input: Stream, body: string) =
   input.write("Content-Length: " & $body.len & "\r\n\r\n" & body)
   input.flush
 
@@ -37,6 +41,249 @@ proc readDiagnostics(output: Stream, uri: string): JsonNode =
       return message
 
 suite "stdio LSP":
+  test "terminates after exit while stdin remains open":
+    let root = currentSourcePath().parentDir.parentDir
+    let process = startProcess(root / "onim", args = ["--stdio"], workingDir = root)
+    defer:
+      close process
+
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+    )
+    check readResponse(process.outputStream, 1) != nil
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "id": 2, "method": "shutdown"}
+    )
+    check readResponse(process.outputStream, 2)["result"].kind == JNull
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(2000) == 0
+
+  test "cancels a pending semantic code action without blocking the reader":
+    let root = currentSourcePath().parentDir.parentDir
+    let filePath = getTempDir() / ("onim-cancel-" & $getCurrentProcessId() & ".nim")
+    let uri = "file://" & filePath.replace('\\', '/')
+    writeFile(filePath, "include missing_module\n\nproc main() = discard\n")
+    defer:
+      if fileExists(filePath):
+        removeFile(filePath)
+    let process = startProcess(root / "onim", args = ["--stdio"], workingDir = root)
+    defer:
+      close process
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"rootUri": "file://" & root.replace('\\', '/')},
+      },
+    )
+    check readResponse(process.outputStream, 1) != nil
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "method": "initialized", "params": {}}
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/codeAction",
+        "params": {
+          "textDocument": {"uri": uri}, "context": {"only": ["source.organizeImports"]}
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 2}},
+    )
+    let started = epochTime()
+    let canceled = readResponse(process.outputStream, 2)
+    check (epochTime() - started) * 1000.0 < 1000.0
+    check canceled != nil
+    check canceled["error"]["code"].getInt == -32800
+
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": nil},
+    )
+    check readResponse(process.outputStream, 3)["result"].kind == JNull
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
+
+  test "reaps the semantic worker between completed fallback requests":
+    let root = getTempDir() / ("onim-reap-" & $getCurrentProcessId())
+    if dirExists(root):
+      removeFile(root / "first.nim")
+      removeFile(root / "second.nim")
+      removeDir(root)
+    createDir(root)
+    let firstPath = root / "first.nim"
+    let secondPath = root / "second.nim"
+    let firstUri = "file://" & firstPath.replace('\\', '/')
+    let secondUri = "file://" & secondPath.replace('\\', '/')
+    let source =
+      "include missing_module\n\nproc main() =\n  for kind, path in walkDir(\"/tmp\"): discard\n"
+    writeFile(firstPath, source)
+    writeFile(secondPath, source)
+    defer:
+      removeFile(firstPath)
+      removeFile(secondPath)
+      removeDir(root)
+
+    let projectRoot = currentSourcePath().parentDir.parentDir
+    let process =
+      startProcess(projectRoot / "onim", args = ["--stdio"], workingDir = projectRoot)
+    defer:
+      close process
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"rootUri": "file://" & root.replace('\\', '/')},
+      },
+    )
+    check readResponse(process.outputStream, 1) != nil
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "method": "initialized", "params": {}}
+    )
+
+    for request in [(id: 2, uri: firstUri), (id: 3, uri: secondUri)]:
+      sendMessage(
+        process.inputStream,
+        %*{
+          "jsonrpc": "2.0",
+          "id": request.id,
+          "method": "textDocument/codeAction",
+          "params": {
+            "textDocument": {"uri": request.uri},
+            "context": {"only": ["source.organizeImports"]},
+          },
+        },
+      )
+      let actions = readResponse(process.outputStream, request.id)
+      check actions != nil
+      check actions["result"].kind == JArray
+      check actions["result"].len == 1
+      check actions["result"][0]["edit"]["changes"][request.uri][0]["newText"].getStr.contains(
+        "import std/os"
+      )
+
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": nil},
+    )
+    check readResponse(process.outputStream, 4)["result"].kind == JNull
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
+
+  test "drops canceled queued semantic work":
+    let root = getTempDir() / ("onim-queue-cancel-" & $getCurrentProcessId())
+    if dirExists(root):
+      removeFile(root / "first.nim")
+      removeFile(root / "canceled.nim")
+      removeFile(root / "next.nim")
+      removeDir(root)
+    createDir(root)
+    let firstPath = root / "first.nim"
+    let canceledPath = root / "canceled.nim"
+    let nextPath = root / "next.nim"
+    let firstUri = "file://" & firstPath.replace('\\', '/')
+    let canceledUri = "file://" & canceledPath.replace('\\', '/')
+    let nextUri = "file://" & nextPath.replace('\\', '/')
+    let source =
+      "include missing_module\n\nproc main() =\n  for kind, path in walkDir(\"/tmp\"): discard\n"
+    writeFile(firstPath, source)
+    writeFile(canceledPath, source)
+    writeFile(nextPath, source)
+    defer:
+      removeFile(firstPath)
+      removeFile(canceledPath)
+      removeFile(nextPath)
+      removeDir(root)
+
+    let projectRoot = currentSourcePath().parentDir.parentDir
+    let process =
+      startProcess(projectRoot / "onim", args = ["--stdio"], workingDir = projectRoot)
+    defer:
+      close process
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"rootUri": "file://" & root.replace('\\', '/')},
+      },
+    )
+    check readResponse(process.outputStream, 1) != nil
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "method": "initialized", "params": {}}
+    )
+    for request in [(id: 2, uri: firstUri), (id: 3, uri: canceledUri)]:
+      sendMessage(
+        process.inputStream,
+        %*{
+          "jsonrpc": "2.0",
+          "id": request.id,
+          "method": "textDocument/codeAction",
+          "params": {
+            "textDocument": {"uri": request.uri},
+            "context": {"only": ["source.organizeImports"]},
+          },
+        },
+      )
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 3}},
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "textDocument/codeAction",
+        "params": {
+          "textDocument": {"uri": nextUri},
+          "context": {"only": ["source.organizeImports"]},
+        },
+      },
+    )
+
+    var responses: array[5, JsonNode]
+    var remaining = 3
+    while remaining > 0:
+      let message = readMessage(process.outputStream)
+      check message != nil
+      if message.hasKey("id") and message["id"].kind == JInt:
+        let responseId = message["id"].getInt
+        if responseId >= 2 and responseId <= 4 and responses[responseId] == nil:
+          responses[responseId] = message
+          dec remaining
+    check responses[3]["error"]["code"].getInt == -32800
+    check responses[2]["result"].len == 1
+    check responses[2]["result"][0]["edit"]["changes"][firstUri][0]["newText"].getStr.contains(
+      "import std/os"
+    )
+    check responses[4]["result"].len == 1
+    check responses[4]["result"][0]["edit"]["changes"][nextUri][0]["newText"].getStr.contains(
+      "import std/os"
+    )
+
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "id": 5, "method": "shutdown", "params": nil},
+    )
+    check readResponse(process.outputStream, 5)["result"].kind == JNull
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
+
   test "returns organize-imports workspace edit":
     let root = currentSourcePath().parentDir.parentDir
     let filePath = root / "tests" / "before" / "walkdir.nim"
@@ -61,10 +308,21 @@ suite "stdio LSP":
     check initialized != nil
     check initialized["result"]["capabilities"]["codeActionProvider"] != nil
     check initialized["result"]["capabilities"]["definitionProvider"].getBool
+    check initialized["result"]["capabilities"]["typeDefinitionProvider"].getBool
     check initialized["result"]["capabilities"]["hoverProvider"].getBool
     check not initialized["result"]["capabilities"]["renameProvider"]["prepareProvider"].getBool
     check initialized["result"]["capabilities"]["referencesProvider"].getBool
     check initialized["result"]["capabilities"]["documentSymbolProvider"].getBool
+    check initialized["result"]["capabilities"]["documentHighlightProvider"].getBool
+    check initialized["result"]["capabilities"]["foldingRangeProvider"].getBool
+    check initialized["result"]["capabilities"]["selectionRangeProvider"].getBool
+    check initialized["result"]["capabilities"]["signatureHelpProvider"] != nil
+    check initialized["result"]["capabilities"]["semanticTokensProvider"] != nil
+    check initialized["result"]["capabilities"]["semanticTokensProvider"]["full"].getBool
+    check initialized["result"]["capabilities"]["semanticTokensProvider"]["legend"][
+      "tokenTypes"
+    ].len == 8
+    check initialized["result"]["capabilities"]["workspaceSymbolProvider"].getBool
     check not initialized["result"]["capabilities"]["completionProvider"][
       "resolveProvider"
     ].getBool
@@ -212,6 +470,87 @@ suite "stdio LSP":
       process.inputStream,
       %*{
         "jsonrpc": "2.0",
+        "id": 35,
+        "method": "textDocument/semanticTokens/full",
+        "params": {"textDocument": {"uri": definitionUri}},
+      },
+    )
+    let semantic = readResponse(process.outputStream, 35)
+    check semantic != nil
+    let semanticData = semantic["result"]["data"]
+    check semanticData.kind == JArray
+    check semanticData.len >= 20
+    check semanticData[0].getInt == 0
+    check semanticData[1].getInt == 0
+    check semanticData[2].getInt == 3
+    check semanticData[3].getInt == 6
+    check semanticData[4].getInt == 0
+    check semanticData[5].getInt == 0
+    check semanticData[6].getInt == 4
+    check semanticData[7].getInt == 5
+    check semanticData[8].getInt == 3
+    check semanticData[9].getInt == 0
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 36,
+        "method": "workspace/symbol",
+        "params": {"query": "helper"},
+      },
+    )
+    let workspaceSymbols = readResponse(process.outputStream, 36)
+    check workspaceSymbols != nil
+    check workspaceSymbols["result"].kind == JArray
+    var foundHelper = false
+    for item in workspaceSymbols["result"].items:
+      if item["name"].getStr == "helper" and
+          item["location"]["uri"].getStr == definitionUri:
+        foundHelper = true
+    check foundHelper
+
+    let typeDefinitionUri = "file:///tmp/onim-type-definition.nim"
+    let typeDefinitionText =
+      "type Person = object\n  name: string\n\nproc show(person: ref Person) =\n  echo person.name\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": typeDefinitionUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": typeDefinitionText,
+          }
+        },
+      },
+    )
+    check readDiagnostics(process.outputStream, typeDefinitionUri) != nil
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 37,
+        "method": "textDocument/typeDefinition",
+        "params": {
+          "textDocument": {"uri": typeDefinitionUri},
+          "position": {"line": 3, "character": 12},
+        },
+      },
+    )
+    let typeDefinition = readResponse(process.outputStream, 37)
+    check typeDefinition != nil
+    check typeDefinition["result"]["uri"].getStr == typeDefinitionUri
+    check typeDefinition["result"]["range"]["start"]["line"].getInt == 0
+    check typeDefinition["result"]["range"]["start"]["character"].getInt == 5
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
         "id": 6,
         "method": "textDocument/definition",
         "params": {
@@ -226,6 +565,157 @@ suite "stdio LSP":
     check definitionResult["result"]["range"]["start"]["line"].getInt == 1
     check definitionResult["result"]["range"]["start"]["character"].getInt == 5
     check definitionResult["result"]["range"]["end"]["character"].getInt == 11
+
+    let highlightUri = "file:///tmp/onim-highlight.nim"
+    let highlightText = "proc main() =\n  let value = 1\n  echo value\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": highlightUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": highlightText,
+          }
+        },
+      },
+    )
+    check readDiagnostics(process.outputStream, highlightUri) != nil
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 30,
+        "method": "textDocument/documentHighlight",
+        "params": {
+          "textDocument": {"uri": highlightUri}, "position": {"line": 2, "character": 7}
+        },
+      },
+    )
+    let highlights = readResponse(process.outputStream, 30)
+    check highlights != nil
+    check highlights["result"].kind == JArray
+    check highlights["result"].len == 2
+    check highlights["result"][0]["kind"].getInt == 1
+    check highlights["result"][0]["range"]["start"]["line"].getInt == 1
+    check highlights["result"][0]["range"]["start"]["character"].getInt == 6
+    check highlights["result"][1]["range"]["start"]["line"].getInt == 2
+    check highlights["result"][1]["range"]["start"]["character"].getInt == 7
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 31,
+        "method": "textDocument/foldingRange",
+        "params": {"textDocument": {"uri": highlightUri}},
+      },
+    )
+    let folds = readResponse(process.outputStream, 31)
+    check folds != nil
+    check folds["result"].kind == JArray
+    check folds["result"].len == 1
+    check folds["result"][0]["startLine"].getInt == 0
+    check folds["result"][0]["endLine"].getInt == 2
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "textDocument/selectionRange",
+        "params": {
+          "textDocument": {"uri": highlightUri},
+          "positions": [{"line": 2, "character": 7}],
+        },
+      },
+    )
+    let selections = readResponse(process.outputStream, 32)
+    check selections != nil
+    check selections["result"].kind == JArray
+    check selections["result"].len == 1
+    check selections["result"][0]["range"]["start"]["line"].getInt == 2
+    check selections["result"][0]["range"]["start"]["character"].getInt == 7
+    check selections["result"][0]["parent"]["range"]["start"]["line"].getInt == 0
+
+    let signatureUri = "file:///tmp/onim-signature.nim"
+    let signatureText =
+      "proc add(left: int, right: int): int = left + right\n" &
+      "proc main() =\n  discard add(1, \n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": signatureUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": signatureText,
+          }
+        },
+      },
+    )
+    check readDiagnostics(process.outputStream, signatureUri) != nil
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 33,
+        "method": "textDocument/signatureHelp",
+        "params": {
+          "textDocument": {"uri": signatureUri},
+          "position": {"line": 2, "character": 17},
+        },
+      },
+    )
+    let signature = readResponse(process.outputStream, 33)
+    check signature != nil
+    check signature["result"]["signatures"].len == 1
+    check signature["result"]["signatures"][0]["label"].getStr.contains(
+      "proc add(left: int, right: int): int"
+    )
+    check signature["result"]["signatures"][0]["parameters"].len == 2
+    check signature["result"]["activeParameter"].getInt == 1
+
+    let stdlibSignatureUri = "file:///tmp/onim-stdlib-signature.nim"
+    let stdlibSignatureText = "import std/os\nproc main() =\n  discard walkDir(\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": stdlibSignatureUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": stdlibSignatureText,
+          }
+        },
+      },
+    )
+    check readDiagnostics(process.outputStream, stdlibSignatureUri) != nil
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 34,
+        "method": "textDocument/signatureHelp",
+        "params": {
+          "textDocument": {"uri": stdlibSignatureUri},
+          "position": {"line": 2, "character": 18},
+        },
+      },
+    )
+    let stdlibSignature = readResponse(process.outputStream, 34)
+    check stdlibSignature != nil
+    check stdlibSignature["result"]["signatures"].len >= 1
+    check stdlibSignature["result"]["signatures"][0]["label"].getStr.contains("walkDir")
 
     sendMessage(
       process.inputStream,
@@ -582,6 +1072,7 @@ suite "stdio LSP":
     check shutdown != nil
     check shutdown["result"].kind == JNull
     sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
 
   test "bootstraps an unopened project module only for definition":
     let projectRoot = currentSourcePath().parentDir.parentDir
@@ -757,6 +1248,7 @@ suite "stdio LSP":
     )
     check readResponse(process.outputStream, 3)["result"].kind == JNull
     sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
 
   test "bootstraps native cross-file rename with unopened dependents":
     let projectRoot = currentSourcePath().parentDir.parentDir
@@ -873,6 +1365,113 @@ suite "stdio LSP":
     )
     check readResponse(process.outputStream, 4)["result"].kind == JNull
     sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
+
+  test "returns resolved document links for imports and includes":
+    let repoRoot = currentSourcePath().parentDir.parentDir
+    let projectRoot = getTempDir() / ("onim-document-links-" & $getCurrentProcessId())
+    let cacheRoot =
+      getTempDir() / ("onim-document-links-cache-" & $getCurrentProcessId())
+    if dirExists(projectRoot):
+      removeDir(projectRoot)
+    if dirExists(cacheRoot):
+      removeDir(cacheRoot)
+    createDir(projectRoot)
+    let providerPath = projectRoot / "link_provider.nim"
+    let partPath = projectRoot / "link_part.nim"
+    let consumerPath = projectRoot / "link_consumer.nim"
+    let consumer = "import link_provider\ninclude link_part\nlink_provider.answer()\n"
+    writeFile(providerPath, "proc answer*() = discard\n")
+    writeFile(partPath, "const partValue = 1\n")
+    writeFile(consumerPath, consumer)
+    let previousCacheRoot = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
+    defer:
+      if previousCacheRoot.len > 0:
+        putEnv("ONIM_CACHE_DIR", previousCacheRoot)
+      else:
+        delEnv("ONIM_CACHE_DIR")
+      if fileExists(providerPath):
+        removeFile(providerPath)
+      if fileExists(partPath):
+        removeFile(partPath)
+      if fileExists(consumerPath):
+        removeFile(consumerPath)
+      if dirExists(projectRoot):
+        removeDir(projectRoot)
+      if dirExists(cacheRoot):
+        removeDir(cacheRoot)
+
+    let uri = "file://" & consumerPath.replace('\\', '/')
+    let process =
+      startProcess(repoRoot / "onim", args = ["--stdio"], workingDir = repoRoot)
+    defer:
+      close process
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"rootUri": "file://" & projectRoot.replace('\\', '/')},
+      },
+    )
+    let initialized = readResponse(process.outputStream, 1)
+    check initialized["result"]["capabilities"]["documentLinkProvider"][
+      "resolveProvider"
+    ].getBool == false
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "method": "initialized", "params": {}}
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument":
+            {"uri": uri, "languageId": "nim", "version": 1, "text": consumer}
+        },
+      },
+    )
+    discard readDiagnostics(process.outputStream, uri)
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/definition",
+        "params":
+          {"textDocument": {"uri": uri}, "position": {"line": 2, "character": 14}},
+      },
+    )
+    check readResponse(process.outputStream, 2) != nil
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/documentLink",
+        "params": {"textDocument": {"uri": uri}},
+      },
+    )
+    let links = readResponse(process.outputStream, 3)
+    check links["result"].len == 2
+    check links["result"][0]["range"]["start"]["line"].getInt == 0
+    check links["result"][0]["range"]["start"]["character"].getInt == 7
+    check links["result"][0]["range"]["end"]["character"].getInt == 20
+    check links["result"][0]["target"].getStr ==
+      "file://" & providerPath.replace('\\', '/')
+    check links["result"][1]["range"]["start"]["line"].getInt == 1
+    check links["result"][1]["range"]["start"]["character"].getInt == 8
+    check links["result"][1]["range"]["end"]["character"].getInt == 17
+    check links["result"][1]["target"].getStr == "file://" & partPath.replace('\\', '/')
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "id": 4, "method": "shutdown"}
+    )
+    check readResponse(process.outputStream, 4)["result"].kind == JNull
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
 
   test "publishes native project-import diagnostics on first open":
     let projectRoot = currentSourcePath().parentDir.parentDir
@@ -929,6 +1528,7 @@ suite "stdio LSP":
     let missing = readMessage(process.outputStream)
     check missing != nil
     check missing["method"].getStr == "textDocument/publishDiagnostics"
+    check missing["params"]["version"].getInt == 1
     check missing["params"]["diagnostics"].len == 1
     check missing["params"]["diagnostics"][0]["message"].getStr.contains(
       "project import: provider"
@@ -967,6 +1567,7 @@ suite "stdio LSP":
     )
     let resolved = readMessage(process.outputStream)
     check resolved != nil
+    check resolved["params"]["version"].getInt == 2
     check resolved["params"]["diagnostics"].len == 0
 
     sendMessage(
@@ -975,6 +1576,7 @@ suite "stdio LSP":
     )
     check readResponse(process.outputStream, 2)["result"].kind == JNull
     sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
 
   test "returns native field completion with UTF-16 ranges":
     let projectRoot = currentSourcePath().parentDir.parentDir
@@ -1046,3 +1648,413 @@ proc show(person: Person) =
     )
     check readResponse(process.outputStream, 103)["result"].kind == JNull
     sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
+
+  test "validates JSON-RPC envelopes and gates shutdown":
+    let root = currentSourcePath().parentDir.parentDir
+    let process = startProcess(root / "onim", args = ["--stdio"], workingDir = root)
+    defer:
+      close process
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"rootUri": "file://" & root.replace('\\', '/')},
+      },
+    )
+    check readResponse(process.outputStream, 1) != nil
+
+    sendRaw(process.inputStream, "{not-json")
+    let parseError = readMessage(process.outputStream)
+    check parseError["id"].kind == JNull
+    check parseError["error"]["code"].getInt == -32700
+
+    sendRaw(process.inputStream, "{\"jsonrpc\":\"2.0\",\"method\":42}")
+    let invalidRequest = readMessage(process.outputStream)
+    check invalidRequest["id"].kind == JNull
+    check invalidRequest["error"]["code"].getInt == -32600
+
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "shutdown"})
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "id": "unknown", "method": "probe"}
+    )
+    let unknown = readMessage(process.outputStream)
+    check unknown["id"].kind == JString
+    check unknown["id"].getStr == "unknown"
+    check unknown["error"]["code"].getInt == -32601
+
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "id": 2, "method": "shutdown"}
+    )
+    check readResponse(process.outputStream, 2)["result"].kind == JNull
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "id": 3, "method": "probe"})
+    let afterShutdown = readResponse(process.outputStream, 3)
+    check afterShutdown["error"]["code"].getInt == -32600
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "id": 4, "method": "exit"})
+    check readResponse(process.outputStream, 4)["error"]["code"].getInt == -32600
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
+
+  test "rejects malformed method params without mutating the session":
+    let root = currentSourcePath().parentDir.parentDir
+    let filePath = getTempDir() / ("onim-params-" & $getCurrentProcessId() & ".nim")
+    let uri = "file://" & filePath.replace('\\', '/')
+    let source = "proc initial() = discard\n"
+    let changed = "proc changed() = discard\n"
+    writeFile(filePath, source)
+    defer:
+      if fileExists(filePath):
+        removeFile(filePath)
+    let process = startProcess(root / "onim", args = ["--stdio"], workingDir = root)
+    defer:
+      close process
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"rootUri": "file://" & root.replace('\\', '/')},
+      },
+    )
+    check readResponse(process.outputStream, 1) != nil
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {"textDocument": {"uri": uri, "version": "bad", "text": source}},
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didClose",
+        "params": {"textDocument": []},
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": uri}, "text": 1},
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeWatchedFiles",
+        "params": {"changes": [{"uri": uri, "type": 3}, {"uri": 4, "type": 3}]},
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "id": 2, "method": "textDocument/codeAction", "params": []},
+    )
+    let invalidAction = readResponse(process.outputStream, 2)
+    check invalidAction != nil
+    check invalidAction["error"]["code"].getInt == -32602
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/definition",
+        "params":
+          {"textDocument": {"uri": uri}, "position": {"line": "bad", "character": 0}},
+      },
+    )
+    let invalidDefinition = readResponse(process.outputStream, 3)
+    check invalidDefinition != nil
+    check invalidDefinition["error"]["code"].getInt == -32602
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "id": 4,
+        "params": {"textDocument": {"uri": uri, "version": 1, "text": source}},
+      },
+    )
+    let invalidForm = readResponse(process.outputStream, 4)
+    check invalidForm != nil
+    check invalidForm["error"]["code"].getInt == -32600
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {"textDocument": {"uri": uri, "version": 1, "text": source}},
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didClose",
+        "params": {"textDocument": []},
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+          "textDocument": {"uri": uri, "version": 2},
+          "contentChanges": [{"text": changed}],
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "textDocument/documentSymbol",
+        "params": {"textDocument": {"uri": uri}},
+      },
+    )
+    let symbols = readResponse(process.outputStream, 7)
+    check symbols != nil
+    check symbols["result"].len == 1
+    check symbols["result"][0]["name"].getStr == "changed"
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0", "id": 5, "method": "shutdown", "params": {"unexpected": true}
+      },
+    )
+    check readResponse(process.outputStream, 5)["error"]["code"].getInt == -32602
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "method": "exit", "params": {"unexpected": true}},
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "textDocument/documentSymbol",
+        "params": {"textDocument": {"uri": uri}},
+      },
+    )
+    check readResponse(process.outputStream, 8) != nil
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "id": 6, "method": "shutdown", "params": nil},
+    )
+    check readResponse(process.outputStream, 6)["result"].kind == JNull
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "method": "exit", "params": {"unexpected": true}},
+    )
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "id": 9, "method": "probe"})
+    check readResponse(process.outputStream, 9)["error"]["code"].getInt == -32600
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
+
+  test "cancels a pending workspace request":
+    let projectRoot = currentSourcePath().parentDir.parentDir
+    let root = getTempDir() / ("onim-lsp-cancel-" & $getCurrentProcessId())
+    createDir(root)
+    let providerPath = root / "provider.nim"
+    let consumerPath = root / "consumer.nim"
+    writeFile(providerPath, "proc answer*() = discard\n")
+    writeFile(consumerPath, "import provider\nprovider.answer()\n")
+    for index in 0 ..< 256:
+      writeFile(root / ("module" & $index & ".nim"), "proc value*() = discard\n")
+    let consumerUri = "file://" & consumerPath.replace('\\', '/')
+    let process =
+      startProcess(projectRoot / "onim", args = ["--stdio"], workingDir = projectRoot)
+    defer:
+      close process
+      for path in walkDirRec(root):
+        if fileExists(path):
+          removeFile(path)
+      removeDir(root)
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"rootUri": "file://" & root.replace('\\', '/')},
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/definition",
+        "params": {
+          "textDocument": {"uri": consumerUri}, "position": {"line": 1, "character": 9}
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 2}},
+    )
+    check readResponse(process.outputStream, 1) != nil
+    let canceled = readResponse(process.outputStream, 2)
+    check canceled != nil
+    check canceled["error"]["code"].getInt == -32800
+
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": nil},
+    )
+    check readResponse(process.outputStream, 3)["result"].kind == JNull
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
+
+  test "rejects invalid full changes and preserves save versions":
+    let root = currentSourcePath().parentDir.parentDir
+    let filePath = getTempDir() / ("onim-sync-" & $getCurrentProcessId() & ".nim")
+    let uri = "file://" & filePath.replace('\\', '/')
+    let initial = "proc main() = discard\n"
+    let changed = "proc main() =\n  for k, v in walkDir(\"/tmp\"): discard k\n"
+    let saved = "proc main() = discard\n"
+    writeFile(filePath, initial)
+    defer:
+      if fileExists(filePath):
+        removeFile(filePath)
+    let process = startProcess(root / "onim", args = ["--stdio"], workingDir = root)
+    defer:
+      close process
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"rootUri": "file://" & root.replace('\\', '/')},
+      },
+    )
+    check readResponse(process.outputStream, 1) != nil
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "method": "initialized", "params": {}}
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {"textDocument": {"uri": uri, "version": 1, "text": initial}},
+      },
+    )
+    discard readDiagnostics(process.outputStream, uri)
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+          "textDocument": {"uri": uri, "version": 2},
+          "contentChanges": [{"text": changed}, {"text": initial}],
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+          "textDocument": {"uri": uri, "version": 2},
+          "contentChanges": [{"text": changed}],
+        },
+      },
+    )
+    let changedDiagnostics = readDiagnostics(process.outputStream, uri)
+    check changedDiagnostics["params"]["diagnostics"].len == 1
+    check changedDiagnostics["params"]["diagnostics"][0]["message"].getStr.contains(
+      "std/os"
+    )
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+          "textDocument": {"uri": uri, "version": 3},
+          "contentChanges":
+            [{"range": {"start": {"line": 0, "character": 0}}, "text": saved}],
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/codeAction",
+        "params": {
+          "textDocument": {"uri": uri}, "context": {"only": ["source.organizeImports"]}
+        },
+      },
+    )
+    let retainedChange = readResponse(process.outputStream, 2)
+    check retainedChange["result"].len == 1
+    check retainedChange["result"][0]["edit"]["changes"][uri][0]["newText"].getStr.contains(
+      "std/os"
+    )
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": uri}, "text": saved},
+      },
+    )
+    let savedDiagnostics = readDiagnostics(process.outputStream, uri)
+    check savedDiagnostics["params"]["diagnostics"].len == 0
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+          "textDocument": {"uri": uri, "version": 2},
+          "contentChanges": [{"text": changed}],
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/codeAction",
+        "params": {
+          "textDocument": {"uri": uri}, "context": {"only": ["source.organizeImports"]}
+        },
+      },
+    )
+    check readResponse(process.outputStream, 3)["result"].len == 0
+
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "id": 4, "method": "shutdown"}
+    )
+    check readResponse(process.outputStream, 4)["result"].kind == JNull
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0

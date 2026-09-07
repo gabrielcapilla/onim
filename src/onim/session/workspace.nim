@@ -26,12 +26,17 @@ type
     restoreIndexed
     restoreLazy
 
+  InvalidationKind = enum
+    invalidationContent
+    invalidationTopology
+
   WorkspaceSnapshot* = object
     valid*: bool
     id*: SnapshotId
     fileId*: FileId
     path*: string
     uri*: string
+    version*: int64
     text*: string
     state*: WorkspaceFileState
     contentGeneration*: ContentGeneration
@@ -299,6 +304,7 @@ proc moduleCatalog*(workspace: Workspace): ModuleCatalog =
 proc rebuildDependencies(workspace: Workspace)
 proc invalidateAll(workspace: Workspace)
 proc replaceDependencies(workspace: Workspace, id: FileId)
+proc reverseClosure(workspace: Workspace, root: FileId): seq[FileId]
 proc stableDiskSource(
   path: string
 ): tuple[valid: bool, source: string, stamp: FileStamp]
@@ -461,6 +467,45 @@ proc applyBootstrapDependencies(workspace: Workspace, value: BootstrapResult): b
     file.reverse.sortIds
   true
 
+proc sameBootstrapContent(
+    workspace: Workspace, file: FileRecord, bootstrapFile: BootstrapFile
+): bool =
+  if file.state != workspaceOnDisk:
+    return false
+  if file.index != nil:
+    return
+      file.index.contentHash == bootstrapFile.sourceHash and
+      file.index.byteLength == bootstrapFile.byteLength
+  if file.textLoaded:
+    return
+      contentFingerprint(file.text) == bootstrapFile.sourceHash and
+      file.text.len == bootstrapFile.byteLength
+  if workspace.manifestByPath.hasKey(file.path):
+    let entry = workspace.manifestByPath[file.path]
+    return
+      entry.sourceHash == bootstrapFile.sourceHash and
+      entry.byteLength == int64(bootstrapFile.byteLength)
+  false
+
+proc sameBootstrapDependencies(
+    workspace: Workspace, id: FileId, forward: openArray[string]
+): bool =
+  let index = id.recordIndex
+  if index < 0 or index >= workspace.files.len:
+    return false
+  var expected = newSeqOfCap[FileId](forward.len)
+  for path in forward:
+    if not workspace.paths.hasKey(path):
+      return false
+    expected.add workspace.paths[path]
+  expected.sortIds
+  if workspace.files[index].forward.len != expected.len:
+    return false
+  for position in 0 ..< expected.len:
+    if uint32(workspace.files[index].forward[position]) != uint32(expected[position]):
+      return false
+  true
+
 proc adoptWorkspaceState(destination, source: Workspace) =
   destination.root = source.root
   destination.manifest = source.manifest
@@ -494,11 +539,8 @@ proc applyBootstrap*(workspace: Workspace, value: BootstrapResult): bool =
   for file in value.files:
     let path = file.path
     present.incl path
-    var id: FileId
-    if candidate.paths.hasKey(path):
-      id = candidate.paths[path]
-    else:
-      id = FileId(candidate.nextFileId)
+    if not candidate.paths.hasKey(path):
+      let id = FileId(candidate.nextFileId)
       inc candidate.nextFileId
       candidate.paths[path] = id
       candidate.files.add FileRecord(
@@ -512,20 +554,13 @@ proc applyBootstrap*(workspace: Workspace, value: BootstrapResult): bool =
         forward: @[],
         reverse: @[],
       )
-    let index = id.recordIndex
-    if candidate.files[index].state == workspaceOpen:
-      continue
-    candidate.files[index].state = workspaceOnDisk
-    candidate.files[index].version = -1
-    candidate.files[index].text = ""
-    candidate.files[index].textLoaded = false
-    candidate.files[index].stamp = file.stamp
-    candidate.files[index].index = nil
-    candidate.files[index].contentGeneration = candidate.nextContent()
 
+  var changedRoots: seq[FileId] = @[]
   for index in 0 ..< candidate.files.len:
     if candidate.files[index].state != workspaceOpen and
-        not present.contains(candidate.files[index].path):
+        not present.contains(candidate.files[index].path) and
+        candidate.files[index].state != workspaceMissing:
+      addUniqueId(changedRoots, candidate.files[index].id)
       candidate.files[index].state = workspaceMissing
       candidate.files[index].text = ""
       candidate.files[index].textLoaded = true
@@ -533,8 +568,29 @@ proc applyBootstrap*(workspace: Workspace, value: BootstrapResult): bool =
       candidate.files[index].index = indexSource("")
       candidate.files[index].contentGeneration = candidate.nextContent()
 
-  candidate.moduleCatalogCache = nil
-  candidate.invalidateProjectSurface()
+  for file in value.files:
+    let id = candidate.paths[file.path]
+    let index = id.recordIndex
+    if candidate.files[index].state == workspaceOpen:
+      continue
+    let sameContent = sameBootstrapContent(candidate, candidate.files[index], file)
+    let sameGraph =
+      sameBootstrapDependencies(candidate, id, file.forward) and
+      ((uint32(id) in candidate.unresolved) == file.unresolved)
+    if not sameContent or not sameGraph:
+      addUniqueId(changedRoots, id)
+    candidate.files[index].state = workspaceOnDisk
+    candidate.files[index].version = -1
+    candidate.files[index].text = ""
+    candidate.files[index].textLoaded = false
+    candidate.files[index].stamp = file.stamp
+    if not sameContent:
+      candidate.files[index].index = nil
+      candidate.files[index].contentGeneration = candidate.nextContent()
+
+  if changedRoots.len > 0:
+    candidate.moduleCatalogCache = nil
+    candidate.invalidateProjectSurface()
   candidate.manifest = bootstrapManifest(value)
   candidate.manifestByPath.clear()
   for entry in candidate.manifest.entries:
@@ -545,7 +601,21 @@ proc applyBootstrap*(workspace: Workspace, value: BootstrapResult): bool =
     if not candidate.applyBootstrapDependencies(value):
       return false
     candidate.invalidated.setLen(0)
-    candidate.invalidateAll()
+    if changedRoots.len > 0:
+      var affected: seq[FileId] = @[]
+      for root in changedRoots:
+        for id in workspace.reverseClosure(root):
+          addUniqueId(affected, id)
+        for id in candidate.reverseClosure(root):
+          addUniqueId(affected, id)
+      candidate.bumpSnapshot()
+      for id in affected:
+        let index = id.recordIndex
+        if index >= 0 and index < candidate.files.len:
+          candidate.files[index].dependencyGeneration =
+            DependencyGeneration(uint64(candidate.snapshotId))
+          addUniqueId(candidate.invalidated, id)
+      sortIds(candidate.invalidated)
   except CatchableError:
     return false
 
@@ -587,13 +657,6 @@ proc replaceDependencies(workspace: Workspace, id: FileId) =
   var unresolved = false
   if workspace.files[index].index != nil:
     for reference in workspace.files[index].index.imports:
-      let dependency =
-        resolveReference(workspace, workspace.files[index].path, reference)
-      if dependency.valid:
-        addUniqueId(workspace.files[index].forward, dependency)
-      elif not reference.startsWith("std/") and reference != "std":
-        unresolved = true
-    for reference in workspace.files[index].index.exports:
       let dependency =
         resolveReference(workspace, workspace.files[index].path, reference)
       if dependency.valid:
@@ -709,11 +772,17 @@ proc reverseClosure(workspace: Workspace, root: FileId): seq[FileId] =
       queue.add dependent
   result.sortIds
 
-proc invalidateDependents(workspace: Workspace, root: FileId): seq[FileId] =
+proc invalidateDependents(
+    workspace: Workspace, root: FileId, kind = invalidationContent
+): seq[FileId] =
   result = reverseClosure(workspace, root)
-  for unresolvedId in workspace.unresolved:
-    for dependent in reverseClosure(workspace, FileId(unresolvedId)):
-      addUniqueId(result, dependent)
+  case kind
+  of invalidationContent:
+    discard
+  of invalidationTopology:
+    for unresolvedId in workspace.unresolved:
+      for dependent in reverseClosure(workspace, FileId(unresolvedId)):
+        addUniqueId(result, dependent)
   if result.len == 0:
     return
   workspace.bumpSnapshot()
@@ -757,7 +826,8 @@ proc installText(
         workspace.files[index].index.contentHash != contentFingerprint(text) or
         workspace.files[index].index.byteLength != text.len
   workspace.files[index].state = state
-  workspace.files[index].version = version
+  if version >= 0 or state != workspaceOpen or workspace.files[index].version < 0:
+    workspace.files[index].version = version
   workspace.files[index].text = text
   workspace.files[index].textLoaded = true
   workspace.files[index].stamp =
@@ -870,6 +940,7 @@ proc ensureText(workspace: Workspace, id: FileId, invalidate = true): bool =
   discard workspace.installDiskText(id, stable.source, stable.stamp, invalidate)
   if wasMissing:
     workspace.rebuildDependencies()
+    discard workspace.invalidateDependents(id, invalidationTopology)
   workspace.persistManifest()
   true
 
@@ -933,6 +1004,8 @@ proc indexWorkspaceImpl(workspace: Workspace): bool =
     let ensured = ensureRecord(workspace, path)
     if hadRecords and ensured.created:
       topologyChanged = true
+    elif hadRecords and workspace.files[ensured.id.recordIndex].state == workspaceMissing:
+      topologyChanged = true
 
   for index in 0 ..< workspace.files.len:
     if workspace.files[index].state != workspaceOpen and
@@ -971,13 +1044,19 @@ proc indexWorkspaceImpl(workspace: Workspace): bool =
         let id = workspace.paths[path]
         let index = id.recordIndex
         let entry = workspace.manifestByPath[path]
+        let sameContent =
+          workspace.files[index].state == workspaceOnDisk and
+          workspace.files[index].index != nil and
+          workspace.files[index].index.contentHash == entry.sourceHash and
+          workspace.files[index].index.byteLength == int(entry.byteLength)
         workspace.files[index].state = workspaceOnDisk
         workspace.files[index].version = -1
         workspace.files[index].text = ""
         workspace.files[index].textLoaded = false
         workspace.files[index].stamp = entry.stamp
-        workspace.files[index].index = nil
-        workspace.files[index].contentGeneration = workspace.nextContent()
+        if not sameContent:
+          workspace.files[index].index = nil
+          workspace.files[index].contentGeneration = workspace.nextContent()
       lazyRestored = workspace.restoreDependencies(restoreLazy)
 
   for path in paths:
@@ -996,24 +1075,36 @@ proc indexWorkspaceImpl(workspace: Workspace): bool =
           workspace.root, path, entry.sourceHash, int(entry.byteLength)
         )
         if cached != nil:
+          let sameContent =
+            workspace.files[id.recordIndex].state == workspaceOnDisk and
+            workspace.files[id.recordIndex].index != nil and
+            workspace.files[id.recordIndex].index.contentHash == entry.sourceHash and
+            workspace.files[id.recordIndex].index.byteLength == int(entry.byteLength)
           workspace.files[id.recordIndex].state = workspaceOnDisk
           workspace.files[id.recordIndex].version = -1
           workspace.files[id.recordIndex].text = ""
           workspace.files[id.recordIndex].textLoaded = false
           workspace.files[id.recordIndex].stamp = stamp
-          workspace.files[id.recordIndex].index = cached
-          workspace.files[id.recordIndex].contentGeneration = workspace.nextContent()
+          if not sameContent:
+            workspace.files[id.recordIndex].index = cached
+            workspace.files[id.recordIndex].contentGeneration = workspace.nextContent()
           continue
     let stable = stableDiskSource(path)
     if stable.valid:
+      let indexed = workspace.indexDiskSource(path, stable.source)
+      let sameContent =
+        workspace.files[id.recordIndex].state == workspaceOnDisk and
+        workspace.files[id.recordIndex].index != nil and indexed != nil and
+        workspace.files[id.recordIndex].index.contentHash == indexed.contentHash and
+        workspace.files[id.recordIndex].index.byteLength == indexed.byteLength
       workspace.files[id.recordIndex].text = stable.source
       workspace.files[id.recordIndex].textLoaded = true
       workspace.files[id.recordIndex].state = workspaceOnDisk
       workspace.files[id.recordIndex].version = -1
       workspace.files[id.recordIndex].stamp = stable.stamp
-      workspace.files[id.recordIndex].index =
-        workspace.indexDiskSource(path, stable.source)
-      workspace.files[id.recordIndex].contentGeneration = workspace.nextContent()
+      if not sameContent:
+        workspace.files[id.recordIndex].index = indexed
+        workspace.files[id.recordIndex].contentGeneration = workspace.nextContent()
       workspace.files[id.recordIndex].text = ""
       workspace.files[id.recordIndex].textLoaded = false
       if hadRecords and wasMissing:
@@ -1081,8 +1172,20 @@ proc fileIdForPath*(workspace: Workspace, path: string): FileId =
   else:
     InvalidFileId
 
+proc isOpenDocument*(workspace: Workspace, path: string): bool =
+  let id = workspace.fileIdForPath(path)
+  id.valid and workspace.files[id.recordIndex].state == workspaceOpen
+
 proc fileCount*(workspace: Workspace): int =
   workspace.files.len
+
+proc fileIds*(workspace: Workspace): seq[FileId] =
+  if workspace == nil:
+    return
+  result = newSeqOfCap[FileId](workspace.files.len)
+  for file in workspace.files:
+    if file.state != workspaceMissing:
+      result.add file.id
 
 proc dependencies*(workspace: Workspace, id: FileId): seq[FileId] =
   let index = id.recordIndex
@@ -1137,10 +1240,17 @@ proc openDocument*(
     return
   if ensured.created:
     rebuildDependencies(workspace)
+    discard workspace.invalidateDependents(result, invalidationTopology)
 
 proc changeDocument*(
     workspace: Workspace, uri, path, text: string, version: int64
 ): bool =
+  let known = workspace.fileIdForPath(path)
+  if known.valid:
+    let index = known.recordIndex
+    if workspace.files[index].state == workspaceOpen and version >= 0 and
+        workspace.files[index].version >= 0 and version <= workspace.files[index].version:
+      return false
   workspace.bumpWorkspaceGeneration()
   let ensured = ensureRecord(workspace, path)
   if not ensured.id.valid:
@@ -1149,6 +1259,7 @@ proc changeDocument*(
   result = installText(workspace, ensured.id, text, workspaceOpen, version, true)
   if ensured.created:
     rebuildDependencies(workspace)
+    discard workspace.invalidateDependents(ensured.id, invalidationTopology)
 
 proc refreshDiskFile*(workspace: Workspace, path: string, deleted = false) =
   workspace.bumpWorkspaceGeneration()
@@ -1173,6 +1284,7 @@ proc refreshDiskFile*(workspace: Workspace, path: string, deleted = false) =
   if topologyChanged:
     workspace.moduleCatalogCache = nil
     rebuildDependencies(workspace)
+    discard workspace.invalidateDependents(ensured.id, invalidationTopology)
   workspace.persistManifest()
 
 proc closeDocument*(workspace: Workspace, uri, path: string) =
@@ -1209,6 +1321,11 @@ proc fileChanged*(workspace: Workspace, path: string, deleted = false) =
   elif lower.endsWith(".nim"):
     workspace.refreshDiskFile(path, deleted)
 
+proc releaseDiskText(workspace: Workspace, index: int) =
+  if workspace.files[index].state == workspaceOnDisk:
+    workspace.files[index].text = ""
+    workspace.files[index].textLoaded = false
+
 proc snapshotForDocument*(workspace: Workspace, uri, path: string): WorkspaceSnapshot =
   let id = workspace.fileIdForPath(path)
   if id.valid:
@@ -1233,6 +1350,7 @@ proc snapshotForDocument*(workspace: Workspace, uri, path: string): WorkspaceSna
       uri
     else:
       workspace.files[index].uri
+  result.version = workspace.files[index].version
   result.text = workspace.files[index].text
   result.state = workspace.files[index].state
   result.contentGeneration = workspace.files[index].contentGeneration
@@ -1240,6 +1358,7 @@ proc snapshotForDocument*(workspace: Workspace, uri, path: string): WorkspaceSna
   result.configGeneration = workspace.configGeneration
   result.surfaceGeneration = workspace.surfaceGeneration
   result.index = workspace.files[index].index
+  workspace.releaseDiskText(index)
 
 proc snapshotForFile*(workspace: Workspace, id: FileId): WorkspaceSnapshot =
   let index = id.recordIndex
@@ -1251,6 +1370,7 @@ proc snapshotForFile*(workspace: Workspace, id: FileId): WorkspaceSnapshot =
   result.fileId = id
   result.path = workspace.files[index].path
   result.uri = workspace.files[index].uri
+  result.version = workspace.files[index].version
   result.text = workspace.files[index].text
   result.state = workspace.files[index].state
   result.contentGeneration = workspace.files[index].contentGeneration
@@ -1258,6 +1378,7 @@ proc snapshotForFile*(workspace: Workspace, id: FileId): WorkspaceSnapshot =
   result.configGeneration = workspace.configGeneration
   result.surfaceGeneration = workspace.surfaceGeneration
   result.index = workspace.files[index].index
+  workspace.releaseDiskText(index)
 
 proc indexViewForFile*(workspace: Workspace, id: FileId): WorkspaceIndexView =
   let index = id.recordIndex

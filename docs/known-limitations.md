@@ -4,7 +4,7 @@ Onim is under active development. The following limitations are intentionally do
 
 ## Semantic coverage
 
-The native analyzer is conservative. It does not yet model all Nim overload resolution, generic instantiation, UFCS, macro/template expansion, generated declarations, conditional compilation, or compiler effects. Those cases may produce no native result or may use the isolated compiler/nimsuggest boundary. A `null` or incomplete result is safer than inventing a definition, completion item, reference, rename, or import edit.
+The native analyzer is conservative. It supports exact same-file and directly imported-project UFCS candidates for indexed local receiver types, with arity selection for complete balanced calls with fixed signatures. Direct routine returns with exact primitive `seq[...]` types retain their originating snapshot while resolving UFCS members. It also supports fields on explicit unary generic-object instances such as `Box[int]`. Directly resolved macro/template calls are classified as generated uncertainty and intentionally produce no native type. It does not yet model default/varargs overloads, generic procedure inference, multi-argument or constrained generic instantiation, element-field access through indexed containers, nested containers, macro/template expansion, generated declarations, conditional compilation, or compiler effects. Conditional, aliased, excluded, or uncertain imports may produce no native result or may use the isolated compiler/nimsuggest boundary. A `null` or incomplete result is safer than inventing a definition, completion item, reference, rename, or import edit.
 
 ## Editing diagnostics
 
@@ -12,7 +12,7 @@ Phantom diagnostics have been observed while editing Nim files in Zed. The exact
 
 ## Process lifetime and memory
 
-Reports include multiple Onim processes remaining alive and sessions whose total resident memory exceeds 2 GiB. This is not an intended memory budget or a validated normal operating profile. The process model and retained workspace/compiler state require measurement on a reproducible project before optimization claims can be made.
+Reports include multiple Onim processes remaining alive and sessions whose total resident memory exceeds 2 GiB. A corrected local Linux probe measured 24.8 MiB parent RSS plus 48.1 MiB semantic-child RSS for a fallback request, 72.7 MiB combined RSS, and no 2 GiB reproduction. The LSP transcript suite also now waits for every process and leaves no Onim child behind. Zed-specific reports remain open until they can be reproduced with the evidence below.
 
 When investigating, capture:
 

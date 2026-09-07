@@ -1,4 +1,4 @@
-import std/[algorithm, strutils]
+import std/algorithm
 
 import ../syntax/lexer
 import ../syntax/parser
@@ -74,36 +74,43 @@ proc isRoutineKeyword(token: Token): bool {.inline.} =
 proc isBlockKeyword(token: Token): bool {.inline.} =
   token.hasKeywordRole(roleBlock)
 
-proc pushDelimiter(stack: var seq[char], text: string): bool {.inline.} =
-  if text.len != 1 or not isOpeningDelimiter(text[0]):
+proc pushDelimiter(
+    stack: var seq[char], tokens: TokenStore, token: Token
+): bool {.inline.} =
+  if tokens.tokenTextLen(token) != 1 or
+      not isOpeningDelimiter(tokens.tokenTextChar(token, 0)):
     return false
-  stack.add text[0]
+  stack.add tokens.tokenTextChar(token, 0)
   true
 
-proc popDelimiter(stack: var seq[char], text: string): bool {.inline.} =
-  if text.len != 1 or not isClosingDelimiter(text[0]) or stack.len == 0:
+proc popDelimiter(
+    stack: var seq[char], tokens: TokenStore, token: Token
+): bool {.inline.} =
+  if tokens.tokenTextLen(token) != 1 or
+      not isClosingDelimiter(tokens.tokenTextChar(token, 0)) or stack.len == 0:
     return false
-  if not matchingDelimiter(stack[^1], text[0]):
+  if not matchingDelimiter(stack[^1], tokens.tokenTextChar(token, 0)):
     return false
   stack.setLen(stack.len - 1)
   true
 
-proc markMalformed[T](tokens: T, result: var ScopeIndex) =
+proc markMalformed(tokens: TokenStore, result: var ScopeIndex) {.gcsafe.} =
   var delimiters: seq[char] = @[]
   for token in tokens:
     if malformedToken(token):
       result.uncertainty.incl scopeMalformed
     if token.kind != tkPunctuation:
       continue
-    if pushDelimiter(delimiters, token.text):
+    if pushDelimiter(delimiters, tokens, token):
       continue
-    if token.text.len == 1 and isClosingDelimiter(token.text[0]) and
-        not popDelimiter(delimiters, token.text):
+    if tokens.tokenTextLen(token) == 1 and
+        isClosingDelimiter(tokens.tokenTextChar(token, 0)) and
+        not popDelimiter(delimiters, tokens, token):
       result.uncertainty.incl scopeMalformed
   if delimiters.len > 0:
     result.uncertainty.incl scopeMalformed
 
-proc markGlobalUncertainty[T](tokens: T, result: var ScopeIndex) =
+proc markGlobalUncertainty(tokens: TokenStore, result: var ScopeIndex) {.gcsafe.} =
   for token in tokens:
     if token.kind != tkIdentifier or not validIdentifier(token) or isStropped(token):
       continue
@@ -114,22 +121,25 @@ proc markGlobalUncertainty[T](tokens: T, result: var ScopeIndex) =
     elif token.hasKeywordRole(roleGenerated):
       result.uncertainty.incl scopeGenerated
 
-proc matchingParen[T](tokens: T, opening: int): tuple[closing: int, valid: bool] =
+proc matchingParen(
+    tokens: TokenStore, opening: int
+): tuple[closing: int, valid: bool] {.gcsafe.} =
   var stack: seq[char] = @[]
   for index in opening ..< tokens.len:
-    let text = tokens[index].text
-    if pushDelimiter(stack, text):
+    let token = tokens[index]
+    if pushDelimiter(stack, tokens, token):
       continue
-    if text.len == 1 and text[0] in {')', ']', '}'}:
-      if not popDelimiter(stack, text):
+    if tokens.tokenTextLen(token) == 1 and
+        tokens.tokenTextChar(token, 0) in {')', ']', '}'}:
+      if not popDelimiter(stack, tokens, token):
         return (-1, false)
       if stack.len == 0:
         return (index, true)
   (-1, false)
 
-proc routineHeader[T](
-    tokens: T, nameToken: int
-): tuple[start, opening, closing, equals: int, valid, hasBody: bool] =
+proc routineHeader(
+    tokens: TokenStore, nameToken: int
+): tuple[start, opening, closing, equals: int, valid, hasBody: bool] {.gcsafe.} =
   result.start = nameToken - 1
   result.opening = -1
   result.closing = -1
@@ -140,15 +150,15 @@ proc routineHeader[T](
 
   var cursor = nameToken + 1
   while cursor < tokens.len:
-    if tokens[cursor].text == "(":
+    if tokens.tokenTextEquals(tokens[cursor], "("):
       result.opening = cursor
       break
-    if tokens[cursor].text == "=":
+    if tokens.tokenTextEquals(tokens[cursor], "="):
       result.equals = cursor
       result.valid = true
       result.hasBody = tokens[cursor].line == tokens[result.start].line
       return
-    if tokens[cursor].text == ";" or
+    if tokens.tokenTextEquals(tokens[cursor], ";") or
         (tokens[cursor].line > tokens[result.start].line and tokens[cursor].column == 0):
       result.valid = true
       return
@@ -166,17 +176,20 @@ proc routineHeader[T](
   cursor = result.closing + 1
   var depth = 0
   while cursor < tokens.len:
-    let text = tokens[cursor].text
-    if text == "(" or text == "[" or text == "{":
+    if tokens.tokenTextEquals(tokens[cursor], "(") or
+        tokens.tokenTextEquals(tokens[cursor], "[") or
+        tokens.tokenTextEquals(tokens[cursor], "{"):
       inc depth
-    elif text == ")" or text == "]" or text == "}":
+    elif tokens.tokenTextEquals(tokens[cursor], ")") or
+        tokens.tokenTextEquals(tokens[cursor], "]") or
+        tokens.tokenTextEquals(tokens[cursor], "}"):
       if depth == 0:
         return
       dec depth
-    elif text == "=" and depth == 0:
+    elif tokens.tokenTextEquals(tokens[cursor], "=") and depth == 0:
       result.equals = cursor
       break
-    elif text == ";" and depth == 0:
+    elif tokens.tokenTextEquals(tokens[cursor], ";") and depth == 0:
       break
     elif tokens[cursor].line > tokens[result.start].line and tokens[cursor].column == 0 and
         depth == 0:
@@ -186,32 +199,34 @@ proc routineHeader[T](
   if result.equals < 0:
     if cursor > result.closing + 1 or (
       cursor < tokens.len and tokens[cursor].line == tokens[result.start].line and
-      tokens[cursor].text != ";"
+      not tokens.tokenTextEquals(tokens[cursor], ";")
     ):
       result.valid = false
     return
   result.hasBody = tokens[result.equals].line == tokens[result.start].line
 
-proc declarationGroup[T](
-    tokens: T,
+proc declarationGroup(
+    tokens: TokenStore,
     first, last: int,
     scope: ScopeId,
     kind: LexicalDeclarationKind,
     declarations: var seq[LexicalDeclaration],
-): bool =
+): bool {.gcsafe.} =
   if first >= last:
     return true
   var split = -1
   var delimiters: seq[char] = @[]
   for index in first ..< last:
-    let text = tokens[index].text
-    if pushDelimiter(delimiters, text):
+    let token = tokens[index]
+    if pushDelimiter(delimiters, tokens, token):
       continue
-    if text.len == 1 and text[0] in {')', ']', '}'}:
-      if not popDelimiter(delimiters, text):
+    if tokens.tokenTextLen(token) == 1 and
+        tokens.tokenTextChar(token, 0) in {')', ']', '}'}:
+      if not popDelimiter(delimiters, tokens, token):
         return false
       continue
-    if delimiters.len == 0 and (text == ":" or text == "="):
+    if delimiters.len == 0 and
+        (tokens.tokenTextEquals(token, ":") or tokens.tokenTextEquals(token, "=")):
       split = index
       break
   if split < 0:
@@ -221,7 +236,7 @@ proc declarationGroup[T](
   var names = 0
   for index in first ..< split:
     let token = tokens[index]
-    if token.text == ",":
+    if tokens.tokenTextEquals(token, ","):
       expectedName = true
     elif token.kind == tkIdentifier and not isValidNimKeyword(token):
       if not expectedName:
@@ -235,8 +250,8 @@ proc declarationGroup[T](
       )
       expectedName = false
       inc names
-    elif token.isKeyword(kwVar) or token.isKeyword(kwOut) or token.text == "sink" or
-        token.text == "lent":
+    elif token.isKeyword(kwVar) or token.isKeyword(kwOut) or
+        tokens.tokenTextEquals(token, "sink") or tokens.tokenTextEquals(token, "lent"):
       discard
     else:
       return false
@@ -245,23 +260,60 @@ proc declarationGroup[T](
 
   delimiters.setLen(0)
   for index in split + 1 ..< last:
-    let text = tokens[index].text
-    if pushDelimiter(delimiters, text):
+    let token = tokens[index]
+    if pushDelimiter(delimiters, tokens, token):
       continue
-    if text.len == 1 and text[0] in {')', ']', '}'}:
-      if not popDelimiter(delimiters, text):
+    if tokens.tokenTextLen(token) == 1 and
+        tokens.tokenTextChar(token, 0) in {')', ']', '}'}:
+      if not popDelimiter(delimiters, tokens, token):
         return false
       continue
-    if delimiters.len == 0 and text == ":":
+    if delimiters.len == 0 and tokens.tokenTextEquals(token, ":"):
       return false
   true
 
-proc parameters[T](
-    tokens: T,
+proc loopHeaderEnd(tokens: TokenStore, first, past: int): int {.inline.} =
+  for index in first ..< past:
+    if tokens[index].isKeyword(kwIn):
+      return index
+  -1
+
+proc loopDeclarationGroup(
+    tokens: TokenStore,
+    first, last: int,
+    scope: ScopeId,
+    declarations: var seq[LexicalDeclaration],
+): bool {.gcsafe.} =
+  if first >= last:
+    return false
+  var expectedName = true
+  var names = 0
+  for index in first ..< last:
+    let token = tokens[index]
+    if tokens.tokenTextEquals(token, ","):
+      expectedName = true
+    elif token.kind == tkIdentifier and not isValidNimKeyword(token):
+      if not expectedName:
+        return false
+      declarations.add LexicalDeclaration(
+        scope: scope,
+        kind: declarationParameter,
+        nameToken: uint32(index),
+        firstToken: uint32(first),
+        pastToken: uint32(last),
+      )
+      expectedName = false
+      inc names
+    else:
+      return false
+  names > 0 and not expectedName
+
+proc parameters(
+    tokens: TokenStore,
     opening, closing: int,
     scope: ScopeId,
     declarations: var seq[LexicalDeclaration],
-): bool =
+): bool {.gcsafe.} =
   if opening < 0 or closing <= opening:
     return true
   let before = declarations.len
@@ -269,15 +321,16 @@ proc parameters[T](
   var delimiters: seq[char] = @[]
   var cursor = first
   while cursor < closing:
-    let text = tokens[cursor].text
-    if pushDelimiter(delimiters, text):
+    let token = tokens[cursor]
+    if pushDelimiter(delimiters, tokens, token):
       inc cursor
       continue
-    if text.len == 1 and text[0] in {')', ']', '}'}:
-      if not popDelimiter(delimiters, text):
+    if tokens.tokenTextLen(token) == 1 and
+        tokens.tokenTextChar(token, 0) in {')', ']', '}'}:
+      if not popDelimiter(delimiters, tokens, token):
         declarations.setLen(before)
         return false
-    elif delimiters.len == 0 and text == ";":
+    elif delimiters.len == 0 and tokens.tokenTextEquals(token, ";"):
       if not declarationGroup(
         tokens, first, cursor, scope, declarationParameter, declarations
       ):
@@ -292,9 +345,9 @@ proc parameters[T](
     return false
   true
 
-proc bodyBounds[T](
-    tokens: T, equals: int
-): tuple[first, past, baseColumn: int, valid: bool] =
+proc bodyBounds(
+    tokens: TokenStore, equals: int
+): tuple[first, past, baseColumn: int, valid: bool] {.gcsafe.} =
   if equals < 0 or equals + 1 >= tokens.len:
     return
   result.first = equals + 1
@@ -302,7 +355,7 @@ proc bodyBounds[T](
   if tokens[result.first].line == tokens[equals].line:
     result.past = result.first
     while result.past < tokens.len and tokens[result.past].line == tokens[equals].line and
-        tokens[result.past].text != ";":
+        not tokens.tokenTextEquals(tokens[result.past], ";"):
       inc result.past
     result.valid = result.past > result.first
     return
@@ -317,49 +370,80 @@ proc bodyBounds[T](
     inc result.past
   result.valid = result.past > result.first
 
-proc statementStart[T](tokens: T, index, first, baseColumn: int): bool =
+proc statementStart(
+    tokens: TokenStore, index, first, baseColumn: int
+): bool {.gcsafe.} =
   if index == first:
     return true
-  if tokens[index].text == ";":
+  if tokens.tokenTextEquals(tokens[index], ";"):
     return false
-  if tokens[index - 1].text == ";":
+  if tokens.tokenTextEquals(tokens[index - 1], ";"):
     return true
   tokens[index].line != tokens[index - 1].line and tokens[index].column == baseColumn
 
-proc localDeclarationEnd[T](tokens: T, start, past, baseColumn: int): int =
+proc localDeclarationEnd(
+    tokens: TokenStore, start, past, baseColumn: int
+): int {.gcsafe.} =
   result = start + 1
   while result < past:
-    if tokens[result].text == ";":
+    if tokens.tokenTextEquals(tokens[result], ";"):
       break
     if tokens[result].line > tokens[start].line and tokens[result].column <= baseColumn:
       break
     inc result
 
-proc blockScopeStartingAt(index: ScopeIndex, token: uint32): ScopeId {.inline.} =
+proc blockScopeStartingAt(
+    index: ScopeIndex, token: uint32
+): ScopeId {.inline, gcsafe.} =
   for ordinal, scope in index.scopes:
     if scope.kind == scopeBlock and scope.firstToken == token:
       return ScopeId(uint32(ordinal + 1))
 
-proc syntaxAllowsBlocks(tree: PartialSyntaxTree): bool =
+proc syntaxAllowsBlocks(tree: PartialSyntaxTree): bool {.gcsafe.} =
   if not tree.validateSyntaxTree:
     return false
   for reason in tree.uncertainty:
     case reason
-    of parserMalformed, parserUnbalanced, parserUnsupportedStructure:
+    of parserMalformed, parserUnbalanced, parserIncomplete, parserUnsupportedStructure:
       return false
     of parserNestedDeclaration:
       discard
   true
 
-proc routineBodyEnd[T](tokens: T, past, byteLength: int): int
+proc routineBodyEnd(tokens: TokenStore, past, byteLength: int): int {.gcsafe.}
 
-proc addBlockScopes[T](
-    tokens: T,
+proc appendBlockScope(
+    tokens: TokenStore,
+    routineScope: ScopeId,
+    first, past, byteLength: int,
+    scopeIndex: var ScopeIndex,
+) {.gcsafe.} =
+  var parent = routineScope
+  for ordinal, candidate in scopeIndex.scopes:
+    if candidate.kind != scopeBlock or candidate.firstToken >= uint32(first) or
+        candidate.pastToken < uint32(past):
+      continue
+    let parentOrdinal = int(uint32(parent)) - 1
+    if parentOrdinal < 0 or
+        candidate.firstToken >= scopeIndex.scopes[parentOrdinal].firstToken:
+      parent = ScopeId(uint32(ordinal + 1))
+  scopeIndex.scopes.add ScopeInterval(
+    parent: parent,
+    kind: scopeBlock,
+    ownerSymbol: invalidScopeOwner,
+    firstToken: uint32(first),
+    pastToken: uint32(past),
+    startOffset: tokens[first].startOffset,
+    endOffset: routineBodyEnd(tokens, past, byteLength),
+  )
+
+proc addBlockScopes(
+    tokens: TokenStore,
     syntax: PartialSyntaxTree,
     routineScope: ScopeId,
     byteLength: int,
     scopeIndex: var ScopeIndex,
-): bool =
+): bool {.gcsafe.} =
   if not syntax.syntaxAllowsBlocks:
     return false
   let routineOrdinal = int(uint32(routineScope)) - 1
@@ -373,7 +457,8 @@ proc addBlockScopes[T](
     let first = int(node.firstToken)
     let past = int(node.pastToken)
     if first < 0 or first + 1 >= tokens.len or past <= first + 1 or past > tokens.len or
-        tokens[first + 1].text != ":" or tokens[first + 1].line != tokens[first].line:
+        not tokens.tokenTextEquals(tokens[first + 1], ":") or
+        tokens[first + 1].line != tokens[first].line:
       scopeIndex.uncertainty.incl scopeNestedBlock
       continue
     let body = first + 2
@@ -382,39 +467,40 @@ proc addBlockScopes[T](
       scopeIndex.uncertainty.incl scopeNestedBlock
       continue
 
-    var parent = routineScope
-    for ordinal, candidate in scopeIndex.scopes:
-      if candidate.kind != scopeBlock or candidate.firstToken >= node.firstToken or
-          candidate.pastToken < node.pastToken:
-        continue
-      let parentOrdinal = int(uint32(parent)) - 1
-      if parentOrdinal < 0 or
-          candidate.firstToken >= scopeIndex.scopes[parentOrdinal].firstToken:
-        parent = ScopeId(uint32(ordinal + 1))
+    appendBlockScope(tokens, routineScope, first, past, byteLength, scopeIndex)
 
-    scopeIndex.scopes.add ScopeInterval(
-      parent: parent,
-      kind: scopeBlock,
-      ownerSymbol: invalidScopeOwner,
-      firstToken: node.firstToken,
-      pastToken: node.pastToken,
-      startOffset: tokens[first].startOffset,
-      endOffset: routineBodyEnd(tokens, past, byteLength),
-    )
+  var index = int(routine.firstToken)
+  while index < int(routine.pastToken):
+    if tokens[index].isKeyword(kwFor):
+      let past = blockEnd(tokens, index)
+      if past > index + 1 and past <= int(routine.pastToken):
+        appendBlockScope(tokens, routineScope, index, past, byteLength, scopeIndex)
+    inc index
   true
 
-proc locals[T](
-    tokens: T,
+proc locals(
+    tokens: TokenStore,
     bounds: tuple[first, past, baseColumn: int, valid: bool],
     scope: ScopeId,
     declarations: var seq[LexicalDeclaration],
     result: var ScopeIndex,
-) =
+) {.gcsafe.} =
   if not bounds.valid:
     return
   var index = bounds.first
   while index < bounds.past:
     let token = tokens[index]
+    if token.kind == tkIdentifier and not isStropped(token) and token.isKeyword(kwFor):
+      let nestedScope = result.blockScopeStartingAt(uint32(index))
+      if nestedScope != InvalidScopeId:
+        let headerEnd = loopHeaderEnd(tokens, index + 1, bounds.past)
+        let before = declarations.len
+        if headerEnd <= index + 1 or
+            not loopDeclarationGroup(
+              tokens, index + 1, headerEnd, nestedScope, declarations
+            ):
+          declarations.setLen(before)
+          result.uncertainty.incl scopeNestedBlock
     if token.kind == tkIdentifier and not isStropped(token) and isBlockKeyword(token):
       let nestedScope = result.blockScopeStartingAt(uint32(index))
       if nestedScope != InvalidScopeId:
@@ -447,19 +533,19 @@ proc locals[T](
       result.uncertainty.incl scopeNestedBlock
     inc index
 
-proc routineBodyEnd[T](tokens: T, past, byteLength: int): int =
+proc routineBodyEnd(tokens: TokenStore, past, byteLength: int): int {.gcsafe.} =
   if past >= tokens.len:
     return byteLength
   tokens[past].startOffset
 
-proc indexedRoutine[T](
-    tokens: T,
+proc indexedRoutine(
+    tokens: TokenStore,
     symbol: SourceSymbol,
     symbolIndex: int,
     byteLength: int,
     syntax: PartialSyntaxTree,
     result: var ScopeIndex,
-) =
+) {.gcsafe.} =
   let nameToken = int(symbol.nameToken)
   let header = routineHeader(tokens, nameToken)
   if not header.valid:
@@ -475,11 +561,11 @@ proc indexedRoutine[T](
     return
 
   for index in nameToken + 1 ..< header.opening:
-    if tokens[index].text == "[":
+    if tokens.tokenTextEquals(tokens[index], "["):
       result.uncertainty.incl scopeUnsupportedHeader
       return
   for index in header.closing + 1 ..< header.equals:
-    if tokens[index].text == "{" or tokens[index].text == "[":
+    if tokens.tokenTextEquals(tokens[index], "{"):
       result.uncertainty.incl scopeUnsupportedHeader
       return
 
@@ -531,12 +617,12 @@ proc indexedRoutine[T](
       result,
     )
 
-proc indexScopes*[T](
-    tokens: T,
+proc indexScopes*(
+    tokens: TokenStore,
     symbols: openArray[SourceSymbol],
     byteLength: int,
     syntax: PartialSyntaxTree,
-): ScopeIndex =
+): ScopeIndex {.gcsafe.} =
   result.scopes.add ScopeInterval(
     parent: InvalidScopeId,
     kind: scopeModule,
@@ -566,13 +652,10 @@ proc indexScopes*[T](
       cmp(left.nameToken, right.nameToken)
   )
 
-proc indexScopes*[T](
-    tokens: T, symbols: openArray[SourceSymbol], byteLength: int
-): ScopeIndex =
-  var copied = newSeqOfCap[Token](tokens.len)
-  for token in tokens:
-    copied.add token
-  let syntax = parsePartialSyntax(initTokenStore(copied))
+proc indexScopes*(
+    tokens: TokenStore, symbols: openArray[SourceSymbol], byteLength: int
+): ScopeIndex {.gcsafe.} =
+  let syntax = parsePartialSyntax(tokens)
   indexScopes(tokens, symbols, byteLength, syntax)
 
 proc containsToken(scope: ScopeInterval, token: uint32): bool {.inline.} =
@@ -583,8 +666,11 @@ proc scopeContains(index: ScopeIndex, scope: ScopeId, token: uint32): bool =
   ordinal >= 0 and ordinal < index.scopes.len and
     index.scopes[ordinal].containsToken(token)
 
-proc validateScopes*[T](
-    index: ScopeIndex, tokens: T, symbols: openArray[SourceSymbol], byteLength: int
+proc validateScopes*(
+    index: ScopeIndex,
+    tokens: TokenStore,
+    symbols: openArray[SourceSymbol],
+    byteLength: int,
 ): bool =
   if byteLength < 0 or index.scopes.len == 0:
     return false
@@ -622,10 +708,18 @@ proc validateScopes*[T](
         return false
     of scopeBlock:
       if scope.ownerSymbol != invalidScopeOwner or parentOrdinal == 0 or
-          index.scopes[parentOrdinal].kind notin {scopeRoutine, scopeBlock} or
-          scope.firstToken + 1 >= uint32(tokens.len) or
-          tokens[int(scope.firstToken)].text != "block" or
-          tokens[int(scope.firstToken) + 1].text != ":":
+          index.scopes[parentOrdinal].kind notin {scopeRoutine, scopeBlock}:
+        return false
+      let first = int(scope.firstToken)
+      if first >= tokens.len:
+        return false
+      if tokens.tokenTextEquals(tokens[first], "block"):
+        if first + 1 >= tokens.len or not tokens.tokenTextEquals(tokens[first + 1], ":"):
+          return false
+      elif tokens[first].isKeyword(kwFor):
+        if loopHeaderEnd(tokens, first + 1, int(scope.pastToken)) <= first + 1:
+          return false
+      else:
         return false
     else:
       return false
