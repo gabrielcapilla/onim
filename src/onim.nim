@@ -1,3 +1,6 @@
+when NimMajor < 2 or (NimMajor == 2 and NimMinor < 2):
+  {.fatal: "onim requires Nim 2.2.0 or newer".}
+
 import std/[os, strutils]
 
 import onim/features/organize
