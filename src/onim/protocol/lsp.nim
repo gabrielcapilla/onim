@@ -118,6 +118,27 @@ var lspSemanticBridgeStarted = false
 var lspSemanticStopRequested: Atomic[bool]
 var lspTraceEnabled = false
 
+type ProcessMemory = object
+  residentKb: uint64
+  peakResidentKb: uint64
+
+proc processMemory(): ProcessMemory {.inline.} =
+  when defined(linux):
+    try:
+      for line in readFile("/proc/self/status").splitLines:
+        let fields = line.splitWhitespace
+        if fields.len < 2:
+          continue
+        case fields[0]
+        of "VmRSS:":
+          result.residentKb = parseUInt(fields[1])
+        of "VmHWM:":
+          result.peakResidentKb = parseUInt(fields[1])
+        else:
+          discard
+    except CatchableError:
+      discard
+
 proc traceLsp(
     event, uri: string,
     version: int64,
@@ -151,12 +172,14 @@ proc traceLspRequest(
     else:
       contentFingerprint($requestId)
   let durationNs = (getMonoTime() - startedAt).inNanoseconds
+  let memory = processMemory()
   stderr.writeLine(
     "onim lsp request event=" & event & " requestHash=" & $requestHash & " durationNs=" &
       $durationNs & " state=" & state & " worker=" &
       (if lspSemanticBridgeStarted: "active" else: "idle") & " file=" &
       $uint32(key.fileId) & " content=" & $uint64(key.contentGeneration) & " dependency=" &
-      $uint64(key.dependencyGeneration) & " surface=" & $uint64(key.surfaceGeneration)
+      $uint64(key.dependencyGeneration) & " surface=" & $uint64(key.surfaceGeneration) &
+      " rssKb=" & $memory.residentKb & " peakRssKb=" & $memory.peakResidentKb
   )
 
 proc sendMessage(message: JsonNode) =
