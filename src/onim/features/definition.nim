@@ -783,7 +783,7 @@ proc exactNamedTypeMatch(
   result.state = typeStateResolved
   result.matches = leftResolution.target.sameDefinitionTarget(rightResolution.target)
 
-proc exactGenericInstanceMatch(
+proc exactGenericInstanceMatch*(
     workspace: Workspace,
     leftSource, rightSource: WorkspaceSnapshot,
     left, right: LocalTypeInfo,

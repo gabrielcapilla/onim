@@ -724,6 +724,73 @@ suite "stdio LSP":
     check implementations["result"][0]["range"]["start"]["line"].getInt == 4
     check implementations["result"][0]["range"]["start"]["character"].getInt == 7
 
+    let genericImplementationText =
+      implementationText & "type Pair[A, B] = object\n" & "  first: A\n" &
+      "  second: B\n" & "method render*(item: Pair[int, string]) = discard\n" &
+      "method render*(item: Pair[int, bool]) = discard\n" &
+      "proc usePair(item: Pair[int, string]) = discard item.render()\n" &
+      "proc usePairBool(item: Pair[int, bool]) = discard item.render()\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+          "textDocument": {"uri": implementationUri, "version": 2},
+          "contentChanges": [{"text": genericImplementationText}],
+        },
+      },
+    )
+    check readDiagnostics(process.outputStream, implementationUri) != nil
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "textDocument/implementation",
+        "params": {
+          "textDocument": {"uri": implementationUri},
+          "position": {
+            "line": 12,
+            "character": genericImplementationText.splitLines[12].find("render") + 1,
+          },
+        },
+      },
+    )
+    let genericImplementations = readResponse(process.outputStream, 42)
+    check genericImplementations != nil
+    check genericImplementations["result"].kind == JArray
+    check genericImplementations["result"].len == 1
+    check genericImplementations["result"][0]["uri"].getStr == implementationUri
+    check genericImplementations["result"][0]["range"]["start"]["line"].getInt == 10
+    check genericImplementations["result"][0]["range"]["start"]["character"].getInt == 7
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 43,
+        "method": "textDocument/implementation",
+        "params": {
+          "textDocument": {"uri": implementationUri},
+          "position": {
+            "line": 13,
+            "character": genericImplementationText.splitLines[13].find("render") + 1,
+          },
+        },
+      },
+    )
+    let mismatchedGenericImplementations = readResponse(process.outputStream, 43)
+    check mismatchedGenericImplementations != nil
+    check mismatchedGenericImplementations["result"].kind == JArray
+    check mismatchedGenericImplementations["result"].len == 1
+    check mismatchedGenericImplementations["result"][0]["uri"].getStr ==
+      implementationUri
+    check mismatchedGenericImplementations["result"][0]["range"]["start"]["line"].getInt ==
+      11
+    check mismatchedGenericImplementations["result"][0]["range"]["start"]["character"].getInt ==
+      7
+
     let hierarchyUri = "file:///tmp/onim-hierarchy.nim"
     let hierarchyText = "proc leaf*() = discard\n" & "proc caller() =\n" & "  leaf()\n"
     sendMessage(

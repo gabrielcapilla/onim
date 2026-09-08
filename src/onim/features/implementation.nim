@@ -42,6 +42,10 @@ proc sameReceiver(
         resolveDefinitionAtToken(workspace, rightSource, int(right.typeToken))
       leftTarget.kind == definitionResolved and rightTarget.kind == definitionResolved and
         leftTarget.target.sameDefinitionTarget(rightTarget.target)
+    of typeGenericInstance:
+      let match =
+        exactGenericInstanceMatch(workspace, leftSource, rightSource, left, right)
+      match.state == typeStateResolved and match.matches
     else:
       false
 
