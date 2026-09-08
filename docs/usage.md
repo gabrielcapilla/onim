@@ -14,7 +14,7 @@ Apply organize-imports to one Nim source file:
 ./onim path/to/file.nim
 ```
 
-The command adds missing imports, removes unused imports when the source is sufficiently resolved, preserves supported import forms, sorts imports, groups standard-library imports, and writes the file only when an edit is needed. Use `--useStdPrefix:off` or `--no-std-prefix` to emit legacy spellings such as `import os`; the default is `std/` spelling.
+The command adds missing imports, removes unused imports when the source is sufficiently resolved, preserves supported import forms, sorts imports, groups standard-library imports, writes the file only when an edit is needed, and runs `nph` after a `.nim` file changes. Use `--useStdPrefix:off` or `--no-std-prefix` to emit legacy spellings such as `import os`; the default is `std/` spelling.
 
 These inputs are ignored:
 

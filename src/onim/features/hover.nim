@@ -1,6 +1,7 @@
 import std/[sets, strutils]
 
 import ../index/occurrences
+import ../index/documentation
 import ../index/scopes
 import ../index/source_index
 import ../index/symbols
@@ -22,6 +23,7 @@ type
     module*: string
     kind*: string
     signature*: string
+    documentation*: string
 
 proc targetHover(
     workspace: Workspace, source: WorkspaceSnapshot, resolution: DefinitionResolution
@@ -38,9 +40,9 @@ proc targetHover(
   let tokenName = view.index.parsed.tokens.tokenText(token)
 
   proc localTypeText(typeSource: WorkspaceSnapshot, typeInfo: LocalTypeInfo): string =
+    if typeInfo.kind.isPrimitiveType:
+      return typeInfo.kind.primitiveTypeName
     case typeInfo.kind
-    of typeBool, typeChar, typeString, typeInt, typeFloat:
-      typeInfo.kind.primitiveTypeName
     of typeSeq:
       if not typeSource.valid or typeSource.index == nil:
         return
@@ -65,6 +67,8 @@ proc targetHover(
           last.endOffset > typeSource.text.len:
         return
       typeSource.text[first.startOffset ..< last.endOffset].strip
+    else:
+      ""
 
   proc localSignature(): string =
     if uint32(resolution.target.fileId) != uint32(source.fileId) or
@@ -104,6 +108,8 @@ proc targetHover(
 
   result.state = hoverAvailable
   result.name = tokenName
+  result.documentation =
+    documentationForDeclaration(view.index.parsed.tokens, resolution.target.nameToken)
   case resolution.target.kind
   of targetObjectField:
     result.kind = "field"
@@ -175,6 +181,17 @@ proc stdlibHover(
     result.module = candidate.module
     result.kind = candidate.kind
     result.signature = candidate.signature
+    result.documentation = candidate.documentation
+  if result.state == hoverUnavailable:
+    let candidate =
+      stdlib.implicitValueCandidate(source.index.parsed.tokens.tokenText(token))
+    if candidate.module.len > 0:
+      result.state = hoverAvailable
+      result.name = candidate.name
+      result.module = candidate.module
+      result.kind = candidate.kind
+      result.signature = candidate.signature
+      result.documentation = candidate.documentation
 
 proc resolveHover*(
     workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int, stdlib: StdlibMap

@@ -19,6 +19,18 @@ type
     typeString
     typeInt
     typeFloat
+    typeInt8
+    typeInt16
+    typeInt32
+    typeInt64
+    typeUInt
+    typeUInt8
+    typeUInt16
+    typeUInt32
+    typeUInt64
+    typeFloat32
+    typeFloat64
+    typeFloat128
     typeSeq
     typeRef
     typeArray
@@ -79,6 +91,8 @@ type
     records*: seq[TypeRecord]
     objects*: seq[ObjectTypeRecord]
     fields*: seq[ObjectField]
+    localTupleObjects*: seq[ObjectTypeRecord]
+    localTupleFields*: seq[ObjectField]
     genericParameterTokens*: seq[uint32]
     localTypeIds*: seq[TypeId]
     routineReturnTypeIds*: seq[TypeId]
@@ -87,6 +101,11 @@ type
 const
   InvalidTypeToken* = high(uint32)
   InvalidTypeId* = TypeId(0'u32)
+  primitiveTypeKinds = [
+    typeBool, typeChar, typeString, typeInt, typeFloat, typeInt8, typeInt16, typeInt32,
+    typeInt64, typeUInt, typeUInt8, typeUInt16, typeUInt32, typeUInt64, typeFloat32,
+    typeFloat64, typeFloat128,
+  ]
 
 proc valid*(id: TypeId): bool {.inline.} =
   uint32(id) != 0'u32
@@ -125,7 +144,25 @@ proc primitiveTypeName*(kind: TypeKind): string {.inline.} =
   of typeString: "string"
   of typeInt: "int"
   of typeFloat: "float"
+  of typeInt8: "int8"
+  of typeInt16: "int16"
+  of typeInt32: "int32"
+  of typeInt64: "int64"
+  of typeUInt: "uint"
+  of typeUInt8: "uint8"
+  of typeUInt16: "uint16"
+  of typeUInt32: "uint32"
+  of typeUInt64: "uint64"
+  of typeFloat32: "float32"
+  of typeFloat64: "float64"
+  of typeFloat128: "float128"
   else: ""
+
+proc isPrimitiveType*(kind: TypeKind): bool {.inline.} =
+  for primitive in primitiveTypeKinds:
+    if kind == primitive:
+      return true
+  false
 
 proc validTypeShape(
     kind: TypeKind, nameToken: uint32, baseType: TypeId, extent = 0'u32
@@ -295,7 +332,12 @@ proc parseGenericParameters(
         return false
   true
 
-proc addField(tokens: TokenStore, tokenIndex: int, fields: var seq[ObjectField]): bool =
+proc addField(
+    tokens: TokenStore,
+    tokenIndex: int,
+    fields: var seq[ObjectField],
+    defaultVisibility = objectFieldPrivate,
+): bool =
   if not validNameToken(tokens, tokenIndex):
     return false
   let token = tokens[tokenIndex]
@@ -311,12 +353,15 @@ proc addField(tokens: TokenStore, tokenIndex: int, fields: var seq[ObjectField])
           tokens.tokenTextEquals(tokens[tokenIndex + 1], "*"):
         objectFieldExported
       else:
-        objectFieldPrivate,
+        defaultVisibility,
   )
   true
 
 proc parseFieldSegment(
-    tokens: TokenStore, first, past: int, fields: var seq[ObjectField]
+    tokens: TokenStore,
+    first, past: int,
+    fields: var seq[ObjectField],
+    defaultVisibility = objectFieldPrivate,
 ): bool =
   if first >= past:
     return true
@@ -361,21 +406,25 @@ proc parseFieldSegment(
     return false
 
   for nameToken in names:
-    if not addField(tokens, nameToken, fields):
+    if not addField(tokens, nameToken, fields, defaultVisibility):
       return false
   true
 
 proc parseFieldLine(
-    tokens: TokenStore, first, past: int, fields: var seq[ObjectField]
+    tokens: TokenStore,
+    first, past: int,
+    fields: var seq[ObjectField],
+    defaultVisibility = objectFieldPrivate,
 ): bool =
   var segment = first
   for index in first ..< past:
     if not tokens.tokenTextEquals(tokens[index], ";"):
       continue
-    if not parseFieldSegment(tokens, segment, index, fields):
+    if not parseFieldSegment(tokens, segment, index, fields, defaultVisibility):
       return false
     segment = index + 1
-  if segment < past and not parseFieldSegment(tokens, segment, past, fields):
+  if segment < past and
+      not parseFieldSegment(tokens, segment, past, fields, defaultVisibility):
     return false
   true
 
@@ -443,6 +492,197 @@ proc indexObject(tokens: TokenStore, symbol: SourceSymbol, types: var TypeIndex)
     pastGenericParameter: uint32(types.genericParameterTokens.len),
   )
   true
+
+proc tupleKeyword(tokens: TokenStore, nameToken, limit: int): int =
+  if nameToken < 0 or nameToken >= limit:
+    return -1
+  let bounds = genericParameterBounds(tokens, nameToken, limit)
+  if not bounds.valid or bounds.present or bounds.after >= limit or
+      not tokens.tokenTextEquals(tokens[bounds.after], "=") or
+      tokens[bounds.after].line != tokens[nameToken].line:
+    return -1
+  let tupleToken = bounds.after + 1
+  if tupleToken >= limit or not tokens[tupleToken].isKeyword(kwTuple) or
+      tokens[tupleToken].line != tokens[nameToken].line:
+    return -1
+  tupleToken
+
+proc parseTupleFieldSegment(
+    tokens: TokenStore, first, past: int, fields: var seq[ObjectField]
+): bool =
+  if first >= past:
+    return false
+  for index in first ..< past:
+    if tokens[index].isKeyword(kwTuple):
+      return false
+  parseFieldSegment(tokens, first, past, fields, objectFieldExported)
+
+proc parseTupleFields(
+    tokens: TokenStore, tupleToken, limit: int, fields: var seq[ObjectField]
+): bool =
+  let opening = tupleToken + 1
+  if opening >= limit or not tokens.tokenTextEquals(tokens[opening], "["):
+    return false
+  var segment = opening + 1
+  var delimiters: seq[char] = @[]
+  var closing = -1
+  for cursor in segment ..< limit:
+    let token = tokens[cursor]
+    if tokens.tokenTextEquals(token, "(") or tokens.tokenTextEquals(token, "[") or
+        tokens.tokenTextEquals(token, "{"):
+      delimiters.add tokens.tokenTextChar(token, 0)
+    elif tokens.tokenTextEquals(token, ")") or tokens.tokenTextEquals(token, "]") or
+        tokens.tokenTextEquals(token, "}"):
+      let delimiter = tokens.tokenTextChar(token, 0)
+      if delimiters.len > 0:
+        if not matchingDelimiter(delimiters[^1], delimiter):
+          return false
+        delimiters.setLen(delimiters.len - 1)
+      elif delimiter == ']':
+        if not parseTupleFieldSegment(tokens, segment, cursor, fields):
+          return false
+        closing = cursor
+        break
+      else:
+        return false
+    elif delimiters.len == 0 and tokens.tokenTextEquals(token, ","):
+      if not parseTupleFieldSegment(tokens, segment, cursor, fields):
+        return false
+      segment = cursor + 1
+  if closing < 0 or fields.len == 0:
+    return false
+  if closing + 1 < limit and tokens[closing + 1].line == tokens[tupleToken].line:
+    return false
+  true
+
+proc parseTupleLiteralFieldSegment(
+    tokens: TokenStore, first, past: int, fields: var seq[ObjectField]
+): bool =
+  if first + 2 >= past or not validNameToken(tokens, first) or
+      not tokens.tokenTextEquals(tokens[first + 1], ":"):
+    return false
+  addField(tokens, first, fields)
+
+proc parseTupleLiteralFields(
+    tokens: TokenStore, first, past: int, fields: var seq[ObjectField]
+): bool =
+  if first < 0 or first + 2 >= past or past > tokens.len or
+      not tokens.tokenTextEquals(tokens[first], "(") or
+      not tokens.tokenTextEquals(tokens[past - 1], ")"):
+    return false
+  var delimiters: seq[char] = @[]
+  var segment = first + 1
+  for cursor in first + 1 ..< past - 1:
+    let token = tokens[cursor]
+    if tokens.tokenTextEquals(token, "(") or tokens.tokenTextEquals(token, "[") or
+        tokens.tokenTextEquals(token, "{"):
+      delimiters.add tokens.tokenTextChar(token, 0)
+    elif tokens.tokenTextEquals(token, ")") or tokens.tokenTextEquals(token, "]") or
+        tokens.tokenTextEquals(token, "}"):
+      if delimiters.len == 0 or
+          not matchingDelimiter(delimiters[^1], tokens.tokenTextChar(token, 0)):
+        return false
+      delimiters.setLen(delimiters.len - 1)
+    elif delimiters.len == 0 and tokens.tokenTextEquals(token, ","):
+      if not parseTupleLiteralFieldSegment(tokens, segment, cursor, fields):
+        return false
+      segment = cursor + 1
+  if delimiters.len != 0 or
+      not parseTupleLiteralFieldSegment(tokens, segment, past - 1, fields):
+    return false
+  fields.len > 0
+
+proc indexTuple(tokens: TokenStore, symbol: SourceSymbol, types: var TypeIndex): bool =
+  let nameToken = int(symbol.nameToken)
+  let limit = typeDeclarationEnd(tokens, nameToken)
+  let tupleToken = tupleKeyword(tokens, nameToken, limit)
+  if tupleToken < 0:
+    return false
+  let firstField = types.fields.len
+  if not parseTupleFields(tokens, tupleToken, limit, types.fields):
+    types.fields.setLen(firstField)
+    return false
+  types.objects.add ObjectTypeRecord(
+    declarationToken: symbol.nameToken,
+    firstField: uint32(firstField),
+    pastField: uint32(types.fields.len),
+    firstGenericParameter: uint32(types.genericParameterTokens.len),
+    pastGenericParameter: uint32(types.genericParameterTokens.len),
+  )
+  true
+
+proc enumKeyword(tokens: TokenStore, nameToken, limit: int): int =
+  if nameToken < 0 or nameToken >= limit:
+    return -1
+  let bounds = genericParameterBounds(tokens, nameToken, limit)
+  if not bounds.valid or bounds.present or bounds.after >= limit or
+      not tokens.tokenTextEquals(tokens[bounds.after], "=") or
+      tokens[bounds.after].line != tokens[nameToken].line:
+    return -1
+  let enumToken = bounds.after + 1
+  if enumToken >= limit or not tokens[enumToken].isKeyword(kwEnum) or
+      tokens[enumToken].line != tokens[nameToken].line:
+    return -1
+  enumToken
+
+proc parseEnumFields(
+    tokens: TokenStore, nameToken, enumToken, limit: int, fields: var seq[ObjectField]
+): bool =
+  var baseColumn = tokens[nameToken].column
+  var declarationToken = nameToken - 1
+  while declarationToken >= 0 and tokens[declarationToken].line == tokens[nameToken].line:
+    if tokens[declarationToken].isKeyword(kwType):
+      baseColumn = tokens[declarationToken].column
+      break
+    dec declarationToken
+  var expectName = true
+  var sawField = false
+  var cursor = enumToken + 1
+  while cursor < limit:
+    let token = tokens[cursor]
+    if token.line <= tokens[enumToken].line:
+      inc cursor
+      continue
+    if token.column <= baseColumn:
+      return sawField and not expectName
+    if validNameToken(tokens, cursor):
+      if not expectName:
+        return false
+      fields.add ObjectField(nameToken: uint32(cursor), visibility: objectFieldExported)
+      expectName = false
+      sawField = true
+    elif tokens.tokenTextEquals(token, ","):
+      if expectName:
+        return false
+      expectName = true
+    else:
+      return false
+    inc cursor
+  sawField and not expectName
+
+proc indexEnum(tokens: TokenStore, symbol: SourceSymbol, types: var TypeIndex): bool =
+  let nameToken = int(symbol.nameToken)
+  let limit = typeDeclarationEnd(tokens, nameToken)
+  let enumToken = enumKeyword(tokens, nameToken, limit)
+  if enumToken < 0:
+    return false
+  let firstField = types.fields.len
+  if not parseEnumFields(tokens, nameToken, enumToken, limit, types.fields):
+    types.fields.setLen(firstField)
+    return false
+  types.objects.add ObjectTypeRecord(
+    declarationToken: symbol.nameToken,
+    firstField: uint32(firstField),
+    pastField: uint32(types.fields.len),
+    firstGenericParameter: uint32(types.genericParameterTokens.len),
+    pastGenericParameter: uint32(types.genericParameterTokens.len),
+  )
+  true
+
+proc simpleEnumDeclaration*(tokens: TokenStore, nameToken: uint32): bool =
+  if nameToken == InvalidTypeToken or nameToken >= uint32(tokens.len):
+    return false
+  enumKeyword(tokens, int(nameToken), typeDeclarationEnd(tokens, int(nameToken))) >= 0
 
 proc splitDeclaration(
     tokens: TokenStore, declaration: LexicalDeclaration
@@ -521,6 +761,56 @@ proc typeUseFor(tokens: TokenStore, declaration: LexicalDeclaration): uint32 =
       return call.typeToken
   InvalidTypeToken
 
+proc numericSuffix(kind: TypeKind): string {.inline.} =
+  case kind
+  of typeFloat: "f"
+  of typeFloat32: "f32"
+  of typeFloat64: "f64"
+  of typeFloat128: "f128"
+  of typeInt8: "i8"
+  of typeInt16: "i16"
+  of typeInt32: "i32"
+  of typeInt64: "i64"
+  of typeUInt: "u"
+  of typeUInt8: "u8"
+  of typeUInt16: "u16"
+  of typeUInt32: "u32"
+  of typeUInt64: "u64"
+  else: ""
+
+proc tokenTextEqualsAt(
+    tokens: TokenStore, token: Token, first: int, wanted: string
+): bool {.inline.} =
+  if first < 0 or first + wanted.len > tokens.tokenTextLen(token):
+    return false
+  for index in 0 ..< wanted.len:
+    if tokens.tokenTextChar(token, first + index) != wanted[index]:
+      return false
+  true
+
+proc numericLiteralKind(tokens: TokenStore, token: Token): TypeKind =
+  let length = tokens.tokenTextLen(token)
+  let based =
+    length >= 2 and tokens.tokenTextChar(token, 0) == '0' and
+    tokens.tokenTextChar(token, 1) in {'b', 'B', 'o', 'O', 'x', 'X'}
+  for kind in primitiveTypeKinds:
+    let suffix = kind.numericSuffix
+    if suffix.len == 0 or suffix.len > length:
+      continue
+    let suffixFirst = length - suffix.len
+    if not tokens.tokenTextEqualsAt(token, suffixFirst, suffix):
+      continue
+    let quoted =
+      suffixFirst > 0 and tokens.tokenTextChar(token, suffixFirst - 1) == '\''
+    if quoted or not based:
+      return kind
+  if based:
+    return typeInt
+  for index in 0 ..< length:
+    if tokens.tokenTextChar(token, index) in {'.', 'e', 'E'}:
+      return typeFloat
+  typeInt
+
 proc directLiteralKind(tokens: TokenStore, first, past: int): TypeKind =
   if first < 0 or first >= past or past > tokens.len:
     return typeUnknown
@@ -537,52 +827,42 @@ proc directLiteralKind(tokens: TokenStore, first, past: int): TypeKind =
         return typeString
       if tokens.tokenTextChar(token, 0) == char(39) and tokens.tokenTextLen(token) >= 3:
         return typeChar
-    elif token.kind == tkPunctuation and tokens.tokenTextLen(token) == 1 and
-        tokens.tokenTextChar(token, 0) >= '0' and tokens.tokenTextChar(token, 0) <= '9':
-      return typeInt
+    elif token.kind == tkNumber:
+      return numericLiteralKind(tokens, token)
     return typeUnknown
-
-  var previousEnd = -1
-  var decimalPoint = false
-  var digitCount = 0
-  var fractionalDigitCount = 0
-  for index in first ..< past:
-    let token = tokens[index]
-    if token.kind != tkPunctuation or tokens.tokenTextLen(token) != 1 or
-        (previousEnd >= 0 and token.startOffset != previousEnd):
-      return typeUnknown
-    let character = tokens.tokenTextChar(token, 0)
-    if character == '.':
-      if decimalPoint or digitCount == 0:
-        return typeUnknown
-      decimalPoint = true
-    elif character >= '0' and character <= '9':
-      inc digitCount
-      if decimalPoint:
-        inc fractionalDigitCount
-    else:
-      return typeUnknown
-    previousEnd = token.endOffset
-  if decimalPoint:
-    if fractionalDigitCount > 0: typeFloat else: typeUnknown
-  else:
-    typeInt
+  typeUnknown
 
 proc primitiveTypeKind(tokens: TokenStore, index: int): TypeKind =
   if not validNameToken(tokens, index):
     return typeUnknown
-  for kind in [typeBool, typeChar, typeString, typeInt, typeFloat]:
+  for kind in primitiveTypeKinds:
     if tokens.tokenTextEquals(tokens[index], kind.primitiveTypeName):
       return kind
   typeUnknown
 
-proc sequenceAnnotationElementKind(tokens: TokenStore, first, past: int): TypeKind =
+proc sequenceAnnotationDescriptor(
+    tokens: TokenStore, first, past: int
+): TypeDescriptor =
+  result.kind = typeUnknown
+  result.nameToken = InvalidTypeToken
+  result.baseKind = typeUnknown
+  result.baseNameToken = InvalidTypeToken
+  result.extent = 0'u32
   if first < 0 or past != first + 4 or past > tokens.len or
       not tokens.tokenTextEquals(tokens[first], "seq") or
       not tokens.tokenTextEquals(tokens[first + 1], "[") or
       not tokens.tokenTextEquals(tokens[past - 1], "]"):
-    return typeUnknown
-  primitiveTypeKind(tokens, first + 2)
+    return
+  let elementKind = primitiveTypeKind(tokens, first + 2)
+  if elementKind.isPrimitiveType:
+    result.kind = typeSeq
+    result.baseKind = elementKind
+    return
+  if not validNameToken(tokens, first + 2):
+    return
+  result.kind = typeSeq
+  result.baseKind = typeNamed
+  result.baseNameToken = uint32(first + 2)
 
 proc arrayAnnotationDescriptor(tokens: TokenStore, first, past: int): TypeDescriptor =
   result.kind = typeUnknown
@@ -603,13 +883,14 @@ proc arrayAnnotationDescriptor(tokens: TokenStore, first, past: int): TypeDescri
       comma = index
   if comma < first + 3 or comma + 2 != past - 1:
     return
+  if comma != first + 3 or tokens[first + 2].kind != tkNumber:
+    return
   var extent = 0'u32
-  for index in first + 2 ..< comma:
-    let token = tokens[index]
-    if token.kind != tkPunctuation or tokens.tokenTextLen(token) != 1 or
-        (index > first + 2 and token.startOffset != tokens[index - 1].endOffset):
-      return
-    let character = tokens.tokenTextChar(token, 0)
+  let extentToken = tokens[first + 2]
+  for index in 0 ..< tokens.tokenTextLen(extentToken):
+    let character = tokens.tokenTextChar(extentToken, index)
+    if character == '_':
+      continue
     if character < '0' or character > '9':
       return
     let digit = uint32(ord(character) - ord('0'))
@@ -617,11 +898,27 @@ proc arrayAnnotationDescriptor(tokens: TokenStore, first, past: int): TypeDescri
       return
     extent = extent * 10'u32 + digit
   let baseKind = primitiveTypeKind(tokens, comma + 1)
-  if baseKind == typeUnknown:
-    return
   result.kind = typeArray
-  result.baseKind = baseKind
+  if baseKind != typeUnknown:
+    result.baseKind = baseKind
+  elif validNameToken(tokens, comma + 1):
+    result.baseKind = typeNamed
+    result.baseNameToken = uint32(comma + 1)
+  else:
+    result.kind = typeUnknown
+    return
   result.extent = extent
+
+proc genericArgument(
+    tokens: TokenStore, first, past: int, kind: var TypeKind, nameToken: var uint32
+): bool =
+  if first >= past:
+    return false
+  kind = primitiveTypeKind(tokens, first)
+  if kind != typeUnknown:
+    return first + 1 == past
+  nameToken = nominalTypeToken(tokens, first, past)
+  nameToken != InvalidTypeToken
 
 proc genericAnnotationDescriptor(tokens: TokenStore, first, past: int): TypeDescriptor =
   result.kind = typeUnknown
@@ -645,15 +942,29 @@ proc genericAnnotationDescriptor(tokens: TokenStore, first, past: int): TypeDesc
     return
   let argumentFirst = opening + 1
   let argumentPast = past - 1
-  var argumentKind = primitiveTypeKind(tokens, argumentFirst)
+  var segmentFirst = argumentFirst
+  var argumentKind = typeUnknown
   var argumentName = InvalidTypeToken
-  if argumentKind == typeUnknown:
-    argumentName = nominalTypeToken(tokens, argumentFirst, argumentPast)
-    if argumentName == InvalidTypeToken:
+  var arguments = 0
+  for index in argumentFirst ..< argumentPast:
+    if not tokens.tokenTextEquals(tokens[index], ","):
+      continue
+    var segmentKind = typeUnknown
+    var segmentName = InvalidTypeToken
+    if not genericArgument(tokens, segmentFirst, index, segmentKind, segmentName):
       return
-    argumentKind = typeNamed
-  elif argumentFirst + 1 != argumentPast:
+    if arguments == 0:
+      argumentKind = segmentKind
+      argumentName = segmentName
+    inc arguments
+    segmentFirst = index + 1
+  var segmentKind = typeUnknown
+  var segmentName = InvalidTypeToken
+  if not genericArgument(tokens, segmentFirst, argumentPast, segmentKind, segmentName):
     return
+  if arguments == 0:
+    argumentKind = segmentKind
+    argumentName = segmentName
   result.kind = typeGenericInstance
   result.nameToken = nameToken
   result.baseKind = argumentKind
@@ -668,11 +979,9 @@ proc annotationDescriptor(tokens: TokenStore, first, past: int): TypeDescriptor 
   let arrayDescriptor = arrayAnnotationDescriptor(tokens, first, past)
   if arrayDescriptor.kind != typeUnknown:
     return arrayDescriptor
-  let sequenceKind = sequenceAnnotationElementKind(tokens, first, past)
-  if sequenceKind != typeUnknown:
-    result.kind = typeSeq
-    result.baseKind = sequenceKind
-    return
+  let sequenceDescriptor = sequenceAnnotationDescriptor(tokens, first, past)
+  if sequenceDescriptor.kind != typeUnknown:
+    return sequenceDescriptor
   let genericDescriptor = genericAnnotationDescriptor(tokens, first, past)
   if genericDescriptor.kind != typeUnknown:
     return genericDescriptor
@@ -704,6 +1013,67 @@ proc sequenceLiteralStart*(tokens: TokenStore, index: int): bool {.inline.} =
     tokens[index + 1].kind == tkPunctuation and
     tokens.tokenTextEquals(tokens[index], "@") and
     tokens.tokenTextEquals(tokens[index + 1], "[")
+
+proc sameTupleFieldShape(
+    tokens: TokenStore, left, right: openArray[ObjectField]
+): bool =
+  if left.len == 0 or left.len != right.len:
+    return false
+  for fieldIndex, leftField in left:
+    if not sameIdentifier(
+      tokens.tokenText(tokens[int(leftField.nameToken)]),
+      tokens.tokenText(tokens[int(right[fieldIndex].nameToken)]),
+    ):
+      return false
+    for previous in 0 ..< fieldIndex:
+      if sameIdentifier(
+        tokens.tokenText(tokens[int(left[fieldIndex].nameToken)]),
+        tokens.tokenText(tokens[int(left[previous].nameToken)]),
+      ):
+        return false
+  true
+
+proc sequenceLiteralTupleFields(
+    tokens: TokenStore, first, past: int, fields: var seq[ObjectField]
+): bool =
+  if first < 0 or first + 3 > past or past > tokens.len or
+      not tokens.sequenceLiteralStart(first) or
+      not tokens.tokenTextEquals(tokens[past - 1], "]"):
+    return false
+  var elementFirst = first + 2
+  if elementFirst >= past - 1:
+    return false
+  while elementFirst < past - 1:
+    var elementPast = elementFirst
+    var delimiters: seq[char] = @[]
+    while elementPast < past - 1:
+      let token = tokens[elementPast]
+      if token.kind == tkPunctuation and tokens.tokenTextLen(token) == 1:
+        let value = tokens.tokenTextChar(token, 0)
+        if isOpeningDelimiter(value):
+          delimiters.add value
+        elif isClosingDelimiter(value):
+          if delimiters.len == 0 or not matchingDelimiter(delimiters[^1], value):
+            return false
+          delimiters.setLen(delimiters.len - 1)
+        elif delimiters.len == 0 and value == ',':
+          break
+      inc elementPast
+    if delimiters.len != 0 or elementPast == elementFirst:
+      return false
+    var elementFields: seq[ObjectField] = @[]
+    if not parseTupleLiteralFields(tokens, elementFirst, elementPast, elementFields):
+      return false
+    if fields.len == 0:
+      fields = elementFields
+    elif not sameTupleFieldShape(tokens, fields, elementFields):
+      return false
+    if elementPast == past - 1:
+      return true
+    elementFirst = elementPast + 1
+    if elementFirst >= past - 1:
+      return false
+  false
 
 proc sequenceLiteralElementKind(tokens: TokenStore, first, past: int): TypeKind =
   if first < 0 or first + 3 > past or past > tokens.len or
@@ -761,6 +1131,16 @@ proc declarationTypeDescriptor(
   if split.equals >= 0:
     let first = split.equals + 1
     let past = int(declaration.pastToken)
+    var tupleFields: seq[ObjectField] = @[]
+    if parseTupleLiteralFields(tokens, first, past, tupleFields):
+      result.kind = typeNamed
+      result.nameToken = declaration.nameToken
+      return
+    if sequenceLiteralTupleFields(tokens, first, past, tupleFields):
+      result.kind = typeSeq
+      result.baseKind = typeNamed
+      result.baseNameToken = declaration.nameToken
+      return
     result.baseKind = sequenceLiteralElementKind(tokens, first, past)
     if result.baseKind != typeUnknown:
       result.kind = typeSeq
@@ -771,15 +1151,21 @@ proc descriptorTypeId(types: TypeIndex, descriptor: TypeDescriptor): TypeId =
   let baseType =
     case descriptor.kind
     of typeSeq:
-      types.typeIdFor(descriptor.baseKind)
+      if descriptor.baseKind == typeNamed:
+        types.typeIdFor(typeNamed, descriptor.baseNameToken)
+      else:
+        types.typeIdFor(descriptor.baseKind)
     of typeRef:
       types.typeIdFor(typeNamed, descriptor.baseNameToken)
     of typeArray:
-      types.typeIdFor(descriptor.baseKind)
+      if descriptor.baseKind == typeNamed:
+        types.typeIdFor(typeNamed, descriptor.baseNameToken)
+      else:
+        types.typeIdFor(descriptor.baseKind)
     of typeGenericInstance:
       if descriptor.baseKind == typeNamed:
         types.typeIdFor(typeNamed, descriptor.baseNameToken)
-      elif descriptor.baseKind in {typeBool, typeChar, typeString, typeInt, typeFloat}:
+      elif descriptor.baseKind.isPrimitiveType:
         types.typeIdFor(descriptor.baseKind)
       else:
         InvalidTypeId
@@ -791,15 +1177,21 @@ proc internDescriptor(types: var TypeIndex, descriptor: TypeDescriptor): TypeId 
   let baseType =
     case descriptor.kind
     of typeSeq:
-      types.internType(descriptor.baseKind)
+      if descriptor.baseKind == typeNamed:
+        types.internType(typeNamed, descriptor.baseNameToken)
+      else:
+        types.internType(descriptor.baseKind)
     of typeRef:
       types.internType(typeNamed, descriptor.baseNameToken)
     of typeArray:
-      types.internType(descriptor.baseKind)
+      if descriptor.baseKind == typeNamed:
+        types.internType(typeNamed, descriptor.baseNameToken)
+      else:
+        types.internType(descriptor.baseKind)
     of typeGenericInstance:
       if descriptor.baseKind == typeNamed:
         types.internType(typeNamed, descriptor.baseNameToken)
-      elif descriptor.baseKind in {typeBool, typeChar, typeString, typeInt, typeFloat}:
+      elif descriptor.baseKind.isPrimitiveType:
         types.internType(descriptor.baseKind)
       else:
         InvalidTypeId
@@ -842,6 +1234,10 @@ proc localTypeAt*(
         descriptor.baseNameToken
       elif descriptor.kind == typeGenericInstance:
         descriptor.nameToken
+      elif descriptor.kind == typeSeq and descriptor.baseKind == typeNamed:
+        descriptor.baseNameToken
+      elif descriptor.kind == typeArray and descriptor.baseKind == typeNamed:
+        descriptor.baseNameToken
       else:
         InvalidTypeToken
     result.firstToken = uint32(split.colon + 1)
@@ -860,6 +1256,13 @@ proc localTypeAt*(
     result.state = typeStateResolved
     result.form = localTypeFormLiteral
     result.typeId = expected
+    result.typeToken =
+      if descriptor.kind == typeNamed and descriptor.nameToken != declaration.nameToken:
+        descriptor.nameToken
+      elif descriptor.kind in {typeSeq, typeArray} and descriptor.baseKind == typeNamed:
+        descriptor.baseNameToken
+      else:
+        InvalidTypeToken
     result.firstToken = uint32(split.equals + 1)
     result.pastToken = declaration.pastToken
 
@@ -946,6 +1349,8 @@ proc routineReturnAt*(
       span.descriptor.baseNameToken
     elif span.descriptor.kind == typeGenericInstance:
       span.descriptor.nameToken
+    elif span.descriptor.kind == typeSeq and span.descriptor.baseKind == typeNamed:
+      span.descriptor.baseNameToken
     else:
       InvalidTypeToken
   result.firstToken = uint32(span.first)
@@ -961,7 +1366,7 @@ proc indexUfcsProcedures(
     if scope.kind != scopeRoutine or scope.ownerSymbol >= uint32(symbols.len):
       continue
     let symbol = symbols[int(scope.ownerSymbol)]
-    if symbol.kind notin {symbolProc, symbolFunc}:
+    if symbol.kind notin {symbolProc, symbolFunc, symbolMethod}:
       continue
     var parameterOrdinal = -1
     let scopeId = ScopeId(uint32(scopeOrdinal + 1))
@@ -996,6 +1401,8 @@ proc indexTypes*(
     tokens: TokenStore, symbols: openArray[SourceSymbol], scopes: ScopeIndex
 ): TypeIndex =
   result.records = @[]
+  result.localTupleObjects = @[]
+  result.localTupleFields = @[]
   result.genericParameterTokens = @[]
   discard result.internType(typeBool)
   discard result.internType(typeChar)
@@ -1006,6 +1413,28 @@ proc indexTypes*(
   for declarationIndex, declaration in scopes.declarations:
     let descriptor = declarationTypeDescriptor(tokens, declaration)
     result.localTypeIds[declarationIndex] = result.internDescriptor(descriptor)
+    var tupleFields: seq[ObjectField] = @[]
+    let split = splitDeclaration(tokens, declaration)
+    let tupleLiteral =
+      if descriptor.kind == typeNamed and descriptor.nameToken == declaration.nameToken:
+        parseTupleLiteralFields(
+          tokens, split.equals + 1, int(declaration.pastToken), tupleFields
+        )
+      elif descriptor.kind == typeSeq and descriptor.baseKind == typeNamed and
+        descriptor.baseNameToken == declaration.nameToken:
+        sequenceLiteralTupleFields(
+          tokens, split.equals + 1, int(declaration.pastToken), tupleFields
+        )
+      else:
+        false
+    if tupleLiteral:
+      let firstField = result.localTupleFields.len
+      result.localTupleFields.add tupleFields
+      result.localTupleObjects.add ObjectTypeRecord(
+        declarationToken: declaration.nameToken,
+        firstField: uint32(firstField),
+        pastField: uint32(result.localTupleFields.len),
+      )
   result.ufcsProcedures = @[]
   indexUfcsProcedures(tokens, symbols, scopes, result)
   result.routineReturnTypeIds = newSeq[TypeId](symbols.len)
@@ -1013,7 +1442,13 @@ proc indexTypes*(
     result.routineReturnTypeIds[symbolIndex] =
       result.internDescriptor(routineReturnSpan(tokens, symbol).descriptor)
     if symbol.kind == symbolType:
-      discard indexObject(tokens, symbol, result)
+      if not indexObject(tokens, symbol, result):
+        if not indexTuple(tokens, symbol, result):
+          discard indexEnum(tokens, symbol, result)
+  result.localTupleObjects.sort(
+    proc(left, right: ObjectTypeRecord): int =
+      cmp(left.declarationToken, right.declarationToken)
+  )
 
 proc objectOrdinal*(index: TypeIndex, declarationToken: uint32): int {.inline.} =
   var first = 0
@@ -1021,6 +1456,22 @@ proc objectOrdinal*(index: TypeIndex, declarationToken: uint32): int {.inline.} 
   while first < past:
     let middle = (first + past) div 2
     let candidate = index.objects[middle].declarationToken
+    if candidate < declarationToken:
+      first = middle + 1
+    elif candidate > declarationToken:
+      past = middle
+    else:
+      return middle
+  -1
+
+proc localTupleObjectOrdinal*(
+    index: TypeIndex, declarationToken: uint32
+): int {.inline.} =
+  var first = 0
+  var past = index.localTupleObjects.len
+  while first < past:
+    let middle = (first + past) div 2
+    let candidate = index.localTupleObjects[middle].declarationToken
     if candidate < declarationToken:
       first = middle + 1
     elif candidate > declarationToken:
@@ -1101,17 +1552,20 @@ proc validateTypeIndex*(
         return false
     of typeArray:
       if record.nameToken != InvalidTypeToken or not record.baseType.valid or
-          uint32(record.baseType) > uint32(recordIndex) or
-          index.typeKind(record.baseType) notin
-          {typeBool, typeChar, typeString, typeInt, typeFloat}:
+          uint32(record.baseType) > uint32(recordIndex) or (
+        not index.typeKind(record.baseType).isPrimitiveType and
+        index.typeKind(record.baseType) != typeNamed
+      ):
         return false
     of typeGenericInstance:
       if record.nameToken == InvalidTypeToken or not record.baseType.valid or
           uint32(record.baseType) > uint32(recordIndex) or record.extent != 0'u32 or
           record.nameToken >= uint32(tokens.len) or
           not validNameToken(tokens, int(record.nameToken)) or
-          index.typeKind(record.baseType) notin
-          {typeBool, typeChar, typeString, typeInt, typeFloat, typeNamed}:
+          not (
+            index.typeKind(record.baseType).isPrimitiveType or
+            index.typeKind(record.baseType) == typeNamed
+          ):
         return false
     else:
       if record.nameToken != InvalidTypeToken or record.baseType.valid or
@@ -1168,6 +1622,39 @@ proc validateTypeIndex*(
             tokens.tokenText(tokens[int(fieldToken)]),
           ):
             return false
+  var previousLocalTuple = high(uint32)
+  for objectType in index.localTupleObjects:
+    if objectType.declarationToken >= uint32(tokens.len) or (
+      previousLocalTuple != high(uint32) and
+      objectType.declarationToken <= previousLocalTuple
+    ) or objectType.firstField > objectType.pastField or
+        objectType.pastField > uint32(index.localTupleFields.len):
+      return false
+    let declarationOrdinal = scopes.declarationOrdinalAt(objectType.declarationToken)
+    if declarationOrdinal < 0 or declarationOrdinal >= scopes.declarations.len:
+      return false
+    let declaration = scopes.declarations[declarationOrdinal]
+    let descriptor = declarationTypeDescriptor(tokens, declaration)
+    if not (
+      descriptor.kind == typeNamed and descriptor.nameToken == declaration.nameToken
+    ) and
+        not (
+          descriptor.kind == typeSeq and descriptor.baseKind == typeNamed and
+          descriptor.baseNameToken == declaration.nameToken
+        ):
+      return false
+    for fieldIndex in objectType.firstField ..< objectType.pastField:
+      let fieldToken = index.localTupleFields[int(fieldIndex)].nameToken
+      if fieldToken <= objectType.declarationToken or fieldToken >= declaration.pastToken or
+          not validNameToken(tokens, int(fieldToken)):
+        return false
+      for previous in objectType.firstField ..< fieldIndex:
+        if sameIdentifier(
+          tokens.tokenText(tokens[int(index.localTupleFields[int(previous)].nameToken)]),
+          tokens.tokenText(tokens[int(fieldToken)]),
+        ):
+          return false
+    previousLocalTuple = objectType.declarationToken
   for declarationIndex, typeId in index.localTypeIds:
     if not typeId.valid:
       continue
@@ -1182,6 +1669,9 @@ proc validateTypeIndex*(
       else: InvalidTypeToken
     if descriptor.kind notin {typeNamed, typeRef, typeGenericInstance}:
       continue
+    if descriptor.kind == typeNamed and descriptor.nameToken == declaration.nameToken and
+        index.localTupleObjectOrdinal(declaration.nameToken) < 0:
+      return false
     if typeToken < declaration.firstToken or typeToken >= declaration.pastToken or
         not validNameToken(tokens, int(typeToken)):
       return false
@@ -1202,7 +1692,7 @@ proc validateTypeIndex*(
         candidate.parameterOrdinal >= uint32(scopes.declarations.len):
       return false
     let symbol = symbols[int(candidate.symbolOrdinal)]
-    if symbol.kind notin {symbolProc, symbolFunc}:
+    if symbol.kind notin {symbolProc, symbolFunc, symbolMethod}:
       return false
     let parameter = scopes.declarations[int(candidate.parameterOrdinal)]
     if parameter.kind != declarationParameter or

@@ -2,7 +2,7 @@
 
 `onim` is an independent Nim language server focused initially on Zed. It provides indexed source organization, navigation, completion, hover, references, rename, and diagnostics while the project is being developed toward a complete native Nim language tool.
 
-Onim is active development software. It is not yet a complete replacement for every semantic capability of `nimsuggest`, `nimlangserver`, or `nimlsp`. The current supported integration target is Zed; known limitations are recorded in [docs/known-limitations.md](docs/known-limitations.md).
+Onim is active development software. It is not yet a complete replacement for every semantic capability of `nimsuggest`, `nimlangserver`, or `nimlsp`. Version 0.1.0 is verified on Linux with Nim 2.2.x; other platforms are not release claims yet. The current supported integration target is Zed; known limitations are recorded in [docs/known-limitations.md](docs/known-limitations.md).
 
 ## Build
 

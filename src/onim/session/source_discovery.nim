@@ -1,6 +1,7 @@
 import std/[algorithm, os, sets, strutils, tables]
 
 import ../index/cache
+import ./package_catalog
 import ./paths
 
 type
@@ -234,6 +235,19 @@ proc fullDiscovery(
   result.status = discoveryFailed
   result.errorPath = root
 
+proc appendNimbleSources(root: string, result: var DiscoveryResult) =
+  if result.status != discoveryComplete:
+    return
+  for path in nimbleDependencySources(root):
+    var present = false
+    for existing in result.paths:
+      if existing == path:
+        present = true
+        break
+    if not present:
+      result.paths.add path
+  result.paths.sort
+
 proc prepareWarmState(
     root: string, previous: ProjectManifest, cancellation: DiscoveryCancellation
 ): tuple[available: bool, state: DiscoveryState] {.gcsafe.} =
@@ -311,8 +325,11 @@ proc discoverSources*(
   if incremental.available:
     if incremental.value.status == discoveryComplete or
         incremental.value.status == discoveryCancelled:
-      return incremental.value
-  fullDiscovery(canonicalRoot, cancellation)
+      result = incremental.value
+      appendNimbleSources(canonicalRoot, result)
+      return
+  result = fullDiscovery(canonicalRoot, cancellation)
+  appendNimbleSources(canonicalRoot, result)
 
 proc discoverSources*(
     root: string, cancellation: DiscoveryCancellation = nil

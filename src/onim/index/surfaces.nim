@@ -554,9 +554,11 @@ proc addOccurrenceUncertainty(
   else:
     target.incl surfaceUnsupported
 
-proc projectSurfaceInput*(module: string, index: SourceIndex): SurfaceInput =
+proc projectSurfaceInput*(
+    module: string, index: SourceIndex, origin = surfaceProject
+): SurfaceInput =
   result.module = module
-  result.origin = surfaceProject
+  result.origin = origin
   if index == nil:
     result.uncertainty = {surfaceUnsupported, surfaceUniverseIncomplete}
     return

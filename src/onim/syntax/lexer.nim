@@ -5,6 +5,7 @@ type
     tkIdentifier
     tkString
     tkPunctuation
+    tkNumber
 
   TokenFlag* = enum
     tfStropped
@@ -227,6 +228,16 @@ proc tokenText*(tokens: TokenStore, token: Token): string =
   let bounds = tokens.tokenTextBounds(token)
   if bounds.first < bounds.past:
     result = tokens.base.source[bounds.first ..< bounds.past]
+
+proc stringLiteralValue*(tokens: TokenStore, token: Token): string =
+  if token.kind != tkString or tokens.tokenTextLen(token) < 2:
+    return
+  let quote = tokens.tokenTextChar(token, 0)
+  if (quote != '"' and quote != char(39)) or
+      tokens.tokenTextChar(token, tokens.tokenTextLen(token) - 1) != quote:
+    return
+  result = tokens.tokenText(token)
+  result = result[1 ..< result.len - 1]
 
 proc identifierKey*(tokens: TokenStore, token: Token): string =
   let bounds = tokens.tokenTextBounds(token)
@@ -492,6 +503,62 @@ proc advance(
     inc column
   inc position
 
+const supportedNumericSuffixes = [
+  "f", "f32", "d", "f64", "f128", "i8", "i16", "i32", "i64", "u", "u8", "u16", "u32",
+  "u64",
+]
+
+proc supportedNumericSuffix(source: string, first, past: int): bool {.inline.} =
+  for suffix in supportedNumericSuffixes:
+    if spanEquals(source, first, past, suffix):
+      return true
+  false
+
+proc advanceNumber(source: string, position: var int, line: var int, column: var int) =
+  let first = position
+  while position < source.len and (source[position].isDigit or source[position] == '_'):
+    advance(source, position, line, column)
+
+  let based =
+    position < source.len and source[first] == '0' and
+    source[position] in {'b', 'B', 'o', 'O', 'x', 'X'}
+  if based:
+    advance(source, position, line, column)
+    while position < source.len and (
+      source[position].isAlphaAscii or source[position].isDigit or
+      source[position] == '_'
+    )
+    :
+      advance(source, position, line, column)
+  else:
+    if position + 1 < source.len and source[position] == '.' and
+        source[position + 1] != '.':
+      advance(source, position, line, column)
+      while position < source.len and
+          (source[position].isDigit or source[position] == '_'):
+        advance(source, position, line, column)
+
+    if position < source.len and source[position] in {'e', 'E'}:
+      advance(source, position, line, column)
+      if position < source.len and source[position] in {'+', '-'}:
+        advance(source, position, line, column)
+      while position < source.len and
+          (source[position].isDigit or source[position] == '_'):
+        advance(source, position, line, column)
+
+  let quoted = position < source.len and source[position] == '\''
+  var suffixFirst = position
+  if quoted:
+    inc suffixFirst
+  var suffixPast = suffixFirst
+  while suffixPast < source.len and isIdentifierContinue(source[suffixPast]):
+    inc suffixPast
+  if suffixPast > suffixFirst and supportedNumericSuffix(
+    source, suffixFirst, suffixPast
+  ):
+    while position < suffixPast:
+      advance(source, position, line, column)
+
 proc skipQuoted(
     source: string,
     position: var int,
@@ -629,6 +696,18 @@ proc lex*(source: string): TokenStore =
           line: tokenLine,
           column: tokenColumn,
         )
+    elif c.isDigit:
+      let start = position
+      let tokenLine = line
+      let tokenColumn = column
+      advanceNumber(source, position, line, column)
+      values.add Token(
+        kind: tkNumber,
+        startOffset: start,
+        endOffset: position,
+        line: tokenLine,
+        column: tokenColumn,
+      )
     else:
       let start = position
       let tokenLine = line

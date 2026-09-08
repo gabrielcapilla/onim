@@ -49,9 +49,15 @@ type
     memberContextInvalid
     memberContextReady
 
+  MemberQualifierKind = enum
+    qualifierIdentifier
+    qualifierIndexedSequence
+
   MemberContext = object
     state: MemberContextState
+    qualifierKind: MemberQualifierKind
     qualifierToken: int
+    indexToken: int
     prefix: string
     replaceStart: int
     replaceEnd: int
@@ -113,18 +119,9 @@ proc memberContext(index: SourceIndex, byteOffset: int): MemberContext =
     return
 
   let dot = index.parsed.tokens[dotToken]
-  let qualifierToken = dotToken - 1
-  if qualifierToken < 0 or qualifierToken >= index.parsed.tokens.len or
-      dot.line != index.parsed.tokens[qualifierToken].line or
-      index.parsed.tokens[qualifierToken].kind != tkIdentifier or
-      not index.parsed.tokens[qualifierToken].validIdentifier or
-      index.parsed.tokens[qualifierToken].isStropped or
-      index.parsed.tokens[qualifierToken].isNimKeyword or
-      index.parsed.tokens[qualifierToken].endOffset != dot.startOffset or (
-    qualifierToken > 0 and
-    index.parsed.tokens.tokenTextEquals(index.parsed.tokens[qualifierToken - 1], ".") and
-    index.parsed.tokens[qualifierToken - 1].line == dot.line
-  ):
+  let qualifier = qualifierBeforeDot(index.parsed.tokens, dotToken)
+  if qualifier.qualifier < 0 or
+      index.parsed.tokens[dotToken - 1].endOffset != dot.startOffset:
     result.state = memberContextInvalid
     return
   if memberToken >= 0:
@@ -135,7 +132,10 @@ proc memberContext(index: SourceIndex, byteOffset: int): MemberContext =
       return
 
   result.state = memberContextReady
-  result.qualifierToken = qualifierToken
+  result.qualifierKind =
+    if qualifier.indexToken >= 0: qualifierIndexedSequence else: qualifierIdentifier
+  result.qualifierToken = qualifier.qualifier
+  result.indexToken = qualifier.indexToken
   result.prefix =
     if memberToken >= 0:
       index.parsed.tokens.tokenText(index.parsed.tokens[memberToken])
@@ -397,6 +397,7 @@ proc appendVisible(
 
 proc appendObjectFields(
     index: SourceIndex,
+    fields: openArray[ObjectField],
     objectType: ObjectTypeRecord,
     prefixKey: string,
     visibility: FieldVisibility,
@@ -404,14 +405,14 @@ proc appendObjectFields(
     candidateByName: var Table[string, int],
 ): bool =
   if index == nil or objectType.firstField > objectType.pastField or
-      objectType.pastField > uint32(index.types.fields.len):
+      objectType.pastField > uint32(fields.len):
     return false
   for fieldIndex in objectType.firstField ..< objectType.pastField:
-    let tokenIndex = int(index.types.fields[int(fieldIndex)].nameToken)
+    let tokenIndex = int(fields[int(fieldIndex)].nameToken)
     if tokenIndex < 0 or tokenIndex >= index.parsed.tokens.len:
       return false
     if visibility == fieldsExported and
-        index.types.fields[int(fieldIndex)].visibility != objectFieldExported:
+        fields[int(fieldIndex)].visibility != objectFieldExported:
       continue
     let token = index.parsed.tokens[tokenIndex]
     if not appendCompletionCandidate(
@@ -423,6 +424,35 @@ proc appendObjectFields(
     ):
       return false
   true
+
+proc completeEnumMembers(
+    source: WorkspaceSnapshot,
+    context: MemberContext,
+    receiver: ObjectReceiverResolution,
+): CompletionResult =
+  if not receiver.resolved or receiver.provider == nil:
+    return
+  var candidates: seq[VisibleCompletion] = @[]
+  var candidateByName = initTable[string, int]()
+  let objectOrdinal = int(receiver.objectOrdinal)
+  if objectOrdinal < 0 or objectOrdinal >= receiver.provider.types.objects.len or
+      not appendObjectFields(
+        receiver.provider,
+        receiver.provider.types.fields,
+        receiver.provider.types.objects[objectOrdinal],
+        identifierKey(context.prefix),
+        if receiver.exportedOnly: fieldsExported else: fieldsAll,
+        candidates,
+        candidateByName,
+      ) or candidates.len == 0:
+    return
+  candidates.sort(compareCompletion)
+  result.state = completionAvailable
+  result.replaceStart = context.replaceStart
+  result.replaceEnd = context.replaceEnd
+  result.items = newSeqOfCap[CompletionItem](candidates.len)
+  for candidate in candidates:
+    result.items.add candidate.item
 
 proc appendUfcsCandidate(
     name, prefixKey: string,
@@ -473,26 +503,70 @@ proc appendUfcsMembers(
       return false
   true
 
+proc appendImplicitFileMembers(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    stdlib: StdlibMap,
+    typeInfo: LocalTypeInfo,
+    prefix: string,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+): bool =
+  if typeInfo.kind != typeNamed or
+      typeInfo.typeToken >= uint32(source.index.parsed.tokens.len):
+    return false
+  let typeToken = source.index.parsed.tokens[int(typeInfo.typeToken)]
+  if not source.index.parsed.tokens.tokenTextEquals(typeToken, "File"):
+    return false
+  if resolveDefinitionAtToken(workspace, source, int(typeInfo.typeToken)).kind !=
+      definitionUnknown:
+    return false
+  for candidate in stdlib.implicitFileMembers(prefix):
+    result = true
+    discard appendCompletionCandidate(
+      candidate.name,
+      completionMethod,
+      identifierKey(prefix),
+      candidates,
+      candidateByName,
+    )
+
 proc completeLocalMembers(
     workspace: Workspace,
     source: WorkspaceSnapshot,
+    stdlib: StdlibMap,
     context: MemberContext,
     declarationToken: uint32,
 ): CompletionResult =
   if workspace == nil or not source.valid or source.index == nil or
       not source.index.bindingsReady or not source.index.nativeIndexSafe():
     return
-  let localType = workspace.resolveLocalType(source, declarationToken)
+  let indexToken =
+    if context.qualifierKind == qualifierIndexedSequence:
+      uint32(context.indexToken)
+    else:
+      InvalidTypeToken
+  let localType = workspace.resolveReceiverType(source, declarationToken, indexToken)
   if localType.info.state != typeStateResolved or not localType.info.typeId.valid:
     return
   var candidates: seq[VisibleCompletion] = @[]
   var candidateByName = initTable[string, int]()
-  let receiver = resolveObjectReceiver(workspace, source, declarationToken)
+  let receiver = resolveObjectReceiver(workspace, source, declarationToken, indexToken)
   if receiver.resolved:
     let visibility = if receiver.exportedOnly: fieldsExported else: fieldsAll
-    let objectType = receiver.provider.types.objects[int(receiver.objectOrdinal)]
+    let objectType =
+      if receiver.fieldSource == objectFieldsLocalTuple:
+        receiver.provider.types.localTupleObjects[int(receiver.objectOrdinal)]
+      else:
+        receiver.provider.types.objects[int(receiver.objectOrdinal)]
+    let fields =
+      if receiver.fieldSource == objectFieldsLocalTuple:
+        receiver.provider.types.localTupleFields
+      else:
+        receiver.provider.types.fields
     if not appendObjectFields(
       receiver.provider,
+      fields,
       objectType,
       identifierKey(context.prefix),
       visibility,
@@ -500,6 +574,15 @@ proc completeLocalMembers(
       candidateByName,
     ):
       return
+  let implicitFile = appendImplicitFileMembers(
+    workspace,
+    source,
+    stdlib,
+    localType.info,
+    identifierKey(context.prefix),
+    candidates,
+    candidateByName,
+  )
   if not appendUfcsMembers(
     workspace,
     source,
@@ -507,7 +590,7 @@ proc completeLocalMembers(
     identifierKey(context.prefix),
     candidates,
     candidateByName,
-  ):
+  ) and not implicitFile:
     return
   if candidates.len == 0:
     return
@@ -588,6 +671,27 @@ proc completeModuleMembers(
   if qualifierDefinition.kind != definitionUnknown:
     return
   let matched = source.importForQualifier(qualifier)
+  if matched.state == importMatchMissing:
+    var candidates: seq[VisibleCompletion] = @[]
+    var candidateByName = initTable[string, int]()
+    for candidate in stdlib.implicitFileMembers(qualifier, context.prefix):
+      discard appendCompletionCandidate(
+        candidate.name,
+        completionMethod,
+        identifierKey(context.prefix),
+        candidates,
+        candidateByName,
+      )
+    if candidates.len == 0:
+      return
+    candidates.sort(compareCompletion)
+    result.state = completionAvailable
+    result.replaceStart = context.replaceStart
+    result.replaceEnd = context.replaceEnd
+    result.items = newSeqOfCap[CompletionItem](candidates.len)
+    for candidate in candidates:
+      result.items.add candidate.item
+    return
   if matched.state != importMatchUnique or matched.item.synthetic or
       matched.item.conditional or matched.item.excluded.len > 0:
     return
@@ -637,11 +741,19 @@ proc completeAt*(
     let binding = source.index.resolveBinding(uint32(context.qualifierToken))
     case binding.state
     of bindingResolved:
-      completeLocalMembers(workspace, source, context, binding.declarationToken)
+      completeLocalMembers(workspace, source, stdlib, context, binding.declarationToken)
     of bindingAmbiguous:
       CompletionResult()
     of bindingUnknown:
-      completeModuleMembers(workspace, source, stdlib, context)
+      if context.qualifierKind == qualifierIndexedSequence:
+        CompletionResult()
+      else:
+        let enumReceiver =
+          resolveEnumTypeReceiver(workspace, source, uint32(context.qualifierToken))
+        if enumReceiver.resolved:
+          completeEnumMembers(source, context, enumReceiver)
+        else:
+          completeModuleMembers(workspace, source, stdlib, context)
   of memberContextInvalid:
     CompletionResult()
   of memberContextAbsent:

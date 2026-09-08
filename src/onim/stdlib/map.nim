@@ -25,6 +25,7 @@ type
     kind*: string
     arity*: int
     signature*: string
+    documentation*: string
     priority*: CandidatePriority
 
   StdlibMap* = ref object
@@ -36,9 +37,9 @@ type
     metadata: StdlibMetadataState
 
 const
-  bundledStdlibBinary = staticRead("../../../stdlib_map.bin")
+  bundledStdlibBinary = staticRead("../../stdlib_map.bin")
   stdlibBinaryMagic = "ONIMBIN1"
-  stdlibBinaryVersion = 1'u32
+  stdlibBinaryVersion = 2'u32
   stdlibBinaryHeaderSize = 32
   maxStdlibBinaryBytes = 64 * 1024 * 1024
   maxStdlibBinaryRecords = 1_000_000
@@ -60,6 +61,7 @@ type
     kind: string
     arity: int32
     signature: string
+    documentation: string
     priority: CandidatePriority
 
 proc canonicalModule*(module: string): string =
@@ -247,7 +249,8 @@ proc decodeStdlibBinary(data: string): StdlibMap =
   if reader.data[0 ..< stdlibBinaryMagic.len] != stdlibBinaryMagic:
     return emptyStdlibMap()
   reader.position = stdlibBinaryMagic.len
-  if reader.readUint32() != stdlibBinaryVersion or reader.readByte() != 1'u8 or
+  let version = reader.readUint32()
+  if (version != 1'u32 and version != stdlibBinaryVersion) or reader.readByte() != 1'u8 or
       reader.readByte() != 0'u8 or reader.readByte() != 0'u8 or reader.readByte() != 0'u8:
     return emptyStdlibMap()
   let payloadLength = reader.readUint64()
@@ -345,7 +348,7 @@ proc decodeStdlibBinary(data: string): StdlibMap =
     previousName = name
     previousCandidate = firstCandidate + count
   if previousCandidate != uint32(candidateCount) or
-      not reader.ensureRecords(candidateCount, 24):
+      not reader.ensureRecords(candidateCount, if version == 1'u32: 24 else: 28):
     return emptyStdlibMap()
 
   var candidates = newSeq[BinaryCandidate](candidateCount)
@@ -355,6 +358,11 @@ proc decodeStdlibBinary(data: string): StdlibMap =
     let kind = reader.readStringId(strings)
     let arity = reader.readInt32()
     let signature = reader.readStringId(strings)
+    let documentation =
+      if version == 1'u32:
+        ""
+      else:
+        reader.readStringId(strings)
     let priority = reader.readByte()
     if reader.readByte() != 0'u8 or reader.readByte() != 0'u8 or
         reader.readByte() != 0'u8 or not reader.valid or module.len == 0 or name.len == 0 or
@@ -367,6 +375,7 @@ proc decodeStdlibBinary(data: string): StdlibMap =
       kind: kind,
       arity: arity,
       signature: signature,
+      documentation: documentation,
       priority: CandidatePriority(priority),
     )
   if reader.position != reader.data.len:
@@ -386,6 +395,7 @@ proc decodeStdlibBinary(data: string): StdlibMap =
           kind: candidate.kind,
           arity: int(candidate.arity),
           signature: candidate.signature,
+          documentation: candidate.documentation,
           priority: candidate.priority,
         ),
       ):
@@ -489,6 +499,7 @@ proc loadStdlibMap*(path: string): StdlibMap =
           kind: stringField(entry, "kind"),
           arity: intField(entry, "arity", -1),
           signature: stringField(entry, "signature"),
+          documentation: stringField(entry, "description"),
           priority: CandidatePriority(priority),
         )
         discard addUniqueCandidate(candidates, candidate)
@@ -530,6 +541,80 @@ proc candidatesFor*(
 
 proc implicitModule*(stdlib: StdlibMap, module: string): bool =
   stdlib != nil and canonicalModule(module) in stdlib.implicitModules
+
+proc firstParameterIsFile(signature: string): bool {.inline.} =
+  let open = signature.find('(')
+  if open < 0:
+    return false
+  let colon = signature.find(':', open + 1)
+  if colon < 0:
+    return false
+  let semicolon = signature.find(';', colon + 1)
+  let close = signature.find(')', colon + 1)
+  var past = semicolon
+  if past < 0 or (close >= 0 and close < past):
+    past = close
+  past >= 0 and signature[colon + 1 ..< past].strip == "File"
+
+proc callableCandidate(candidate: SymbolCandidate): bool {.inline.} =
+  case candidate.kind
+  of "skProc", "skFunc", "skIterator", "skMethod", "skMacro", "skTemplate",
+      "skConverter":
+    true
+  else:
+    false
+
+proc implicitValueCandidate*(stdlib: StdlibMap, name: string): SymbolCandidate =
+  if stdlib == nil or not stdlib.implicitModule("std/system"):
+    return
+  for candidate in stdlib.candidatesFor(name, "", -1):
+    if candidate.kind != "skVar" or not candidate.signature.endsWith("}: File"):
+      continue
+    if result.module.len > 0:
+      return SymbolCandidate()
+    result = candidate
+
+proc implicitFileModule(stdlib: StdlibMap, name: string): string =
+  let candidate = stdlib.implicitValueCandidate(name)
+  if candidate.module.len > 0:
+    result = canonicalModule(candidate.module)
+
+proc implicitFileModule(stdlib: StdlibMap): string =
+  if stdlib == nil or not stdlib.implicitModule("std/system"):
+    return
+  for _, candidates in stdlib.symbols:
+    for candidate in candidates:
+      if candidate.kind != "skVar" or not candidate.signature.endsWith("}: File"):
+        continue
+      let module = canonicalModule(candidate.module)
+      if result.len == 0:
+        result = module
+      elif result != module:
+        return ""
+
+proc fileMembersForModule(
+    stdlib: StdlibMap, module, prefix: string
+): seq[SymbolCandidate] =
+  if module.len == 0:
+    return
+  let prefixKey = identifierKey(prefix)
+  for _, candidates in stdlib.symbols:
+    for candidate in candidates:
+      if canonicalModule(candidate.module) != module or not candidate.callableCandidate or
+          not firstParameterIsFile(candidate.signature):
+        continue
+      let key = identifierKey(candidate.name)
+      if key.len == 0 or (prefixKey.len > 0 and not key.startsWith(prefixKey)):
+        continue
+      discard addUniqueCandidate(result, candidate)
+
+proc implicitFileMembers*(
+    stdlib: StdlibMap, name, prefix: string
+): seq[SymbolCandidate] =
+  stdlib.fileMembersForModule(stdlib.implicitFileModule(name), prefix)
+
+proc implicitFileMembers*(stdlib: StdlibMap, prefix: string): seq[SymbolCandidate] =
+  stdlib.fileMembersForModule(stdlib.implicitFileModule(), prefix)
 
 proc resolveUniqueCandidate*(
   stdlib: StdlibMap, name, qualifier: string, arity = -1

@@ -13,7 +13,7 @@ import ../session/paths
 const
   cacheMagic = "ONIMIDX1"
   manifestMagic = "ONIMMAN1"
-  cacheVersion = 5'u32
+  cacheVersion = 6'u32
   manifestVersion = 3'u32
   manifestGraphVersion = 4'u32
   manifestDiscoveryVersion = 1'u32

@@ -104,6 +104,40 @@ proc matchingCallClose(tokens: TokenStore, opening: int): int =
         return index
   -1
 
+proc signatureParameters(
+    source: string, tokens: TokenStore, opening, closing: int
+): seq[string] =
+  var segment = opening + 1
+  var depth = 0
+  for index in opening + 1 ..< closing:
+    if tokenIs(tokens, index, "(") or tokenIs(tokens, index, "[") or
+        tokenIs(tokens, index, "{"):
+      inc depth
+    elif tokenIs(tokens, index, ")") or tokenIs(tokens, index, "]") or
+        tokenIs(tokens, index, "}"):
+      if depth > 0:
+        dec depth
+    elif depth == 0 and (tokenIs(tokens, index, ",") or tokenIs(tokens, index, ";")):
+      let parameter = sourceSpan(source, tokens, segment, index)
+      if parameter.len > 0:
+        result.add parameter
+      segment = index + 1
+  let parameter = sourceSpan(source, tokens, segment, closing)
+  if parameter.len > 0:
+    result.add parameter
+
+proc signatureParameters(signature: string): seq[string] =
+  let tokens = lex(signature)
+  var opening = -1
+  for index, token in tokens:
+    if tokenIs(tokens, index, "("):
+      opening = index
+      break
+  if opening >= 0:
+    let closing = matchingCallClose(tokens, opening)
+    if closing >= 0:
+      result = signatureParameters(signature, tokens, opening, closing)
+
 proc sourceSignature(
     source: WorkspaceSnapshot, symbol: SourceSymbol
 ): SignatureCandidate =
@@ -136,24 +170,7 @@ proc sourceSignature(
   if closing < 0:
     return
 
-  var segment = opening + 1
-  var depth = 0
-  for index in opening + 1 ..< closing:
-    if tokenIs(tokens, index, "(") or tokenIs(tokens, index, "[") or
-        tokenIs(tokens, index, "{"):
-      inc depth
-    elif tokenIs(tokens, index, ")") or tokenIs(tokens, index, "]") or
-        tokenIs(tokens, index, "}"):
-      if depth > 0:
-        dec depth
-    elif depth == 0 and tokenIs(tokens, index, ","):
-      let parameter = sourceSpan(source.text, tokens, segment, index)
-      if parameter.len > 0:
-        result.parameters.add parameter
-      segment = index + 1
-  let parameter = sourceSpan(source.text, tokens, segment, closing)
-  if parameter.len > 0:
-    result.parameters.add parameter
+  result.parameters = signatureParameters(source.text, tokens, opening, closing)
 
   var finish = closing + 1
   while finish < tokens.len and tokens[finish].line == tokens[closing].line and
@@ -226,7 +243,8 @@ proc stdlibSignatures(
     for candidate in stdlib.candidatesFor(name, qualifier):
       if sameModule(candidate.module, item.module):
         result.addCandidate SignatureCandidate(
-          label: candidate.signature, parameters: @[]
+          label: candidate.signature,
+          parameters: signatureParameters(candidate.signature),
         )
 
 proc resolveSignatureHelp*(

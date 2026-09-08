@@ -1417,9 +1417,8 @@ proc nativeImportAdditions(
         index.parsed.tokens.tokenTextEquals(index.parsed.tokens[tokenIndex + 1], "."):
       continue
 
-    let resolved = stdlib.resolveUniqueCandidate(
-      name, qualifier, callArity(info, source, tokenIndex)
-    )
+    let arity = callArity(info, source, tokenIndex)
+    let resolved = stdlib.resolveUniqueCandidate(name, qualifier, arity)
     if qualifier.len == 0:
       let binding = nativeBinding(info, index, name, tokenIndex)
       if binding == nativeBound:
@@ -1427,7 +1426,13 @@ proc nativeImportAdditions(
       if binding == nativeUnknown:
         result.safe = false
         return
-    let projectResult = projectCandidate(project, catalog, owner, name, qualifier)
+    var projectResult: tuple[state: NativeCandidateState, candidate: SymbolCandidate]
+    if project == nil or project.universeIsComplete():
+      projectResult = projectCandidate(project, catalog, owner, name, qualifier)
+    elif stdlib.nativeImplicitEquivalent(name, qualifier, arity):
+      projectResult.state = nativeCandidateNone
+    else:
+      projectResult.state = nativeCandidateUnknown
     var candidate: SymbolCandidate
     var candidateSource = nativeCandidateStdlibSource
     case projectResult.state
@@ -1442,9 +1447,7 @@ proc nativeImportAdditions(
       of candidateResolutionMissing:
         continue
       of candidateResolutionAmbiguous:
-        if stdlib.nativeImplicitEquivalent(
-          name, qualifier, callArity(info, source, tokenIndex)
-        ):
+        if stdlib.nativeImplicitEquivalent(name, qualifier, arity):
           continue
         result.safe = false
         return
@@ -1509,7 +1512,7 @@ proc tryOrganizeSourceWithIndex*(
       return
     additions =
       nativeImportAdditions(source, info, index, stdlib, project, catalog, owner)
-    if not additions.safe or additions.candidates.len == 0:
+    if not additions.safe:
       return
   else:
     additions =

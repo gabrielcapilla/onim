@@ -19,6 +19,7 @@ type
     kind: string
     arity: int
     signature: string
+    documentation: string
     priority: int
 
   BinarySymbol = object
@@ -28,7 +29,7 @@ type
 
 const
   stdlibBinaryMagic = "ONIMBIN1"
-  stdlibBinaryVersion = 1'u32
+  stdlibBinaryVersion = 2'u32
 
 proc binaryFingerprint(value: string): uint64 =
   var resultValue = 14695981039346656037'u64
@@ -117,12 +118,18 @@ proc writeStdlibBinary(root: JsonNode, outputPath: string) =
           entry["signature"].getStr
         else:
           ""
+      let documentation =
+        if entry.hasKey("description") and entry["description"].kind == JString:
+          entry["description"].getStr
+        else:
+          ""
       candidates.add BinaryCandidate(
         module: module,
         name: if exportedName.len > 0: exportedName else: name,
         kind: entry["kind"].getStr,
         arity: entryArity(entry),
         signature: signature,
+        documentation: documentation,
         priority: priority,
       )
       moduleSet[module] = true
@@ -143,6 +150,7 @@ proc writeStdlibBinary(root: JsonNode, outputPath: string) =
     discard pool.poolId(candidate.name)
     discard pool.poolId(candidate.kind)
     discard pool.poolId(candidate.signature)
+    discard pool.poolId(candidate.documentation)
 
   var offsets: seq[uint32] = @[]
   var lengths: seq[uint32] = @[]
@@ -179,6 +187,7 @@ proc writeStdlibBinary(root: JsonNode, outputPath: string) =
     payload.appendUint32(pool.ids[candidate.kind])
     payload.appendInt32(int32(candidate.arity))
     payload.appendUint32(pool.ids[candidate.signature])
+    payload.appendUint32(pool.ids[candidate.documentation])
     payload.appendByte(uint8(candidate.priority))
     payload.appendByte(0'u8)
     payload.appendByte(0'u8)
@@ -257,7 +266,7 @@ proc discoverNimConfig(): tuple[nimExe, libPath, nimVersion: string] =
 proc parseConfig(): GeneratorConfig =
   let discovered = discoverNimConfig()
   result.libPath = discovered.libPath
-  result.outputPath = getCurrentDir() / "stdlib_map.json"
+  result.outputPath = getCurrentDir() / "src" / "stdlib_map.json"
   for argument in commandLineParams():
     if argument.startsWith("--lib:"):
       result.libPath = argument[6 .. ^1]
@@ -330,6 +339,13 @@ proc entrySignature(entry: JsonNode, libPath: string): string =
     return normalizedSignature(entry["code"].getStr, libPath)
   ""
 
+proc entryDocumentation(entry: JsonNode): string =
+  if entry != nil and entry.kind == JObject and entry.hasKey("description") and
+      entry["description"].kind == JString:
+    entry["description"].getStr
+  else:
+    ""
+
 proc addReexportAlias(
     symbols: var Table[string, seq[JsonNode]], name, targetModule: string
 ) =
@@ -394,6 +410,9 @@ proc generate(config: GeneratorConfig, nimVersion: string) =
           %""
       item["arity"] = %entryArity(entry)
       item["signature"] = %entrySignature(entry, config.libPath)
+      let documentation = entryDocumentation(entry)
+      if documentation.len > 0:
+        item["description"] = %documentation
       symbols.mgetOrPut(name, @[]).add item
 
   # os re-exports its directory iterator implementation. The JSON doc backend

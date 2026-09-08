@@ -284,6 +284,71 @@ suite "stdio LSP":
     sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
     check process.waitForExit(3000) == 0
 
+  test "serves native organize imports before compiler availability":
+    let root = getTempDir() / ("onim-native-" & $getCurrentProcessId())
+    if dirExists(root):
+      removeFile(root / "main.nim")
+      removeDir(root)
+    createDir(root)
+    let emptyPath = root / "bin"
+    createDir(emptyPath)
+    let filePath = root / "main.nim"
+    let uri = "file://" & filePath.replace('\\', '/')
+    writeFile(
+      filePath,
+      "proc main() =\n" & "  echo fmt(\"hello\")\n" &
+        "  for kind, path in walkDir(\"/tmp\"): discard\n",
+    )
+    let projectRoot = currentSourcePath().parentDir.parentDir
+    let previousPath = getEnv("PATH")
+    putEnv("PATH", emptyPath)
+    defer:
+      putEnv("PATH", previousPath)
+      removeFile(filePath)
+      removeDir(emptyPath)
+      removeDir(root)
+    let process =
+      startProcess(projectRoot / "onim", args = ["--stdio"], workingDir = projectRoot)
+    defer:
+      close process
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"rootUri": "file://" & root.replace('\\', '/')},
+      },
+    )
+    check readResponse(process.outputStream, 1) != nil
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "method": "initialized", "params": {}}
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/codeAction",
+        "params": {
+          "textDocument": {"uri": uri}, "context": {"only": ["source.organizeImports"]}
+        },
+      },
+    )
+    let actions = readResponse(process.outputStream, 2)
+    check actions != nil
+    check actions["result"].len == 1
+    check actions["result"][0]["edit"]["changes"][uri][0]["newText"].getStr ==
+      "import std/[os, strformat]\n\n"
+    sendMessage(
+      process.inputStream,
+      %*{"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": nil},
+    )
+    check readResponse(process.outputStream, 3)["result"].kind == JNull
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
+
   test "returns organize-imports workspace edit":
     let root = currentSourcePath().parentDir.parentDir
     let filePath = root / "tests" / "before" / "walkdir.nim"
@@ -309,6 +374,8 @@ suite "stdio LSP":
     check initialized["result"]["capabilities"]["codeActionProvider"] != nil
     check initialized["result"]["capabilities"]["definitionProvider"].getBool
     check initialized["result"]["capabilities"]["typeDefinitionProvider"].getBool
+    check initialized["result"]["capabilities"]["implementationProvider"].getBool
+    check initialized["result"]["capabilities"]["callHierarchyProvider"].getBool
     check initialized["result"]["capabilities"]["hoverProvider"].getBool
     check not initialized["result"]["capabilities"]["renameProvider"]["prepareProvider"].getBool
     check initialized["result"]["capabilities"]["referencesProvider"].getBool
@@ -584,6 +651,135 @@ suite "stdio LSP":
     check definitionResult["result"]["range"]["start"]["character"].getInt == 5
     check definitionResult["result"]["range"]["end"]["character"].getInt == 11
 
+    let implementationUri = "file:///tmp/onim-implementation.nim"
+    let implementationText =
+      "type Left = object\n" & "  value*: int\n" & "type Right = object\n" &
+      "  value*: int\n" & "method render*(item: Left) = discard\n" &
+      "method render*(item: Right) = discard\n" &
+      "proc use(item: Left) = discard item.render()\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": implementationUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": implementationText,
+          }
+        },
+      },
+    )
+    check readDiagnostics(process.outputStream, implementationUri) != nil
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 39,
+        "method": "textDocument/implementation",
+        "params": {
+          "textDocument": {"uri": implementationUri},
+          "position": {
+            "line": 6, "character": implementationText.splitLines[6].find("render") + 1
+          },
+        },
+      },
+    )
+    let implementations = readResponse(process.outputStream, 39)
+    check implementations != nil
+    check implementations["result"].kind == JArray
+    check implementations["result"].len == 1
+    check implementations["result"][0]["uri"].getStr == implementationUri
+    check implementations["result"][0]["range"]["start"]["line"].getInt == 4
+    check implementations["result"][0]["range"]["start"]["character"].getInt == 7
+
+    let hierarchyUri = "file:///tmp/onim-hierarchy.nim"
+    let hierarchyText = "proc leaf*() = discard\n" & "proc caller() =\n" & "  leaf()\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": hierarchyUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": hierarchyText,
+          }
+        },
+      },
+    )
+    check readDiagnostics(process.outputStream, hierarchyUri) != nil
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 40,
+        "method": "textDocument/prepareCallHierarchy",
+        "params": {
+          "textDocument": {"uri": hierarchyUri},
+          "position":
+            {"line": 0, "character": hierarchyText.splitLines[0].find("leaf") + 1},
+        },
+      },
+    )
+    let leafItem = readResponse(process.outputStream, 40)
+    check leafItem != nil
+    check leafItem["result"].kind == JArray
+    check leafItem["result"].len == 1
+    check leafItem["result"][0]["name"].getStr == "leaf"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 41,
+        "method": "callHierarchy/incomingCalls",
+        "params": {"item": leafItem["result"][0]},
+      },
+    )
+    let incoming = readResponse(process.outputStream, 41)
+    check incoming != nil
+    check incoming["result"].kind == JArray
+    check incoming["result"].len == 1
+    check incoming["result"][0]["from"]["name"].getStr == "caller"
+    check incoming["result"][0]["fromRanges"][0]["start"]["line"].getInt == 2
+    check incoming["result"][0]["fromRanges"][0]["start"]["character"].getInt == 2
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "textDocument/prepareCallHierarchy",
+        "params": {
+          "textDocument": {"uri": hierarchyUri},
+          "position":
+            {"line": 1, "character": hierarchyText.splitLines[1].find("caller") + 1},
+        },
+      },
+    )
+    let callerItem = readResponse(process.outputStream, 42)
+    check callerItem != nil
+    check callerItem["result"].len == 1
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 43,
+        "method": "callHierarchy/outgoingCalls",
+        "params": {"item": callerItem["result"][0]},
+      },
+    )
+    let outgoing = readResponse(process.outputStream, 43)
+    check outgoing != nil
+    check outgoing["result"].kind == JArray
+    check outgoing["result"].len == 1
+    check outgoing["result"][0]["to"]["name"].getStr == "leaf"
+    check outgoing["result"][0]["fromRanges"][0]["start"]["line"].getInt == 2
+    check outgoing["result"][0]["fromRanges"][0]["start"]["character"].getInt == 2
+
     let highlightUri = "file:///tmp/onim-highlight.nim"
     let highlightText = "proc main() =\n  let value = 1\n  echo value\n"
     sendMessage(
@@ -755,6 +951,7 @@ suite "stdio LSP":
     check stdlibSignature != nil
     check stdlibSignature["result"]["signatures"].len >= 1
     check stdlibSignature["result"]["signatures"][0]["label"].getStr.contains("walkDir")
+    check stdlibSignature["result"]["signatures"][0]["parameters"].len >= 1
 
     sendMessage(
       process.inputStream,
@@ -987,6 +1184,7 @@ suite "stdio LSP":
     let stdlibHover = readResponse(process.outputStream, 14)
     check stdlibHover != nil
     check stdlibHover["result"]["contents"]["value"].getStr.contains("std/os")
+    check stdlibHover["result"]["contents"]["value"].getStr.contains("Walks over")
 
     sendMessage(
       process.inputStream,
@@ -1399,6 +1597,71 @@ suite "stdio LSP":
       },
     )
     check readResponse(process.outputStream, 3)["result"].kind == JNull
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "textDocument/prepareCallHierarchy",
+        "params": {
+          "textDocument": {"uri": providerUri},
+          "position": {"line": 0, "character": providerSource.find("answer") + 1},
+        },
+      },
+    )
+    let preparedAnswer = readResponse(process.outputStream, 5)
+    check preparedAnswer != nil
+    check preparedAnswer["result"].kind == JArray
+    check preparedAnswer["result"].len == 1
+    check preparedAnswer["result"][0]["name"].getStr == "answer"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "callHierarchy/incomingCalls",
+        "params": {"item": preparedAnswer["result"][0]},
+      },
+    )
+    let incoming = readResponse(process.outputStream, 6)
+    check incoming != nil
+    check incoming["result"].kind == JArray
+    var incomingNames: seq[string] = @[]
+    for call in incoming["result"].items:
+      incomingNames.add call["from"]["name"].getStr
+    check "useAnswer" in incomingNames
+    check "useAlias" in incomingNames
+    check "useFrom" in incomingNames
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "textDocument/prepareCallHierarchy",
+        "params": {
+          "textDocument": {"uri": aliasUri},
+          "position":
+            {"line": 1, "character": aliasSource.splitLines[1].find("useAlias") + 1},
+        },
+      },
+    )
+    let preparedAlias = readResponse(process.outputStream, 7)
+    check preparedAlias != nil
+    check preparedAlias["result"].kind == JArray
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "callHierarchy/outgoingCalls",
+        "params": {"item": preparedAlias["result"][0]},
+      },
+    )
+    let outgoing = readResponse(process.outputStream, 8)
+    check outgoing != nil
+    check outgoing["result"].kind == JArray
+    check outgoing["result"].len == 1
+    check outgoing["result"][0]["to"]["name"].getStr == "answer"
     sendMessage(
       process.inputStream, %*{"jsonrpc": "2.0", "id": 4, "method": "shutdown"}
     )

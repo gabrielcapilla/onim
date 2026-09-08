@@ -322,6 +322,38 @@ suite "organize imports":
     check attempt.handled
     check applyEdits(source, attempt.edits) == "import provider\n\n" & source
 
+  test "keeps implicit-only edits native while project surface is incomplete":
+    let project = buildSurfaceIndex(
+      @[projectSurfaceInput("provider", indexSource("proc provided*() = discard\n"))],
+      universeComplete = false,
+    )
+    let implicitSource = "proc main() =\n  echo 1'u8\n"
+    let implicitAttempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim",
+      implicitSource,
+      indexSource(implicitSource),
+      loadStdlibMap(""),
+      defaultOrganizeOptions(),
+      project,
+      nil,
+      "",
+    )
+    check implicitAttempt.handled
+    check implicitAttempt.edits.len == 0
+
+    let projectSource = "proc main() =\n  discard provided()\n"
+    let projectAttempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim",
+      projectSource,
+      indexSource(projectSource),
+      loadStdlibMap(""),
+      defaultOrganizeOptions(),
+      project,
+      nil,
+      "",
+    )
+    check not projectAttempt.handled
+
   test "uses the owner-relative project module for qualified additions":
     let source = "provider.provided()\n"
     let index = indexSource(source)

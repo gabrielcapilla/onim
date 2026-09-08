@@ -4,6 +4,9 @@ bin/
 bench/bench_organize
 bench/bench_incremental
 bench/bench_workspace
+bench/bench_completion
+bench/bench_surface
+bench/bench_references
 tests/torganize
 tests/tlsp
 tests/tworkspace

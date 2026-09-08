@@ -6,7 +6,7 @@ description = "A standalone Nim language server"
 license = "MIT"
 srcDir = "src"
 bin = @["onim"]
-installFiles = @["stdlib_map.json", "stdlib_map.bin"]
+installFiles = @["src/stdlib_map.json", "src/stdlib_map.bin"]
 
 # Dependencies
 

@@ -25,6 +25,10 @@ type
     targetDeclaration
     targetObjectField
 
+  ObjectFieldSource* = enum
+    objectFieldsNominal
+    objectFieldsLocalTuple
+
   DefinitionTarget* = object
     kind*: DefinitionTargetKind
     snapshotId*: SnapshotId
@@ -42,6 +46,7 @@ type
     provider*: SourceIndex
     objectOrdinal*: uint32
     exportedOnly*: bool
+    fieldSource*: ObjectFieldSource
 
   LocalTypeResolution* = object
     info*: LocalTypeInfo
@@ -127,7 +132,7 @@ proc symbolMatches(index: SourceIndex, name: string, exportedOnly = false): seq[
     if identifierKey(index.parsed.tokens, index.parsed.tokens[tokenIndex]) == wanted:
       result.add symbolIndex
 
-proc routineKind(kind: SourceSymbolKind): bool =
+proc routineKind*(kind: SourceSymbolKind): bool =
   kind in {
     symbolProc, symbolFunc, symbolIterator, symbolMethod, symbolMacro, symbolTemplate,
     symbolConverter,
@@ -183,6 +188,11 @@ proc targetFor(
     contentGeneration: view.contentGeneration,
     nameToken: symbol.nameToken,
   )
+
+proc resolveSymbolTarget*(
+    source: WorkspaceSnapshot, view: WorkspaceIndexView, symbolIndex: int
+): DefinitionResolution =
+  targetFor(source, view, symbolIndex)
 
 proc addTarget(targets: var seq[DefinitionTarget], target: DefinitionTarget) =
   for existing in targets:
@@ -273,22 +283,66 @@ proc importedUseSupported*(
     return false
   not source.localDeclarationShadows(tokenIndex, name)
 
-proc qualifiedMember(
-    tokens: TokenStore, tokenIndex: int
-): tuple[qualifier, member: int] =
+proc integerIndexToken(tokens: TokenStore, tokenIndex: int): bool {.inline.} =
+  if tokenIndex < 0 or tokenIndex >= tokens.len or tokens[tokenIndex].kind != tkNumber:
+    return false
+  var digits = 0
+  for index in 0 ..< tokens.tokenTextLen(tokens[tokenIndex]):
+    let character = tokens.tokenTextChar(tokens[tokenIndex], index)
+    if character == '_':
+      continue
+    if character < '0' or character > '9':
+      return false
+    inc digits
+  digits > 0
+
+proc qualifierBeforeDot*(
+    tokens: TokenStore, dotToken: int
+): tuple[qualifier, indexToken: int] =
   result = (-1, -1)
-  if tokenIndex < 2 or not tokens.tokenTextEquals(tokens[tokenIndex - 1], "."):
+  if dotToken <= 0 or dotToken >= tokens.len or
+      not tokens.tokenTextEquals(tokens[dotToken], "."):
     return
-  let qualifier = tokenIndex - 2
-  if tokens[qualifier].kind != tkIdentifier or
-      tokens[qualifier].line != tokens[tokenIndex].line or (
+  let direct = dotToken - 1
+  if tokens[direct].kind == tkIdentifier and tokens[direct].validIdentifier and
+      not tokens[direct].isStropped and not tokens[direct].isNimKeyword and
+      tokens[direct].line == tokens[dotToken].line and (
+    direct == 0 or not tokens.tokenTextEquals(tokens[direct - 1], ".") or
+    tokens[direct - 1].line != tokens[direct].line
+  ):
+    result.qualifier = direct
+    return
+  let closing = dotToken - 1
+  let indexToken = dotToken - 2
+  let opening = dotToken - 3
+  let qualifier = dotToken - 4
+  if qualifier < 0 or not tokens.tokenTextEquals(tokens[opening], "[") or
+      not integerIndexToken(tokens, indexToken) or
+      not tokens.tokenTextEquals(tokens[closing], "]") or
+      tokens[qualifier].kind != tkIdentifier or not tokens[qualifier].validIdentifier or
+      tokens[qualifier].isStropped or tokens[qualifier].isNimKeyword or
+      tokens[qualifier].line != tokens[dotToken].line or
+      tokens[indexToken].line != tokens[dotToken].line or
+      tokens[opening].line != tokens[dotToken].line or
+      tokens[closing].line != tokens[dotToken].line or (
     qualifier > 0 and tokens.tokenTextEquals(tokens[qualifier - 1], ".") and
     tokens[qualifier - 1].line == tokens[qualifier].line
-  ) or (
+  ):
+    return
+  result = (qualifier, indexToken)
+
+proc qualifiedMember(
+    tokens: TokenStore, tokenIndex: int
+): tuple[qualifier, indexToken, member: int] =
+  result = (-1, -1, -1)
+  if tokenIndex < 1 or not tokens.tokenTextEquals(tokens[tokenIndex - 1], "."):
+    return
+  let qualifier = qualifierBeforeDot(tokens, tokenIndex - 1)
+  if qualifier.qualifier < 0 or (
     tokenIndex + 1 < tokens.len and tokens.tokenTextEquals(tokens[tokenIndex + 1], ".")
   ):
     return
-  result = (qualifier, tokenIndex)
+  result = (qualifier.qualifier, qualifier.indexToken, tokenIndex)
 
 proc qualifierMatches(item: ImportInfo, qualifier: string): bool =
   if item.alias.len > 0:
@@ -439,11 +493,10 @@ proc resolveLocalType*(
     let returnInfo = targetSource.index.types.routineReturnAt(
       targetSource.index.parsed.tokens, targetSource.index.symbols, symbolIndex
     )
-    if returnInfo.state != typeStateResolved or
-        returnInfo.kind notin {
-          typeNamed, typeRef, typeGenericInstance, typeBool, typeChar, typeString,
-          typeInt, typeFloat, typeSeq,
-        }:
+    if returnInfo.state != typeStateResolved or (
+      not returnInfo.kind.isPrimitiveType and
+      returnInfo.kind notin {typeNamed, typeRef, typeGenericInstance, typeSeq}
+    ):
       result.info = LocalTypeInfo(state: typeStateUnknown)
       return
     result.info = returnInfo
@@ -453,13 +506,38 @@ proc resolveLocalType*(
   else:
     result.info = LocalTypeInfo(state: typeStateUnknown)
 
+proc resolveReceiverType*(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    declarationToken: uint32,
+    indexToken = InvalidTypeToken,
+): LocalTypeResolution =
+  result = workspace.resolveLocalType(source, declarationToken)
+  if indexToken == InvalidTypeToken:
+    return
+  if result.info.state != typeStateResolved or
+      result.info.kind notin {typeSeq, typeArray} or
+      result.info.typeToken == InvalidTypeToken:
+    result.info = LocalTypeInfo(state: typeStateUnknown)
+    return
+  let baseType = source.index.types.typeBase(result.info.typeId)
+  if source.index.types.typeKind(baseType) != typeNamed:
+    result.info = LocalTypeInfo(state: typeStateUnknown)
+    return
+  result.info.kind = typeNamed
+  result.info.typeId = baseType
+
 proc resolveObjectReceiver*(
-    workspace: Workspace, source: WorkspaceSnapshot, receiverDeclarationToken: uint32
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    receiverDeclarationToken: uint32,
+    indexToken = InvalidTypeToken,
 ): ObjectReceiverResolution =
   if workspace == nil or not validSource(source) or source.index == nil or
       not source.index.bindingsReady or not source.index.nativeIndexSafe():
     return
-  let localType = workspace.resolveLocalType(source, receiverDeclarationToken)
+  let localType =
+    workspace.resolveReceiverType(source, receiverDeclarationToken, indexToken)
   if localType.info.state != typeStateResolved or
       localType.info.kind notin {typeNamed, typeRef, typeGenericInstance}:
     return
@@ -473,6 +551,28 @@ proc resolveObjectReceiver*(
   elif localType.contentGeneration.value != source.contentGeneration.value or
       localType.snapshotId.value != source.id.value:
     return
+  if localType.info.form == localTypeFormLiteral:
+    let tupleToken =
+      if localType.info.typeToken == InvalidTypeToken:
+        receiverDeclarationToken
+      else:
+        localType.info.typeToken
+    let localTupleOrdinal = source.index.types.localTupleObjectOrdinal(tupleToken)
+    if localTupleOrdinal >= 0:
+      result.resolved = true
+      result.typeTarget = DefinitionTarget(
+        kind: targetDeclaration,
+        snapshotId: source.id,
+        fileId: source.fileId,
+        contentGeneration: source.contentGeneration,
+        nameToken: tupleToken,
+      )
+      result.provider = source.index
+      result.objectOrdinal = uint32(localTupleOrdinal)
+      result.fieldSource = objectFieldsLocalTuple
+      return
+    if localType.info.typeToken == InvalidTypeToken:
+      return
   let typeToken = localType.info.typeToken
   let typeResolution = resolveDefinitionAtToken(workspace, typeSource, int(typeToken))
   if typeResolution.kind != definitionResolved or
@@ -500,13 +600,92 @@ proc resolveObjectReceiver*(
     return
   if localType.info.kind == typeGenericInstance:
     let objectType = provider.types.objects[objectOrdinal]
-    if objectType.pastGenericParameter - objectType.firstGenericParameter != 1'u32:
+    if objectType.pastGenericParameter <= objectType.firstGenericParameter:
       return
   result.resolved = true
   result.typeTarget = typeResolution.target
   result.provider = provider
   result.objectOrdinal = uint32(objectOrdinal)
   result.exportedOnly = exportedOnly
+
+proc enumReceiverInView(
+    source: WorkspaceSnapshot,
+    view: WorkspaceIndexView,
+    name: string,
+    exportedOnly: bool,
+): ObjectReceiverResolution =
+  if not view.valid or view.index == nil or view.id.value != source.id.value:
+    return
+  let matches = symbolMatches(view.index, name, exportedOnly)
+  if matches.len != 1:
+    return
+  let symbolIndex = matches[0]
+  if view.index.symbols[symbolIndex].kind != symbolType:
+    return
+  let declarationToken = view.index.symbols[symbolIndex].nameToken
+  if not simpleEnumDeclaration(view.index.parsed.tokens, declarationToken):
+    return
+  let objectOrdinal = view.index.types.objectOrdinal(declarationToken)
+  if objectOrdinal < 0:
+    return
+  let target = targetFor(source, view, symbolIndex)
+  if target.kind != definitionResolved:
+    return
+  result.resolved = true
+  result.typeTarget = target.target
+  result.provider = view.index
+  result.objectOrdinal = uint32(objectOrdinal)
+  result.exportedOnly = exportedOnly
+
+proc resolveEnumTypeReceiver*(
+    workspace: Workspace, source: WorkspaceSnapshot, typeToken: uint32
+): ObjectReceiverResolution =
+  if workspace == nil or not validSource(source) or source.index == nil or
+      typeToken >= uint32(source.index.parsed.tokens.len):
+    return
+  let name =
+    source.index.parsed.tokens.tokenText(source.index.parsed.tokens[int(typeToken)])
+  let localView = WorkspaceIndexView(
+    valid: source.valid,
+    id: source.id,
+    fileId: source.fileId,
+    contentGeneration: source.contentGeneration,
+    index: source.index,
+  )
+  let local = enumReceiverInView(source, localView, name, exportedOnly = false)
+  if local.resolved:
+    return local
+  if not workspace.graphComplete:
+    return
+  var found = false
+  for item in source.index.parsed.imports:
+    var usable = false
+    case item.form
+    of importModule:
+      usable =
+        not item.synthetic and item.alias.len == 0 and not item.conditional and
+        item.excluded.len == 0
+    of fromModule:
+      if item.synthetic or item.alias.len > 0 or item.conditional or
+          hasExcept(source.index.parsed, item):
+        continue
+      for symbol in item.importedSymbols:
+        if sameIdentifier(symbol.name, name) and plainImported(source.text, symbol):
+          usable = true
+          break
+    if not usable:
+      continue
+    let moduleId = workspace.resolveModule(source.fileId, item.module)
+    if not moduleId.valid:
+      continue
+    let view = workspace.indexViewForFile(moduleId)
+    let candidate = enumReceiverInView(source, view, name, exportedOnly = true)
+    if not candidate.resolved:
+      continue
+    if found:
+      return
+    result = candidate
+    found = true
 
 proc resolveObjectField(
     source: WorkspaceSnapshot, receiver: ObjectReceiverResolution, memberToken: int
@@ -516,17 +695,27 @@ proc resolveObjectField(
     return unknownResolution(definitionUnsupported)
   let provider = receiver.provider
   let objectOrdinal = int(receiver.objectOrdinal)
-  if objectOrdinal < 0 or objectOrdinal >= provider.types.objects.len:
-    return unknownResolution(definitionUnsupported)
-  let objectType = provider.types.objects[objectOrdinal]
+  var objectType: ObjectTypeRecord
+  var fields: seq[ObjectField]
+  case receiver.fieldSource
+  of objectFieldsNominal:
+    if objectOrdinal < 0 or objectOrdinal >= provider.types.objects.len:
+      return unknownResolution(definitionUnsupported)
+    objectType = provider.types.objects[objectOrdinal]
+    fields = provider.types.fields
+  of objectFieldsLocalTuple:
+    if objectOrdinal < 0 or objectOrdinal >= provider.types.localTupleObjects.len:
+      return unknownResolution(definitionUnsupported)
+    objectType = provider.types.localTupleObjects[objectOrdinal]
+    fields = provider.types.localTupleFields
   if objectType.firstField > objectType.pastField or
-      objectType.pastField > uint32(provider.types.fields.len):
+      objectType.pastField > uint32(fields.len):
     return unknownResolution(definitionUnsupported)
   var matched = -1
   let wanted =
     source.index.parsed.tokens.tokenText(source.index.parsed.tokens[memberToken])
   for fieldIndex in objectType.firstField ..< objectType.pastField:
-    let field = provider.types.fields[int(fieldIndex)]
+    let field = fields[int(fieldIndex)]
     if receiver.exportedOnly and field.visibility != objectFieldExported:
       continue
     if field.nameToken >= uint32(provider.parsed.tokens.len):
@@ -541,7 +730,7 @@ proc resolveObjectField(
     matched = int(fieldIndex)
   if matched < 0:
     return unknownResolution(definitionUnsupported)
-  let field = provider.types.fields[matched]
+  let field = fields[matched]
   result.kind = definitionResolved
   result.target = DefinitionTarget(
     kind: targetObjectField,
@@ -575,6 +764,25 @@ proc resolveObjectFieldDeclaration(
     return
   unknownResolution(definitionUnsupported)
 
+proc exactNamedTypeMatch(
+    workspace: Workspace,
+    leftSource, rightSource: WorkspaceSnapshot,
+    leftToken, rightToken: uint32,
+): tuple[state: TypeState, matches: bool] =
+  if leftToken == InvalidTypeToken or rightToken == InvalidTypeToken:
+    return
+  let leftResolution = resolveDefinitionAtToken(workspace, leftSource, int(leftToken))
+  let rightResolution =
+    resolveDefinitionAtToken(workspace, rightSource, int(rightToken))
+  if leftResolution.kind != definitionResolved:
+    result.state = typeStateForDefinition(leftResolution.kind)
+    return
+  if rightResolution.kind != definitionResolved:
+    result.state = typeStateForDefinition(rightResolution.kind)
+    return
+  result.state = typeStateResolved
+  result.matches = leftResolution.target.sameDefinitionTarget(rightResolution.target)
+
 proc exactTypeMatch*(
     workspace: Workspace,
     leftSource, rightSource: WorkspaceSnapshot,
@@ -592,10 +800,11 @@ proc exactTypeMatch*(
   if left.kind != right.kind:
     result.state = typeStateResolved
     return
-  case left.kind
-  of typeBool, typeChar, typeString, typeInt, typeFloat:
+  if left.kind.isPrimitiveType:
     result.state = typeStateResolved
     result.matches = true
+    return
+  case left.kind
   of typeSeq:
     let leftBase = leftSource.index.types.typeBase(left.typeId)
     let rightBase = rightSource.index.types.typeBase(right.typeId)
@@ -603,6 +812,10 @@ proc exactTypeMatch*(
     let rightKind = rightSource.index.types.typeKind(rightBase)
     if leftKind == typeUnknown or rightKind == typeUnknown:
       return
+    if leftKind == typeNamed and rightKind == typeNamed:
+      return exactNamedTypeMatch(
+        workspace, leftSource, rightSource, left.typeToken, right.typeToken
+      )
     result.state = typeStateResolved
     result.matches = leftKind == rightKind
   of typeArray:
@@ -619,20 +832,9 @@ proc exactTypeMatch*(
       leftSource.index.types.typeKind(leftRecord.baseType) ==
       rightSource.index.types.typeKind(rightRecord.baseType)
   of typeNamed, typeRef:
-    if left.typeToken == InvalidTypeToken or right.typeToken == InvalidTypeToken:
-      return
-    let leftResolution =
-      resolveDefinitionAtToken(workspace, leftSource, int(left.typeToken))
-    let rightResolution =
-      resolveDefinitionAtToken(workspace, rightSource, int(right.typeToken))
-    if leftResolution.kind != definitionResolved:
-      result.state = typeStateForDefinition(leftResolution.kind)
-      return
-    if rightResolution.kind != definitionResolved:
-      result.state = typeStateForDefinition(rightResolution.kind)
-      return
-    result.state = typeStateResolved
-    result.matches = leftResolution.target.sameDefinitionTarget(rightResolution.target)
+    return exactNamedTypeMatch(
+      workspace, leftSource, rightSource, left.typeToken, right.typeToken
+    )
   of typeGenericInstance:
     result.state = typeStateUnresolved
   else:
@@ -805,7 +1007,7 @@ proc collectUfcsFromProvider(
       return typeStateUnknown
     let symbol = provider.index.symbols[int(candidate.symbolOrdinal)]
     if symbol.nameToken >= uint32(provider.index.parsed.tokens.len) or
-        symbol.kind notin {symbolProc, symbolFunc}:
+        symbol.kind notin {symbolProc, symbolFunc, symbolMethod}:
       return typeStateUnknown
     if imported and not symbol.exported:
       continue
@@ -948,12 +1150,14 @@ proc resolveUfcsMember(
     source: WorkspaceSnapshot,
     receiverDeclarationToken: uint32,
     memberToken: int,
+    indexToken = InvalidTypeToken,
 ): DefinitionResolution =
   if workspace == nil or not validSource(source) or source.index == nil or
       receiverDeclarationToken >= uint32(source.index.parsed.tokens.len) or
       memberToken < 0 or memberToken >= source.index.parsed.tokens.len:
     return unknownResolution(definitionUnsupported)
-  let localType = workspace.resolveLocalType(source, receiverDeclarationToken)
+  let localType =
+    workspace.resolveReceiverType(source, receiverDeclarationToken, indexToken)
   let wanted =
     source.index.parsed.tokens.tokenText(source.index.parsed.tokens[memberToken])
   if wanted.len == 0:
@@ -1032,18 +1236,38 @@ proc resolveDefinitionAtToken*(
     let qualifierBinding = source.index.resolveBinding(uint32(qualified.qualifier))
     case qualifierBinding.state
     of bindingResolved:
-      let receiver =
-        resolveObjectReceiver(workspace, source, qualifierBinding.declarationToken)
+      let receiver = resolveObjectReceiver(
+        workspace,
+        source,
+        qualifierBinding.declarationToken,
+        if qualified.indexToken >= 0:
+          uint32(qualified.indexToken)
+        else:
+          InvalidTypeToken,
+      )
       if receiver.resolved:
         let field = resolveObjectField(source, receiver, qualified.member)
         if field.kind != definitionUnsupported:
           return field
       return resolveUfcsMember(
-        workspace, source, qualifierBinding.declarationToken, qualified.member
+        workspace,
+        source,
+        qualifierBinding.declarationToken,
+        qualified.member,
+        if qualified.indexToken >= 0:
+          uint32(qualified.indexToken)
+        else:
+          InvalidTypeToken,
       )
     of bindingAmbiguous:
       return unknownResolution(definitionAmbiguous)
     of bindingUnknown:
+      if qualified.indexToken >= 0:
+        return unknownResolution(definitionUnsupported)
+      let enumReceiver =
+        resolveEnumTypeReceiver(workspace, source, uint32(qualified.qualifier))
+      if enumReceiver.resolved:
+        return resolveObjectField(source, enumReceiver, qualified.member)
       if not source.importedUseSupported(
         qualified.qualifier,
         source.index.parsed.tokens.tokenText(

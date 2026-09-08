@@ -5,6 +5,7 @@ import onim/index/bindings
 import onim/index/scopes
 import onim/session/workspace
 import onim/stdlib/map
+import onim/syntax/lexer
 
 proc hoverFor(source, wanted: string): HoverInfo =
   let workspace = initWorkspace()
@@ -27,6 +28,21 @@ suite "native hover":
     let info = hoverFor("import std/os\nwalkDir(\"/tmp\")\n", "walkDir")
     check info.state == hoverAvailable
     check info.module == "std/os"
+    check info.documentation.contains("Walks over")
+
+  test "resolves implicit stdlib File values":
+    let info = hoverFor("proc show() = discard stdout\n", "stdout")
+    check info.state == hoverAvailable
+    check info.module == "std/syncio"
+    check info.signature.endsWith(": File")
+    check info.documentation == "The standard output stream."
+
+  test "shows contiguous project declaration documentation":
+    let source =
+      "## Say hello.\n## This line continues the contract.\nproc greet*() = discard\ngreet()\n"
+    let info = hoverFor(source, "greet")
+    check info.state == hoverAvailable
+    check info.documentation == "Say hello.\nThis line continues the contract."
 
   test "resolves qualified aliases":
     let info =
@@ -64,6 +80,26 @@ proc show(person: Person) =
     check info.kind == "field"
     check info.module.len == 0
 
+  test "resolves inferred named tuple field hover":
+    let source = """proc show() =
+  let point = (x: 1, y: "ok")
+  discard point.x
+"""
+    let info = hoverAt(source, source.rfind("x"))
+    check info.state == hoverAvailable
+    check info.name == "x"
+    check info.kind == "field"
+
+  test "resolves named tuple element field hover":
+    let source = """proc show() =
+  let people = @[(name: "Ada", age: 1), (name: "Bob", age: 2)]
+  discard people[0].name
+"""
+    let info = hoverAt(source, source.rfind("people[0].name") + "people[0].".len)
+    check info.state == hoverAvailable
+    check info.name == "name"
+    check info.kind == "field"
+
   test "reports explicit, constructor, and literal local types":
     let source = """type Person = object
   name: string
@@ -74,6 +110,8 @@ proc show(value: ref Person) =
   var character = 'x'
   const text = "hello"
   let count = 42
+  let ratio = 3.14
+  let mask = 0xE
   let numbers = @[1, 2, 3]
   discard value
   discard made
@@ -81,6 +119,8 @@ proc show(value: ref Person) =
   discard character
   discard text
   discard count
+  discard ratio
+  discard mask
   discard numbers
 """
     check hoverFor(source, "value").signature == "value: ref Person"
@@ -89,6 +129,8 @@ proc show(value: ref Person) =
     check hoverFor(source, "character").signature == "var character: char"
     check hoverFor(source, "text").signature == "const text: string"
     check hoverFor(source, "count").signature == "let count: int"
+    check hoverFor(source, "ratio").signature == "let ratio: float"
+    check hoverFor(source, "mask").signature == "let mask: int"
     check hoverFor(source, "numbers").signature == "let numbers: seq[int]"
 
   test "reports explicit primitive sequence annotations":
@@ -198,21 +240,32 @@ proc show() =
       check info.name == name
       check info.signature.len == 0
 
-  test "keeps unsupported numeric suffixes conservatively rejected":
+  test "keeps numeric suffixes in one literal and preserves later bindings":
     let source = """proc show() =
   let suffixed = 1'i32
+  let byteValue = 1'u8
+  let ratioValue = 1.0'f32
+  let later = 42
   discard suffixed
+  discard byteValue
+  discard ratioValue
+  discard later
 """
     let path = "/tmp/onim-hover-suffixed.nim"
     let uri = "file:///tmp/onim-hover-suffixed.nim"
     let workspace = initWorkspace()
     discard workspace.openDocument(uri, path, source, 1)
     let snapshot = workspace.snapshotForDocument(uri, path)
-    let info =
-      resolveHover(workspace, snapshot, source.rfind("suffixed") + 1, stdlibMap())
-    check scopeMalformed in snapshot.index.scopes.uncertainty
-    check not snapshot.index.bindingsReady
-    check info.state == hoverUnavailable
+    check snapshot.index.bindingsReady
+    check lexicalIssues(snapshot.index.parsed.tokens).len == 0
+    check resolveHover(workspace, snapshot, source.rfind("suffixed") + 1, stdlibMap()).signature ==
+      "let suffixed: int32"
+    check resolveHover(workspace, snapshot, source.rfind("byteValue") + 1, stdlibMap()).signature ==
+      "let byteValue: uint8"
+    check resolveHover(workspace, snapshot, source.rfind("ratioValue") + 1, stdlibMap()).signature ==
+      "let ratioValue: float32"
+    check resolveHover(workspace, snapshot, source.rfind("later") + 1, stdlibMap()).signature ==
+      "let later: int"
 
   test "keeps typed hover bound to the nearest shadow":
     let source = """proc show() =

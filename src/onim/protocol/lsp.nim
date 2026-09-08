@@ -9,6 +9,8 @@ elif defined(windows):
 import ../features/completion
 import ../features/definition
 import ../features/hover
+import ../features/hierarchy
+import ../features/implementation
 import ../features/inlay
 import ../features/organize
 import ../features/references
@@ -61,6 +63,7 @@ type
     id: JsonNode
     semantic: SemanticKey
     uri: string
+    waitingForBootstrap: bool
 
   BootstrapRuntime = object
     active: bool
@@ -68,9 +71,23 @@ type
     nextJobGeneration: uint64
     pending: BootstrapRequest
 
+  PendingWorkspaceKind = enum
+    pendingDefinition
+    pendingReferences
+    pendingRename
+    pendingImplementation
+    pendingPrepareCallHierarchy
+    pendingIncomingCalls
+    pendingOutgoingCalls
+
   PendingWorkspaceRequest = object
+    kind: PendingWorkspaceKind
     id: JsonNode
     params: JsonNode
+
+  HierarchyGroup = object
+    target: DefinitionTarget
+    ranges: seq[JsonNode]
 
   PositionIndex = object
     lineStarts: seq[int]
@@ -470,6 +487,14 @@ proc validRenameParams(params: JsonNode): bool =
   validPositionParams(params) and params.hasKey("newName") and params["newName"] != nil and
     params["newName"].kind == JString
 
+proc validCallHierarchyItemParams(params: JsonNode): bool =
+  if params == nil or params.kind != JObject or not params.hasKey("item"):
+    return false
+  let item = params["item"]
+  item != nil and item.kind == JObject and item.hasKey("uri") and
+    validUriValue(item["uri"]) and item.hasKey("selectionRange") and
+    validRangeValue(item["selectionRange"])
+
 proc validCodeActionParams(params: JsonNode): bool =
   if not validTextDocumentParams(params) or not params.hasKey("context"):
     return false
@@ -497,12 +522,14 @@ proc validCancelParams(params: JsonNode): bool =
 proc validMethodForm(methodName: string, hasId: bool): bool =
   case methodName
   of "initialize", "shutdown", "textDocument/definition", "textDocument/typeDefinition",
-      "textDocument/references", "textDocument/hover", "textDocument/rename",
-      "textDocument/completion", "textDocument/documentSymbol",
+      "textDocument/implementation", "textDocument/references", "textDocument/hover",
+      "textDocument/rename", "textDocument/completion", "textDocument/documentSymbol",
       "textDocument/documentHighlight", "textDocument/foldingRange",
       "textDocument/selectionRange", "textDocument/signatureHelp",
       "textDocument/semanticTokens/full", "textDocument/documentLink",
-      "textDocument/inlayHint", "textDocument/codeAction", "workspace/symbol":
+      "textDocument/inlayHint", "textDocument/codeAction", "workspace/symbol",
+      "textDocument/prepareCallHierarchy", "callHierarchy/incomingCalls",
+      "callHierarchy/outgoingCalls":
     hasId
   of "initialized", "textDocument/didOpen", "textDocument/didChange",
       "textDocument/didSave", "textDocument/didClose",
@@ -527,10 +554,14 @@ proc validMethodParams(methodName: string, params: JsonNode): bool =
     validTextDocumentParams(params)
   of "workspace/didChangeWatchedFiles":
     validWatchedFileParams(params)
-  of "textDocument/definition", "textDocument/typeDefinition", "textDocument/hover",
-      "textDocument/completion", "textDocument/documentHighlight",
-      "textDocument/signatureHelp":
+  of "textDocument/definition", "textDocument/typeDefinition",
+      "textDocument/implementation", "textDocument/hover", "textDocument/completion",
+      "textDocument/documentHighlight", "textDocument/signatureHelp":
     validPositionParams(params)
+  of "textDocument/prepareCallHierarchy":
+    validPositionParams(params)
+  of "callHierarchy/incomingCalls", "callHierarchy/outgoingCalls":
+    validCallHierarchyItemParams(params)
   of "textDocument/inlayHint":
     validTextDocumentParams(params) and params.hasKey("range") and
       validRangeValue(params["range"])
@@ -978,6 +1009,36 @@ proc bootstrapPending(workspace: Workspace): bool {.inline.} =
       workspaceBootstrapPending, workspaceBootstrapIncomplete
     }
 
+proc implementationResponse(
+    params: JsonNode, workspace: Workspace
+): tuple[value: JsonNode, needsBootstrap: bool] =
+  result.value = newJArray()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let source = workspace.snapshotForDocument(uriText, path)
+  if not source.valid:
+    return
+  let positions = initPositionIndex(source.text)
+  let offset = offsetAt(positions, source.text, valueOrEmpty(params, "position"))
+  let targets = implementationTargets(workspace, source, offset)
+  if targets.len == 0:
+    result.needsBootstrap = workspace.bootstrapPending
+    if result.needsBootstrap:
+      result.value = newJNull()
+    return
+  for target in targets:
+    let view = workspace.indexViewForFile(target.fileId)
+    let location = definitionLocation(source, uriText, view, target, positions)
+    if location != nil:
+      result.value.add location
+
 proc referencesResponse(
     params: JsonNode, workspace: Workspace
 ): tuple[value: JsonNode, needsBootstrap: bool] =
@@ -1045,6 +1106,8 @@ proc hoverResponse(
   if info.module.len > 0:
     value.add "\n# " & info.module
   value.add "\n```"
+  if info.documentation.len > 0:
+    value.add "\n\n" & info.documentation
   result = %*{
     "contents": {"kind": "markdown", "value": value},
     "range": {
@@ -1278,6 +1341,140 @@ proc documentSymbolKind(kind: SourceSymbolKind): int =
       symbolConverter:
     12
 
+proc callHierarchyItem(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    sourceUri: string,
+    target: DefinitionTarget,
+    positions: PositionIndex,
+): JsonNode =
+  let view = workspace.indexViewForFile(target.fileId)
+  let symbolIndex = view.routineSymbolIndex(target)
+  if symbolIndex < 0:
+    return
+  let location = definitionLocation(source, sourceUri, view, target, positions)
+  if location == nil:
+    return
+  let token = view.index.parsed.tokens[int(target.nameToken)]
+  let name = view.index.parsed.tokens.tokenText(token)
+  %*{
+    "name": name,
+    "kind": documentSymbolKind(view.index.symbols[symbolIndex].kind),
+    "uri": location["uri"],
+    "range": location["range"],
+    "selectionRange": location["range"],
+  }
+
+proc addHierarchyGroup(
+    groups: var seq[HierarchyGroup], target: DefinitionTarget, range: JsonNode
+) =
+  if range == nil:
+    return
+  for group in groups.mitems:
+    if group.target.sameDefinitionTarget(target):
+      group.ranges.add range
+      return
+  groups.add HierarchyGroup(target: target, ranges: @[range])
+
+proc callHierarchyResponse(
+    methodName: string, params: JsonNode, workspace: Workspace
+): tuple[value: JsonNode, needsBootstrap: bool] =
+  result.value = newJNull()
+  let item = valueOrEmpty(params, "item")
+  let document =
+    if methodName == "textDocument/prepareCallHierarchy":
+      valueOrEmpty(params, "textDocument")
+    elif item.kind == JObject:
+      item
+    else:
+      newJObject()
+  if document.kind != JObject or not document.hasKey("uri") or
+      document["uri"].kind != JString:
+    return
+  let uriText = document["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let source = workspace.snapshotForDocument(uriText, path)
+  if not source.valid or source.index == nil:
+    return
+  let positions = initPositionIndex(source.text)
+  let position =
+    if methodName == "textDocument/prepareCallHierarchy":
+      valueOrEmpty(params, "position")
+    else:
+      valueOrEmpty(item["selectionRange"], "start")
+  let offset = offsetAt(positions, source.text, position)
+  let target = hierarchyTargetAt(workspace, source, offset)
+  if not target.supported:
+    result.needsBootstrap = target.needsBootstrap
+    return
+  if methodName == "textDocument/prepareCallHierarchy":
+    let hierarchyItem =
+      callHierarchyItem(workspace, source, uriText, target.target, positions)
+    if hierarchyItem != nil:
+      result.value = newJArray()
+      result.value.add hierarchyItem
+    return
+
+  let resolved =
+    if methodName == "callHierarchy/incomingCalls":
+      incomingCalls(workspace, source, offset)
+    else:
+      outgoingCalls(workspace, source, offset)
+  if not resolved.supported:
+    result.needsBootstrap = resolved.needsBootstrap
+    return
+
+  var groups: seq[HierarchyGroup] = @[]
+  for relation in resolved.calls:
+    let groupTarget =
+      if methodName == "callHierarchy/incomingCalls":
+        relation.caller
+      else:
+        relation.callee
+    let callFile =
+      if methodName == "callHierarchy/incomingCalls":
+        relation.caller.fileId
+      else:
+        source.fileId
+    let callSource =
+      if callFile.value == source.fileId.value:
+        source
+      else:
+        workspace.snapshotForFile(callFile)
+    if not callSource.valid or callSource.index == nil or
+        relation.callToken >= uint32(callSource.index.parsed.tokens.len):
+      continue
+    let callUri =
+      if callFile.value == source.fileId.value:
+        uriText
+      elif callSource.uri.len > 0:
+        callSource.uri
+      else:
+        fileUri(callSource.path)
+    let callPositions = initPositionIndex(callSource.text)
+    let location = referenceLocation(
+      callUri,
+      callSource,
+      callSource.index.parsed.tokens[int(relation.callToken)],
+      callPositions,
+    )
+    if location != nil:
+      groups.addHierarchyGroup(groupTarget, location["range"])
+
+  result.value = newJArray()
+  for group in groups:
+    let groupItem =
+      callHierarchyItem(workspace, source, uriText, group.target, positions)
+    if groupItem == nil:
+      continue
+    if methodName == "callHierarchy/incomingCalls":
+      result.value.add %*{"from": groupItem, "fromRanges": group.ranges}
+    else:
+      result.value.add %*{"to": groupItem, "fromRanges": group.ranges}
+
 proc documentSymbols(params: JsonNode, workspace: Workspace): JsonNode =
   result = newJArray()
   let textDocument = valueOrEmpty(params, "textDocument")
@@ -1319,9 +1516,9 @@ proc inlayTypeLabel(
   if ordinal < 0 or ordinal >= types.records.len:
     return
   let record = types.records[ordinal]
+  if record.kind.isPrimitiveType:
+    return record.kind.primitiveTypeName
   case record.kind
-  of typeBool, typeChar, typeString, typeInt, typeFloat:
-    result = record.kind.primitiveTypeName
   of typeNamed:
     if record.nameToken < uint32(tokens.len):
       result = tokens.tokenText(tokens[int(record.nameToken)])
@@ -1344,6 +1541,8 @@ proc inlayTypeLabel(
         result = tokens.tokenText(tokens[int(record.nameToken)]) & "[" & base & "]"
   of typeUnknown:
     result = ""
+  else:
+    discard
 
 proc inlayHints(params: JsonNode, workspace: Workspace): JsonNode =
   result = newJArray()
@@ -2037,7 +2236,13 @@ proc codeActionOutcome(
     pending: var SemanticKey,
     queued: var seq[SemanticRequest],
     options: OrganizeOptions,
-): tuple[response: JsonNode, deferred: bool, key: SemanticKey, uri: string] =
+): tuple[
+  response: JsonNode,
+  deferred: bool,
+  waitingForBootstrap: bool,
+  key: SemanticKey,
+  uri: string,
+] =
   result.response = newJArray()
   if not supportsOrganize(params):
     return
@@ -2065,11 +2270,53 @@ proc codeActionOutcome(
     if indexed.handled:
       edits = indexed.edits
     else:
+      if bootstrapPending(workspace):
+        result.deferred = true
+        result.waitingForBootstrap = true
+        result.uri = uriText
+        return
       if enqueueSemantic(snapshot, options, pending, queued):
         result.deferred = true
         result.uri = uriText
         return
   result.response = renderCodeActions(uriText, snapshot.text, edits)
+
+proc resolveBootstrapCodeActions(
+    pendingCodeActions: var seq[PendingCodeAction],
+    workspace: Workspace,
+    stdlib: var StdlibMap,
+    actionCache: var seq[CachedAction],
+    pending: var SemanticKey,
+    queued: var seq[SemanticRequest],
+    retry: bool,
+) =
+  var remaining: seq[PendingCodeAction] = @[]
+  for item in pendingCodeActions:
+    if not item.waitingForBootstrap:
+      remaining.add item
+      continue
+    if not retry:
+      sendResponse(item.id, newJArray())
+      continue
+    let snapshot = workspace.snapshotForFile(item.semantic.fileId)
+    if not snapshot.valid:
+      sendResponse(item.id, newJArray())
+      continue
+    let options = OrganizeOptions(useStdPrefix: item.semantic.useStdPrefix)
+    let indexed = cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache)
+    if indexed.handled:
+      sendResponse(item.id, renderCodeActions(item.uri, snapshot.text, indexed.edits))
+      continue
+    if enqueueSemantic(snapshot, options, pending, queued):
+      var resumed = item
+      resumed.semantic = semanticKey(snapshot, options)
+      resumed.waitingForBootstrap = false
+      remaining.add resumed
+    else:
+      sendResponse(item.id, newJArray())
+  pendingCodeActions = remaining
+  if retry:
+    discard dispatchSemantic(queued, pending)
 
 proc scheduleBootstrap(runtime: var BootstrapRuntime, workspace: Workspace): bool =
   if workspace == nil or workspace.root.len == 0:
@@ -2096,62 +2343,79 @@ proc publishOpenNativeDiagnostics(workspace: Workspace, stdlib: StdlibMap) =
     let snapshot = workspace.snapshotForFile(id)
     publishNativeDiagnostics(workspace, snapshot, stdlib, diagnosticBootstrap)
 
-proc finishPendingDefinitions(
+proc finishPendingWorkspace(
     workspace: Workspace, pending: var seq[PendingWorkspaceRequest]
 ) =
   for item in pending:
-    let response = definitionResponse(item.params, workspace)
-    if response.needsBootstrap:
-      sendResponse(item.id, newJNull())
-    else:
-      sendResponse(item.id, response.value)
-  pending.setLen(0)
-
-proc finishPendingReferences(
-    workspace: Workspace, pending: var seq[PendingWorkspaceRequest]
-) =
-  for item in pending:
-    let response = referencesResponse(item.params, workspace)
-    if response.needsBootstrap:
-      sendResponse(item.id, newJNull())
-    else:
-      sendResponse(item.id, response.value)
-  pending.setLen(0)
-
-proc finishPendingRenames(
-    workspace: Workspace, pending: var seq[PendingWorkspaceRequest]
-) =
-  for item in pending:
-    let response = renameResponse(item.params, workspace)
-    if response.needsBootstrap:
-      sendResponse(item.id, newJNull())
-    else:
-      sendResponse(item.id, response.value)
+    case item.kind
+    of pendingDefinition:
+      let response = definitionResponse(item.params, workspace)
+      sendResponse(
+        item.id,
+        if response.needsBootstrap:
+          newJNull()
+        else:
+          response.value,
+      )
+    of pendingReferences:
+      let response = referencesResponse(item.params, workspace)
+      sendResponse(
+        item.id,
+        if response.needsBootstrap:
+          newJNull()
+        else:
+          response.value,
+      )
+    of pendingRename:
+      let response = renameResponse(item.params, workspace)
+      sendResponse(
+        item.id,
+        if response.needsBootstrap:
+          newJNull()
+        else:
+          response.value,
+      )
+    of pendingImplementation:
+      let response = implementationResponse(item.params, workspace)
+      sendResponse(
+        item.id,
+        if response.needsBootstrap:
+          newJNull()
+        else:
+          response.value,
+      )
+    of pendingPrepareCallHierarchy, pendingIncomingCalls, pendingOutgoingCalls:
+      let methodName =
+        case item.kind
+        of pendingPrepareCallHierarchy: "textDocument/prepareCallHierarchy"
+        of pendingIncomingCalls: "callHierarchy/incomingCalls"
+        of pendingOutgoingCalls: "callHierarchy/outgoingCalls"
+        else: ""
+      let response = callHierarchyResponse(methodName, item.params, workspace)
+      sendResponse(
+        item.id,
+        if response.needsBootstrap:
+          newJNull()
+        else:
+          response.value,
+      )
   pending.setLen(0)
 
 proc handleBootstrapEvent(
     runtime: var BootstrapRuntime,
     workspace: Workspace,
-    pendingDefinitions: var seq[PendingWorkspaceRequest],
-    pendingReferences: var seq[PendingWorkspaceRequest],
-    pendingRenames: var seq[PendingWorkspaceRequest],
+    pendingWorkspace: var seq[PendingWorkspaceRequest],
     stdlib: StdlibMap,
     payload: string,
 ): bool =
   let value = decodeBootstrapResult(payload)
-  if value.kind == bootstrapStopped:
-    return false
   runtime.active = false
   let accepted = workspace.applyBootstrap(value)
   if accepted:
     publishOpenNativeDiagnostics(workspace, stdlib)
-    finishPendingDefinitions(workspace, pendingDefinitions)
-    finishPendingReferences(workspace, pendingReferences)
-    finishPendingRenames(workspace, pendingRenames)
+    finishPendingWorkspace(workspace, pendingWorkspace)
   elif value.kind == bootstrapFailed:
-    finishPendingDefinitions(workspace, pendingDefinitions)
-    finishPendingReferences(workspace, pendingReferences)
-    finishPendingRenames(workspace, pendingRenames)
+    finishPendingWorkspace(workspace, pendingWorkspace)
   if runtime.hasPending:
     let request = runtime.pending
     runtime.hasPending = false
@@ -2166,9 +2430,7 @@ proc runLsp*() =
   var actionCache: seq[CachedAction] = @[]
   var pending: SemanticKey
   var queued: seq[SemanticRequest] = @[]
-  var pendingDefinitions: seq[PendingWorkspaceRequest] = @[]
-  var pendingReferences: seq[PendingWorkspaceRequest] = @[]
-  var pendingRenames: seq[PendingWorkspaceRequest] = @[]
+  var pendingWorkspace: seq[PendingWorkspaceRequest] = @[]
   var pendingCodeActions: seq[PendingCodeAction] = @[]
   var bootstrap: BootstrapRuntime
   var options = defaultOrganizeOptions()
@@ -2193,11 +2455,31 @@ proc runLsp*() =
     if event.kind == lspBootstrapEvent:
       if shutdownRequested:
         continue
-      if decodeBootstrapResult(event.payload).kind != bootstrapStopped:
-        discard handleBootstrapEvent(
-          bootstrap, workspace, pendingDefinitions, pendingReferences, pendingRenames,
-          stdlib, event.payload,
-        )
+      let bootstrapResult = decodeBootstrapResult(event.payload)
+      let accepted = handleBootstrapEvent(
+        bootstrap, workspace, pendingWorkspace, stdlib, event.payload
+      )
+      if bootstrapResult.kind != bootstrapStopped:
+        if accepted and not bootstrap.active:
+          resolveBootstrapCodeActions(
+            pendingCodeActions, workspace, stdlib, actionCache, pending, queued, true
+          )
+        elif not accepted and not bootstrap.active:
+          var retryBootstrap = false
+          for item in pendingCodeActions:
+            if item.waitingForBootstrap:
+              retryBootstrap = true
+              break
+          if bootstrapResult.kind == bootstrapComplete and retryBootstrap:
+            if not scheduleBootstrap(bootstrap, workspace):
+              resolveBootstrapCodeActions(
+                pendingCodeActions, workspace, stdlib, actionCache, pending, queued,
+                false,
+              )
+          else:
+            resolveBootstrapCodeActions(
+              pendingCodeActions, workspace, stdlib, actionCache, pending, queued, false
+            )
       continue
     if event.kind == lspSemanticEvent:
       if handleSemanticEvent(
@@ -2273,6 +2555,8 @@ proc runLsp*() =
       capabilities["codeActionProvider"] = provider
       capabilities["definitionProvider"] = %true
       capabilities["typeDefinitionProvider"] = %true
+      capabilities["implementationProvider"] = %true
+      capabilities["callHierarchyProvider"] = %true
       capabilities["completionProvider"] = %*{"resolveProvider": false}
       capabilities["hoverProvider"] = %true
       capabilities["renameProvider"] = %*{"prepareProvider": false}
@@ -2313,9 +2597,7 @@ proc runLsp*() =
     of "shutdown":
       shutdownRequested = true
       cancelPendingCodeActions(pendingCodeActions)
-      cancelPendingWorkspaceRequests(pendingDefinitions)
-      cancelPendingWorkspaceRequests(pendingReferences)
-      cancelPendingWorkspaceRequests(pendingRenames)
+      cancelPendingWorkspaceRequests(pendingWorkspace)
       pending = SemanticKey()
       queued.setLen(0)
       sendResponse(id, newJNull())
@@ -2334,7 +2616,8 @@ proc runLsp*() =
           if snapshot.valid:
             finishPendingCodeActionsForUri(pendingCodeActions, uriText)
             publishNativeDiagnostics(workspace, snapshot, stdlib, diagnosticOpen)
-            if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled:
+            if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled and
+                not bootstrapPending(workspace):
               discard enqueueSemantic(snapshot, options, pending, queued)
             discard scheduleBootstrap(bootstrap, workspace)
     of "textDocument/didChange":
@@ -2350,7 +2633,7 @@ proc runLsp*() =
               publishNativeDiagnostics(workspace, snapshot, stdlib, diagnosticEdit)
               if not cacheIndexedAction(
                 workspace, snapshot, options, stdlib, actionCache
-              ).handled:
+              ).handled and not bootstrapPending(workspace):
                 discard enqueueSemantic(snapshot, options, pending, queued)
               discard scheduleBootstrap(bootstrap, workspace)
     of "textDocument/didClose":
@@ -2376,7 +2659,8 @@ proc runLsp*() =
           if before.contentGeneration.value != snapshot.contentGeneration.value:
             finishPendingCodeActionsForUri(pendingCodeActions, uriText)
             publishNativeDiagnostics(workspace, snapshot, stdlib, diagnosticEdit)
-            if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled:
+            if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled and
+                not bootstrapPending(workspace):
               discard enqueueSemantic(snapshot, options, pending, queued)
             discard scheduleBootstrap(bootstrap, workspace)
     of "workspace/didChangeWatchedFiles":
@@ -2391,7 +2675,9 @@ proc runLsp*() =
         var response = definitionResponse(params, workspace)
         if response.needsBootstrap:
           if bootstrap.active:
-            pendingDefinitions.add PendingWorkspaceRequest(id: id, params: params)
+            pendingWorkspace.add PendingWorkspaceRequest(
+              kind: pendingDefinition, id: id, params: params
+            )
           else:
             discard workspace.bootstrapWorkspace()
             response = definitionResponse(params, workspace)
@@ -2401,14 +2687,50 @@ proc runLsp*() =
     of "textDocument/typeDefinition":
       if hasId:
         sendResponse(id, typeDefinitionResponse(params, workspace))
+    of "textDocument/implementation":
+      if hasId:
+        var response = implementationResponse(params, workspace)
+        if response.needsBootstrap:
+          if bootstrap.active:
+            pendingWorkspace.add PendingWorkspaceRequest(
+              kind: pendingImplementation, id: id, params: params
+            )
+          else:
+            discard workspace.bootstrapWorkspace()
+            response = implementationResponse(params, workspace)
+            sendResponse(id, response.value)
+        else:
+          sendResponse(id, response.value)
+    of "textDocument/prepareCallHierarchy", "callHierarchy/incomingCalls",
+        "callHierarchy/outgoingCalls":
+      if hasId:
+        let pendingKind =
+          case methodName
+          of "textDocument/prepareCallHierarchy": pendingPrepareCallHierarchy
+          of "callHierarchy/incomingCalls": pendingIncomingCalls
+          else: pendingOutgoingCalls
+        var response = callHierarchyResponse(methodName, params, workspace)
+        if response.needsBootstrap:
+          if bootstrap.active:
+            pendingWorkspace.add PendingWorkspaceRequest(
+              kind: pendingKind, id: id, params: params
+            )
+          else:
+            discard workspace.bootstrapWorkspace()
+            response = callHierarchyResponse(methodName, params, workspace)
+            sendResponse(id, response.value)
+        else:
+          sendResponse(id, response.value)
     of "textDocument/references":
       if hasId:
         let response = referencesResponse(params, workspace)
         if response.needsBootstrap:
-          pendingReferences.add PendingWorkspaceRequest(id: id, params: params)
+          pendingWorkspace.add PendingWorkspaceRequest(
+            kind: pendingReferences, id: id, params: params
+          )
           if not bootstrap.active:
             if not scheduleBootstrap(bootstrap, workspace):
-              pendingReferences.setLen(pendingReferences.len - 1)
+              pendingWorkspace.setLen(pendingWorkspace.len - 1)
               sendResponse(id, newJNull())
         else:
           sendResponse(id, response.value)
@@ -2419,10 +2741,12 @@ proc runLsp*() =
       if hasId:
         let response = renameResponse(params, workspace)
         if response.needsBootstrap:
-          pendingRenames.add PendingWorkspaceRequest(id: id, params: params)
+          pendingWorkspace.add PendingWorkspaceRequest(
+            kind: pendingRename, id: id, params: params
+          )
           if not bootstrap.active:
             if not scheduleBootstrap(bootstrap, workspace):
-              pendingRenames.setLen(pendingRenames.len - 1)
+              pendingWorkspace.setLen(pendingWorkspace.len - 1)
               sendResponse(id, newJNull())
         else:
           sendResponse(id, response.value)
@@ -2470,9 +2794,7 @@ proc runLsp*() =
         finishSemanticWorkerStop()
         lspSemanticStopRequested.store(false, moRelaxed)
       if not cancellation.found:
-        if not cancelPendingWorkspaceRequest(pendingDefinitions, requestId):
-          if not cancelPendingWorkspaceRequest(pendingReferences, requestId):
-            discard cancelPendingWorkspaceRequest(pendingRenames, requestId)
+        discard cancelPendingWorkspaceRequest(pendingWorkspace, requestId)
     of "textDocument/codeAction":
       if hasId:
         let startedAt =
@@ -2494,7 +2816,10 @@ proc runLsp*() =
           finishPendingCodeActionsForUri(pendingCodeActions, outcome.uri)
         if outcome.deferred:
           pendingCodeActions.add PendingCodeAction(
-            id: id, semantic: outcome.key, uri: outcome.uri
+            id: id,
+            semantic: outcome.key,
+            uri: outcome.uri,
+            waitingForBootstrap: outcome.waitingForBootstrap,
           )
         else:
           sendResponse(id, outcome.response)

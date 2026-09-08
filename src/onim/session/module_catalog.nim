@@ -3,6 +3,7 @@ import std/os except FileId
 
 import ../syntax/lexer
 import ./ids
+import ./package_catalog
 import ./paths
 
 type
@@ -45,18 +46,8 @@ proc canonicalModuleName*(module: string): string =
     normalized = normalized.replace("//", "/")
   prefix & normalized
 
-proc pathString(tokens: TokenStore, token: Token): string =
-  if token.kind != tkString or tokens.tokenTextLen(token) < 2:
-    return ""
-  let quote = tokens.tokenTextChar(token, 0)
-  if (quote != '"' and quote != char(39)) or
-      tokens.tokenTextChar(token, tokens.tokenTextLen(token) - 1) != quote:
-    return ""
-  result = tokens.tokenText(token)
-  result = result[1 ..< result.len - 1]
-
 proc tokenPathValue(tokens: TokenStore, token: Token): string =
-  let quoted = pathString(tokens, token)
+  let quoted = tokens.stringLiteralValue(token)
   if quoted.len > 0:
     return quoted
   if token.kind == tkIdentifier and token.keyword == kwNone:
@@ -97,11 +88,13 @@ proc addNimbleRoots(catalog: ModuleCatalog, configPath: string): bool =
       inc cursor
     if cursor + 1 >= tokens.len or not tokens.tokenTextEquals(tokens[cursor], "="):
       return false
-    let value = pathString(tokens, tokens[cursor + 1])
+    let value = tokens.stringLiteralValue(tokens[cursor + 1])
     if value.len == 0:
       return false
     catalog.addConfiguredRoot(configPath, value)
-  not sawSourceDirectory or catalog.roots.len > 0
+  if not sawSourceDirectory:
+    catalog.addRoot(splitFile(configPath).dir)
+  catalog.roots.len > 0
 
 proc addNimConfigRoots(catalog: ModuleCatalog, configPath: string) =
   var source: string
@@ -139,6 +132,16 @@ proc configureRoots(catalog: ModuleCatalog, root: string) =
   except CatchableError:
     catalog.complete = false
 
+  let dependencies = canonicalRoot / "nimbledeps"
+  if dirExists(dependencies):
+    try:
+      for path in walkDirRec(dependencies):
+        if fileExists(path) and path.toLowerAscii.endsWith(".nimble") and
+            not catalog.addNimbleRoots(path):
+          catalog.complete = false
+    except CatchableError:
+      catalog.complete = false
+
   let compilerConfig = canonicalRoot / "nim.cfg"
   if fileExists(compilerConfig):
     catalog.addNimConfigRoots(compilerConfig)
@@ -147,6 +150,13 @@ proc configureRoots(catalog: ModuleCatalog, root: string) =
   # paths are not a complete description of the compiler's search path.
   if fileExists(canonicalRoot / "config.nims"):
     catalog.complete = false
+
+  for resolution in declaredNimblePackages(canonicalRoot):
+    case resolution.kind
+    of packageResolved:
+      catalog.addRoot(resolution.selected.sourceRoot)
+    of packageUnknown, packageMissing, packageAmbiguous:
+      catalog.complete = false
 
 proc moduleForPath*(catalog: ModuleCatalog, path: string): string =
   if catalog == nil:

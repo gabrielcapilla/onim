@@ -7,6 +7,7 @@ import ../index/surfaces
 import ./bootstrap_worker
 import ./ids
 import ./module_catalog
+import ./package_catalog
 import ./paths
 import ./source_discovery
 
@@ -164,8 +165,13 @@ proc persistManifest(workspace: Workspace) =
     return
   var entries: seq[ManifestEntry] = @[]
   var graphValid = true
+  var projectFileCount = 0
   for index in 0 ..< workspace.files.len:
     let file = workspace.files[index]
+    if not pathWithin(workspace.root, file.path):
+      graphValid = false
+      continue
+    inc projectFileCount
     if file.state != workspaceOnDisk:
       graphValid = false
       continue
@@ -195,7 +201,7 @@ proc persistManifest(workspace: Workspace) =
       stamp: stamp,
       unresolved: uint32(file.id) in workspace.unresolved,
     )
-  graphValid = graphValid and entries.len == workspace.files.len
+  graphValid = graphValid and entries.len == projectFileCount
   if not graphValid and workspace.manifest.graphValid:
     return
   entries.sort(
@@ -367,8 +373,13 @@ proc bootstrapManifest(value: BootstrapResult): ProjectManifest =
   result.discoveryValid = value.discoveryValid
   var ordinals = initTable[string, uint32]()
   for ordinal, file in value.files:
-    ordinals[file.path] = uint32(ordinal)
+    if pathWithin(result.root, file.path):
+      ordinals[file.path] = uint32(ordinal)
+    else:
+      result.graphValid = false
   for file in value.files:
+    if not pathWithin(result.root, file.path):
+      continue
     var entry = ManifestEntry(
       path: file.path,
       sourceHash: file.sourceHash,
@@ -379,14 +390,23 @@ proc bootstrapManifest(value: BootstrapResult): ProjectManifest =
     for dependency in file.forward:
       if ordinals.hasKey(dependency):
         entry.forwardOrdinals.add ordinals[dependency]
+      else:
+        result.graphValid = false
     entry.forwardOrdinals.sort
     result.replaceManifestEntry(entry)
 
-proc validBootstrapPath(root, path: string): bool =
-  path != root and pathWithin(root, path)
+proc validBootstrapPath(workspace: Workspace, path: string): bool =
+  if pathWithin(workspace.root, path):
+    return path != workspace.root
+  if not path.toLowerAscii.endsWith(".nim"):
+    return false
+  for root in nimbleDependencyRoots(workspace.root):
+    if pathWithin(root, path):
+      return true
+  false
 
 proc validBootstrapDirectoryPath(root, path: string): bool =
-  path == root or validBootstrapPath(root, path)
+  path == root or pathWithin(root, path)
 
 proc validBootstrapResult(workspace: Workspace, value: BootstrapResult): bool =
   if value.kind != bootstrapComplete or canonicalPath(value.root) != workspace.root or
@@ -415,7 +435,7 @@ proc validBootstrapResult(workspace: Workspace, value: BootstrapResult): bool =
   var previousPath = ""
   for file in value.files:
     let path = canonicalPath(file.path)
-    if path != file.path or not validBootstrapPath(workspace.root, path) or path in paths or
+    if path != file.path or not workspace.validBootstrapPath(path) or path in paths or
         (previousPath.len > 0 and path <= previousPath) or file.byteLength < 0 or
         file.stamp.size < 0 or file.stamp.modifiedNanoseconds < -1 or
         file.stamp.modifiedNanoseconds >= 1_000_000_000:
@@ -1429,7 +1449,12 @@ proc projectSurface*(workspace: Workspace): SurfaceIndex =
     if contentGeneration != workspace.projectSurfaceInputGenerations[fileIndex] or
         input.module != module or
         candidateCount != workspace.projectSurfaceInputCandidateCounts[fileIndex]:
-      input = projectSurfaceInput(module, workspace.files[fileIndex].index)
+      let origin =
+        if pathWithin(workspace.root, workspace.files[fileIndex].path):
+          surfaceProject
+        else:
+          surfaceExternal
+      input = projectSurfaceInput(module, workspace.files[fileIndex].index, origin)
       workspace.projectSurfaceInputs[fileIndex] = input
       workspace.projectSurfaceInputGenerations[fileIndex] = contentGeneration
       workspace.projectSurfaceInputCandidateCounts[fileIndex] = candidateCount

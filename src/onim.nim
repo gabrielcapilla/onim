@@ -1,7 +1,7 @@
 when NimMajor < 2 or (NimMajor == 2 and NimMinor < 2):
   {.fatal: "onim requires Nim 2.2.0 or newer".}
 
-import std/[os, strutils]
+import std/[os, osproc, strutils]
 
 import onim/features/organize
 import onim/protocol/lsp
@@ -15,6 +15,27 @@ proc usage(output: File) =
 
 proc version(output: File) =
   output.writeLine "onim " & onimVersion
+
+proc formatNimFile(filePath: string): bool =
+  let formatter = findExe("nph")
+  if formatter.len == 0:
+    stderr.writeLine "onim: nph was not found in PATH"
+    return false
+  try:
+    let formatted = execCmdEx(
+      quoteShell(formatter) & " " & quoteShell(filePath),
+      options = {poStdErrToStdOut, poUsePath},
+      workingDir = splitFile(filePath).dir,
+    )
+    if formatted.exitCode != 0:
+      if formatted.output.len > 0:
+        stderr.write formatted.output
+      stderr.writeLine "onim: nph failed for " & filePath
+      return false
+    true
+  except CatchableError as error:
+    stderr.writeLine "onim: nph failed for " & filePath & ": " & error.msg
+    false
 
 when isMainModule:
   if commandLineParams().len > 0 and commandLineParams()[0] == "--semantic-worker":
@@ -58,4 +79,6 @@ when isMainModule:
     quit 2
   else:
     if organizeFile(filePath, options):
+      if filePath.toLowerAscii.endsWith(".nim") and not formatNimFile(filePath):
+        quit 1
       echo "organized imports in " & filePath

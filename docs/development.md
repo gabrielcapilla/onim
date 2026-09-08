@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Nim 2.0 or newer;
+- Nim 2.2.0 or newer within the 2.2.x series;
 - Nimble;
 - `nph` for Nim formatting;
 - a matching Nim installation when regenerating the standard-library map.
@@ -19,6 +19,10 @@ nph --check src tests bench gen_stdlib_map.nim
 
 Format changed Nim modules with `nph` before committing. Documentation-only changes do not require a Nim formatter run.
 
+## Project modules
+
+Onim indexes the project root, `src`, safe `nim.cfg` paths, local Nimble dependencies, and only the user-installed packages declared by the project `.nimble` file. It reads literal package metadata without executing `config.nims` or package tasks. Unresolved or dynamic package configuration remains conservative.
+
 ## Standard-library data
 
 Regenerate the compiler-derived map after changing the active Nim installation:
@@ -27,7 +31,7 @@ Regenerate the compiler-derived map after changing the active Nim installation:
 nimble generateStdlibMap
 ```
 
-The generator walks the Nim `lib/` tree and uses Nim's JSON documentation output. `stdlib_map.json` is the readable generated source; `stdlib_map.bin` is the bundled binary form used for startup lookup. Review generated changes together and run `nimble test` after regeneration.
+The generator walks the Nim `lib/` tree and uses Nim's JSON documentation output. `src/stdlib_map.json` is the readable generated source; `src/stdlib_map.bin` is the bundled binary form used for startup lookup and Nimble installation. Review generated changes together and run `nimble test` after regeneration.
 
 ## Benchmarks
 
@@ -40,6 +44,24 @@ nimble bench
 Treat benchmark output as evidence for a fixed workload only. It does not establish a universal latency or memory guarantee. Reproduce memory or process-lifetime reports with a named project, a fixed sequence of LSP messages, and resident-memory/process-tree measurements before changing the architecture.
 
 For protocol evidence, set `ONIM_TRACE_LSP=1`; it emits diagnostic publication events with a hashed URI, versions, numeric snapshot generations, reason, and count, plus code-action request events with a hashed request ID, generations, duration, result state, worker state, and Linux `rssKb`/`peakRssKb` process-memory fields. It never emits source text or paths. Set `ONIM_TRACE_WORKERS=1` to trace semantic/bootstrap worker start, cancellation, interruption, and reap events. Both are disabled by default.
+
+## Capture a Zed diagnostic report
+
+Run the configured client with tracing inherited by the extension process:
+
+```sh
+ONIM_TRACE_LSP=1 ONIM_TRACE_WORKERS=1 zeditor --foreground --new /path/to/project 2>zed-onim.log
+```
+
+Record `zeditor --version`, `nim --version`, and the Onim commit. Reproduce the smallest edit that produces the phantom diagnostic, then record the file URI, document versions, edit/save order, and the matching `publishDiagnostics` lines from `zed-onim.log`. Do not paste source text into the trace file.
+
+After closing the Zed workspace, verify that no Onim process remains:
+
+```sh
+pgrep -af '(^|/)onim( |$)' || true
+```
+
+The report is actionable only when it includes the client sequence and the corresponding trace. Convert that sequence into a focused `tests/tlsp.nim` replay before changing runtime behavior; an unreproduced report is not evidence for a speculative fix.
 
 ## Source layout
 

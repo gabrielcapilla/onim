@@ -2,6 +2,7 @@ import std/[algorithm, strutils, unittest]
 import std/os except FileId
 
 import onim/features/definition
+import onim/features/implementation
 import onim/index/symbols
 import onim/index/types
 import onim/session/ids
@@ -43,6 +44,30 @@ proc forward*() = discard
 """
 
 suite "native definition resolution":
+  test "resolves method implementations by receiver type":
+    let text = """type Left = object
+  value*: int
+type Right = object
+  value*: int
+method render*(item: Left) = discard
+method render*(item: Right) = discard
+proc use(item: Left) = discard item.render()
+"""
+    let workspace = initWorkspace()
+    let fileId = workspace.openDocument(
+      "file:///tmp/onim-method-implementations.nim",
+      "/tmp/onim-method-implementations.nim", text, 1,
+    )
+    let snapshot = workspace.snapshotForFile(fileId)
+    let callOffset = text.rfind("item.render") + "item.".len + 1
+    let target = resolveDefinition(workspace, snapshot, callOffset)
+    check target.kind == definitionResolved
+    let implementations = implementationTargets(workspace, snapshot, callOffset)
+    check implementations.len == 1
+    if implementations.len == 1:
+      check implementations[0].fileId.value == fileId.value
+      check implementations[0].nameToken == target.target.nameToken
+
   test "resolves routine parameters and direct locals":
     let text = """proc add(value: int) =
   let total = value + 1
@@ -105,6 +130,149 @@ proc use(item: Item) =
     )
     check fieldResolution.kind == definitionResolved
     check fieldResolution.target.kind == targetObjectField
+
+    let sequenceText = """type Item = object
+  name: string
+type Other = object
+proc itemCount(items: seq[Item]) = discard
+proc otherCount(items: seq[Other]) = discard
+proc use(items: seq[Item]) =
+  discard items.itemCount
+proc useOther(items: seq[Other]) =
+  discard items.itemCount
+proc useField(items: seq[Item]) =
+  discard items[0].name
+"""
+    let sequenceWorkspace = initWorkspace()
+    let sequenceId = sequenceWorkspace.openDocument(
+      "file:///tmp/onim-sequence-ufcs.nim", "/tmp/onim-sequence-ufcs.nim", sequenceText,
+      1,
+    )
+    let sequenceSnapshot = sequenceWorkspace.snapshotForFile(sequenceId)
+    let sequenceMatch = resolveDefinition(
+      sequenceWorkspace,
+      sequenceSnapshot,
+      sequenceText.find("items.itemCount") + "items.".len + 2,
+    )
+    check sequenceMatch.kind == definitionResolved
+    check sequenceSnapshot.index.parsed.tokens.tokenText(
+      sequenceSnapshot.index.parsed.tokens[int(sequenceMatch.target.nameToken)]
+    ) == "itemCount"
+    let sequenceMismatch = resolveDefinition(
+      sequenceWorkspace,
+      sequenceSnapshot,
+      sequenceText.rfind("items.itemCount") + "items.".len + 2,
+    )
+    check sequenceMismatch.kind == definitionUnsupported
+    let sequenceField = resolveDefinition(
+      sequenceWorkspace,
+      sequenceSnapshot,
+      sequenceText.find("items[0].name") + "items[0].".len + 1,
+    )
+    check sequenceField.kind == definitionResolved
+    check sequenceField.target.kind == targetObjectField
+    let arrayText = """type Entry = object
+  name: string
+proc useArray(entries: array[2, Entry]) =
+  discard entries[0].name
+"""
+    let arrayId = sequenceWorkspace.openDocument(
+      "file:///tmp/onim-array-field.nim", "/tmp/onim-array-field.nim", arrayText, 1
+    )
+    let arraySnapshot = sequenceWorkspace.snapshotForFile(arrayId)
+    let arrayField = resolveDefinition(
+      sequenceWorkspace,
+      arraySnapshot,
+      arrayText.find("entries[0].name") + "entries[0].".len + 1,
+    )
+    check arrayField.kind == definitionResolved
+    check arrayField.target.kind == targetObjectField
+
+    let tupleSequenceText = """proc use() =
+  let people = @[(name: "Ada", age: 1), (name: "Bob", age: 2)]
+  discard people[0].name
+"""
+    let tupleSequenceWorkspace = initWorkspace()
+    let tupleSequenceId = tupleSequenceWorkspace.openDocument(
+      "file:///tmp/onim-tuple-sequence-field.nim", "/tmp/onim-tuple-sequence-field.nim",
+      tupleSequenceText, 1,
+    )
+    let tupleSequenceSnapshot = tupleSequenceWorkspace.snapshotForFile(tupleSequenceId)
+    let tupleSequenceField = resolveDefinition(
+      tupleSequenceWorkspace,
+      tupleSequenceSnapshot,
+      tupleSequenceText.find("people[0].name") + "people[0].".len + 1,
+    )
+    check tupleSequenceField.kind == definitionResolved
+    check tupleSequenceField.target.kind == targetObjectField
+
+    let enumText = """type Color = enum
+  red, green, blue
+proc show() =
+  discard Color.green
+"""
+    let enumWorkspace = initWorkspace()
+    let enumId = enumWorkspace.openDocument(
+      "file:///tmp/onim-enum.nim", "/tmp/onim-enum.nim", enumText, 1
+    )
+    let enumSnapshot = enumWorkspace.snapshotForFile(enumId)
+    let enumResolution = resolveDefinition(
+      enumWorkspace, enumSnapshot, enumText.find("Color.green") + "Color.".len + 1
+    )
+    check enumResolution.kind == definitionResolved
+    check enumResolution.target.kind == targetObjectField
+    check enumSnapshot.index.parsed.tokens.tokenText(
+      enumSnapshot.index.parsed.tokens[int(enumResolution.target.nameToken)]
+    ) == "green"
+
+  test "resolves exported enum members from direct project imports":
+    let root = getTempDir() / ("onim-enum-project-" & $getCurrentProcessId())
+    let cacheRoot = getTempDir() / ("onim-enum-project-cache-" & $getCurrentProcessId())
+    cleanTree(root)
+    cleanTree(cacheRoot)
+    createDir(root)
+    let providerPath = root / "colors.nim"
+    let consumerPath = root / "consumer.nim"
+    writeFile(providerPath, "type Color* = enum\n  red, green, blue\n")
+    writeFile(consumerPath, "import colors\nproc show() =\n  discard Color.green\n")
+
+    let previousCacheRoot = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
+    defer:
+      if previousCacheRoot.len > 0:
+        putEnv("ONIM_CACHE_DIR", previousCacheRoot)
+      else:
+        delEnv("ONIM_CACHE_DIR")
+      cleanTree(root)
+      cleanTree(cacheRoot)
+
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    let providerId = workspace.fileIdForPath(providerPath)
+    let consumerId = workspace.fileIdForPath(consumerPath)
+    check workspace.graphComplete
+    let snapshot = workspace.snapshotForFile(consumerId)
+    let resolution = resolveDefinition(
+      workspace, snapshot, snapshot.text.find("Color.green") + "Color.".len + 1
+    )
+    check resolution.kind == definitionResolved
+    check resolution.target.kind == targetObjectField
+    check resolution.target.fileId.value == providerId.value
+    let providerSnapshot = workspace.snapshotForFile(providerId)
+    check providerSnapshot.index.parsed.tokens.tokenText(
+      providerSnapshot.index.parsed.tokens[int(resolution.target.nameToken)]
+    ) == "green"
+    let fromConsumer =
+      "from colors import Color\nproc show() =\n  discard Color.green\n"
+    discard
+      workspace.changeDocument("file://" & consumerPath, consumerPath, fromConsumer, 2)
+    let fromSnapshot = workspace.snapshotForFile(consumerId)
+    let fromResolution = resolveDefinition(
+      workspace, fromSnapshot, fromSnapshot.text.find("Color.green") + "Color.".len + 1
+    )
+    check fromResolution.kind == definitionResolved
+    check fromResolution.target.kind == targetObjectField
+    check fromResolution.target.fileId.value == providerId.value
 
   test "resolves exported UFCS members from direct project imports":
     let root = getTempDir() / ("onim-ufcs-project-" & $getCurrentProcessId())
@@ -354,6 +522,48 @@ proc use() =
     let genericResolution = resolveLast(genericWorkspace, genericId, "value")
     check genericResolution.kind == definitionResolved
     check genericResolution.target.kind == targetObjectField
+
+    let tupleText = """type Point = tuple[x: int, label: string]
+proc show(point: Point) =
+  discard point.label
+"""
+    let tupleWorkspace = initWorkspace()
+    let tupleId = tupleWorkspace.openDocument(
+      "file:///tmp/onim-tuple-field.nim", "/tmp/onim-tuple-field.nim", tupleText, 1
+    )
+    let tupleResolution = resolveLast(tupleWorkspace, tupleId, "label")
+    check tupleResolution.kind == definitionResolved
+    check tupleResolution.target.kind == targetObjectField
+    let tupleSnapshot = tupleWorkspace.snapshotForFile(tupleId)
+    check tupleSnapshot.index.parsed.tokens.tokenText(
+      tupleSnapshot.index.parsed.tokens[int(tupleResolution.target.nameToken)]
+    ) == "label"
+
+    let inferredTupleText = """proc show() =
+  let point = (x: 1, y: "ok")
+  discard point.x
+"""
+    let inferredTupleWorkspace = initWorkspace()
+    let inferredTupleId = inferredTupleWorkspace.openDocument(
+      "file:///tmp/onim-inferred-tuple-field.nim", "/tmp/onim-inferred-tuple-field.nim",
+      inferredTupleText, 1,
+    )
+    let inferredTupleResolution =
+      resolveLast(inferredTupleWorkspace, inferredTupleId, "x")
+    check inferredTupleResolution.kind == definitionResolved
+    check inferredTupleResolution.target.kind == targetObjectField
+    let inferredTupleSnapshot = inferredTupleWorkspace.snapshotForFile(inferredTupleId)
+    check inferredTupleSnapshot.index.parsed.tokens.tokenText(
+      inferredTupleSnapshot.index.parsed.tokens[
+        int(inferredTupleResolution.target.nameToken)
+      ]
+    ) == "x"
+    let unnamedWorkspace = initWorkspace()
+    let unnamedId = unnamedWorkspace.openDocument(
+      "file:///tmp/onim-unnamed-tuple-field.nim", "/tmp/onim-unnamed-tuple-field.nim",
+      "proc show() =\n  let unnamed = (1, \"ok\")\n  discard unnamed.x\n", 1,
+    )
+    check resolveLast(unnamedWorkspace, unnamedId, "x").kind == definitionUnsupported
 
   test "resolves module qualifiers, aliases, and from bindings":
     let root = getTempDir() / ("onim-definition-project-" & $getCurrentProcessId())

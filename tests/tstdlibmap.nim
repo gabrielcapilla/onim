@@ -1,4 +1,4 @@
-import std/[os, sets, tables, unittest]
+import std/[os, sets, strutils, tables, unittest]
 
 import onim/index/surfaces
 import onim/stdlib/map
@@ -6,7 +6,7 @@ import onim/stdlib/map
 proc sameCandidate(left, right: SymbolCandidate): bool =
   left.module == right.module and left.name == right.name and left.kind == right.kind and
     left.arity == right.arity and left.signature == right.signature and
-    left.priority == right.priority
+    left.documentation == right.documentation and left.priority == right.priority
 
 proc assertSameMap(expected, actual: StdlibMap) =
   check actual.surfaceIsComplete
@@ -35,8 +35,9 @@ proc checkMalformed(content: string, suffix: string) =
 
 suite "packed stdlib map":
   test "matches the compiler-derived JSON map":
-    let expected = loadStdlibMap(getCurrentDir() / "stdlib_map.json")
-    let actual = loadStdlibBinary(getCurrentDir() / "stdlib_map.bin")
+    let root = currentSourcePath().parentDir.parentDir / "src"
+    let expected = loadStdlibMap(root / "stdlib_map.json")
+    let actual = loadStdlibBinary(root / "stdlib_map.bin")
     check expected.surfaceIsComplete
     assertSameMap(expected, actual)
     check actual.implicitModule("std/system")
@@ -44,9 +45,11 @@ suite "packed stdlib map":
     check surface.valid
     check surface.lookupInModule("std/os", "walkDir").candidates.len == 1
     check surface.lookupInModule("std/tables", "Table").candidates.len == 1
+    check actual.symbols["walkDir"][0].documentation.contains("Walks over")
 
   test "rejects malformed binary envelopes":
-    let source = readFile(getCurrentDir() / "stdlib_map.bin")
+    let source =
+      readFile(currentSourcePath().parentDir.parentDir / "src" / "stdlib_map.bin")
 
     var truncated = source
     truncated.setLen(truncated.len - 1)

@@ -273,7 +273,7 @@ iterator values(value: int) = discard
 method dispatch(value: int) = discard
 """
     )
-    check index.types.ufcsProcedures.len == 2
+    check index.types.ufcsProcedures.len == 3
     for candidateIndex, candidate in index.types.ufcsProcedures:
       check candidate.typeId.valid
       check candidate.parameterOrdinal < uint32(index.scopes.declarations.len)
@@ -282,7 +282,7 @@ method dispatch(value: int) = discard
       check index.parsed.tokens.tokenText(index.parsed.tokens[int(parameter.nameToken)]) ==
         "value"
       let symbol = index.symbols[int(candidate.symbolOrdinal)]
-      check symbol.kind in {symbolProc, symbolFunc}
+      check symbol.kind in {symbolProc, symbolFunc, symbolMethod}
       check symbol.nameToken < parameter.nameToken
       if candidateIndex > 0:
         check uint32(candidate.typeId) >=

@@ -433,6 +433,53 @@ suite "workspace index":
     check workspace.dependencies(mainId).hasId(providerId)
     check workspace.graphComplete
 
+  test "indexes declared installed Nimble package sources":
+    let root = getTempDir() / ("onim-installed-package-" & $getCurrentProcessId())
+    let nimbleRoot = getTempDir() / ("onim-installed-nimble-" & $getCurrentProcessId())
+    cleanTree(root)
+    cleanTree(nimbleRoot)
+    createDir(root)
+    createDir(nimbleRoot)
+    createDir(nimbleRoot / "pkgs2")
+    let packageRoot = nimbleRoot / "pkgs2" / "sample-2.0.0"
+    createDir(packageRoot)
+    createDir(packageRoot / "src")
+    let mainPath = root / "main.nim"
+    let packagePath = packageRoot / "src" / "sample.nim"
+    writeFile(
+      root / "app.nimble", "requires \"nim >= 2.2.0\"\nrequires \"sample >= 1.0\"\n"
+    )
+    writeFile(packageRoot / "sample.nimble", "version = \"2.0.0\"\nsrcDir = \"src\"\n")
+    writeFile(mainPath, "import sample\ndiscard answer()\n")
+    writeFile(packagePath, "proc answer*(): int = 42\n")
+
+    let previousNimbleRoot = getEnv("NIMBLE_DIR")
+    putEnv("NIMBLE_DIR", nimbleRoot)
+    defer:
+      if previousNimbleRoot.len > 0:
+        putEnv("NIMBLE_DIR", previousNimbleRoot)
+      else:
+        delEnv("NIMBLE_DIR")
+      cleanTree(root)
+      cleanTree(nimbleRoot)
+
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    let mainId = workspace.fileIdForPath(mainPath)
+    let packageId = workspace.fileIdForPath(packagePath)
+    check mainId.valid
+    check packageId.valid
+    check workspace.fileCount == 2
+    check workspace.moduleForPath(packagePath) == "sample"
+    check workspace.dependencies(mainId).hasId(packageId)
+    check workspace.graphComplete
+    check workspace.manifest.entries.len == 1
+    check workspace.manifest.entries[0].path == absolutePath(mainPath)
+    let surface = workspace.projectSurface()
+    let answer = surface.lookupInModule("sample", "answer")
+    check answer.kind == surfaceResolved
+    check surface.moduleAt(answer.candidates[0].surface).origin == surfaceExternal
+
   test "indexes dependencies and invalidates reverse closure":
     let root = getTempDir() / ("onim-workspace-" & $getCurrentProcessId())
     cleanRoot(root)

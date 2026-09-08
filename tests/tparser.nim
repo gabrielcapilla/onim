@@ -25,7 +25,7 @@ suite "recoverable native syntax tree":
       "\xEF\xBB\xBF# commentName\n" & "let normal_name = `strange-name`\n" &
       "let empty = ``\n" &
       "echo \"stringName\" \"\"\"tripleName\"\"\" r\"rawName\" ( [ ] )\n" &
-      "let café = 1\n" & "let broken = `unterminated\n"
+      "let café = 1\n" & "let ratio = 3.14\n" & "let broken = `unterminated\n"
     let tokens = lex(source)
     var normal = false
     var closedStrop = false
@@ -33,6 +33,7 @@ suite "recoverable native syntax tree":
     var openStrop = false
     var closedStrings = 0
     var delimiters = 0
+    var numericTokens = 0
     for token in tokens:
       if tokens.tokenTextEquals(token, "normal_name"):
         normal = token.kind == tkIdentifier and token.validIdentifier
@@ -46,6 +47,9 @@ suite "recoverable native syntax tree":
           openStrop = not token.validIdentifier
       elif token.kind == tkString and token.isClosedString:
         inc closedStrings
+      elif token.kind == tkNumber:
+        inc numericTokens
+        check tokens.tokenTextLen(token) > 0
       if token.kind == tkPunctuation and (
         tokens.tokenTextEquals(token, "(") or tokens.tokenTextEquals(token, "[") or
         tokens.tokenTextEquals(token, "]") or tokens.tokenTextEquals(token, ")")
@@ -64,6 +68,7 @@ suite "recoverable native syntax tree":
     check openStrop
     check closedStrings == 2
     check delimiters == 4
+    check numericTokens == 2
 
   test "records imports and structural containers without duplicating lexer data":
     let source = """# header
@@ -93,6 +98,18 @@ proc main(value: int) =
     check countNodes(tree, syntaxExport) == 1
     check countNodes(tree, syntaxDeclaration) == 1
     check childOf(tree, syntaxImport, syntaxWhen)
+
+  test "keeps supported numeric suffixes in one token":
+    let source =
+      "let byteValue = 1'u8\n" & "let signedValue = 2'i32\n" & "let ratio = 3.0'f32\n" &
+      "let hexadecimal = 0x10'u16\n"
+    let tokens = lex(source)
+    var numericTexts: seq[string] = @[]
+    for token in tokens:
+      if token.kind == tkNumber:
+        numericTexts.add tokens.tokenText(token)
+    check numericTexts == @["1'u8", "2'i32", "3.0'f32", "0x10'u16"]
+    check lexicalIssues(tokens).len == 0
 
   test "recovers from malformed lexical structure":
     let unclosedString = parsePartialSyntax("echo \"not closed\n")

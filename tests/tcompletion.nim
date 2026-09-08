@@ -209,6 +209,42 @@ proc show() =
     check result.state == completionAvailable
     check result.items.mapIt(it.label) == @["bravo"]
 
+  test "completes fields of named tuple aliases":
+    let source = """type Point = tuple[x: int, y: string]
+proc show(point: Point) =
+  discard point.
+"""
+    let result = memberCompletionAt(source, "point.")
+    check result.state == completionAvailable
+    check result.items.anyIt(it.label == "x" and it.kind == completionField)
+    check result.items.anyIt(it.label == "y" and it.kind == completionField)
+
+  test "completes fields of inferred named tuple literals":
+    let source = """proc show() =
+  let point = (x: 1, y: "ok")
+  discard point.
+  let unnamed = (1, "ok")
+  discard unnamed.
+"""
+    let result = memberCompletionAt(source, "point.")
+    check result.state == completionAvailable
+    check result.items.mapIt(it.label) == @["x", "y"]
+    check memberCompletionAt(source, "unnamed.").state == completionUnsupported
+
+  test "completes fields of named tuple elements in sequences":
+    let source = """proc show() =
+  let people = @[(name: "Ada", age: 1), (name: "Bob", age: 2)]
+  discard people[0].na
+"""
+    let result = memberCompletionAt(source, "people[0].na")
+    check result.state == completionAvailable
+    check result.items.mapIt(it.label) == @["name"]
+    let mixed = """proc show() =
+  let people = @[(name: "Ada"), (age: 1)]
+  discard people[0].na
+"""
+    check memberCompletionAt(mixed, "people[0].na").state == completionUnsupported
+
   test "reconstructs object type facts from the cache":
     let root = getTempDir() / ("onim-object-completion-cache-" & $getCurrentProcessId())
     let cacheRoot =
@@ -223,8 +259,13 @@ proc show() =
   Person = object
     name: string
 
+type Point = tuple[x: int, y: string]
+
 proc show(person: Person) =
   person.na
+
+proc locate(point: Point) =
+  point.la
 """
     let previous = getEnv("ONIM_CACHE_DIR")
     putEnv("ONIM_CACHE_DIR", cacheRoot)
@@ -257,6 +298,21 @@ proc show(person: Person) =
     )
     check restored.state == fresh.state
     check restored.items == fresh.items
+    let tupleOffset = source.find("point.la") + "point.la".len
+    let freshTuple = completeAt(
+      workspace,
+      WorkspaceSnapshot(valid: true, path: path, text: source, index: original),
+      tupleOffset,
+      emptyStdlibMap(),
+    )
+    let restoredTuple = completeAt(
+      workspace,
+      WorkspaceSnapshot(valid: true, path: path, text: source, index: cached),
+      tupleOffset,
+      emptyStdlibMap(),
+    )
+    check restoredTuple.state == freshTuple.state
+    check restoredTuple.items == freshTuple.items
 
   test "completes canonical stdlib module members":
     let root = getTempDir() / ("onim-module-completion-" & $getCurrentProcessId())
@@ -310,6 +366,39 @@ proc main() =
     let legacyOffset = legacy.find("filesystem.") + "filesystem.".len
     let legacyResult = completeAt(workspace, legacySnapshot, legacyOffset, stdlib)
     check legacyResult.state == completionUnsupported
+
+  test "completes implicit File receivers from stdlib metadata":
+    let source = """proc main() =
+  stdout.wri
+"""
+    let snapshot = localSnapshot(source)
+    let workspace = initWorkspace()
+    let offset = source.find("stdout.wri") + "stdout.wri".len
+    let result = completeAt(workspace, snapshot, offset, loadStdlibMap(""))
+    check result.state == completionAvailable
+    check result.items.anyIt(it.label == "write")
+    check result.items.anyIt(it.label == "writeLine")
+    check not result.items.anyIt(it.label == "writeFile")
+    check result.replaceStart == source.find("wri")
+    check result.replaceEnd == offset
+
+    let typedSource = """proc main(output: File) =
+  output.wri
+"""
+    let typedSnapshot = localSnapshot(typedSource)
+    let typedOffset = typedSource.find("output.wri") + "output.wri".len
+    let typedResult =
+      completeAt(workspace, typedSnapshot, typedOffset, loadStdlibMap(""))
+    check typedResult.state == completionAvailable
+    check typedResult.items.anyIt(it.label == "writeLine")
+
+    let stderrSource = """proc main() =
+  stderr.wri
+"""
+    let stderrSnapshot = localSnapshot(stderrSource)
+    let stderrOffset = stderrSource.find("stderr.wri") + "stderr.wri".len
+    check completeAt(workspace, stderrSnapshot, stderrOffset, loadStdlibMap("")).state ==
+      completionAvailable
 
   test "completes project members, refreshes overlays, and respects precedence":
     let root = getTempDir() / ("onim-project-completion-" & $getCurrentProcessId())
@@ -645,6 +734,110 @@ proc show(value: int) =
     check overloadResult.items.mapIt(it.label) == @["choose"]
     check overloadResult.items[0].kind == completionMethod
 
+  test "matches UFCS members by named sequence element":
+    let source = """type Item = object
+type Other = object
+
+proc itemCount*(items: seq[Item]) = discard
+proc otherCount*(items: seq[Other]) = discard
+
+proc showItems(items: seq[Item]) =
+  items.itemC
+proc showOther(items: seq[Other]) =
+  items.otherC
+"""
+    let itemResult = memberCompletionAt(source, "items.itemC")
+    check itemResult.state == completionAvailable
+    check itemResult.items.mapIt(it.label) == @["itemCount"]
+    let otherResult = memberCompletionAt(source, "items.otherC")
+    check otherResult.state == completionAvailable
+    check otherResult.items.mapIt(it.label) == @["otherCount"]
+
+  test "completes fields of indexed named sequence elements":
+    let source = """type User = object
+  name: string
+
+proc show(users: seq[User]) =
+  users[0].na
+"""
+    let result = memberCompletionAt(source, "users[0].na")
+    check result.state == completionAvailable
+    check result.items.mapIt(it.label) == @["name"]
+
+  test "completes fields of indexed named array elements":
+    let source = """type User = object
+  name: string
+
+proc show(users: array[2, User]) =
+  users[0].na
+"""
+    let result = memberCompletionAt(source, "users[0].na")
+    check result.state == completionAvailable
+    check result.items.mapIt(it.label) == @["name"]
+
+  test "completes simple enum members through the type name":
+    let source = """type Color = enum
+  red, green, blue
+
+proc show() =
+  Color.gr
+"""
+    let result = memberCompletionAt(source, "Color.gr")
+    check result.state == completionAvailable
+    check result.items.mapIt(it.label) == @["green"]
+
+    let shadowed = """type Color = enum
+  red, green
+
+proc show(Color: int) =
+  Color.gr
+    """
+    check memberCompletionAt(shadowed, "Color.gr").state == completionUnsupported
+
+  test "completes exported enum members through a project import":
+    let root = getTempDir() / ("onim-enum-completion-" & $getCurrentProcessId())
+    let cacheRoot =
+      getTempDir() / ("onim-enum-completion-cache-" & $getCurrentProcessId())
+    createDir(root)
+    let providerPath = root / "colors.nim"
+    let consumerPath = root / "consumer.nim"
+    writeFile(providerPath, "type Color* = enum\n  red, green, blue\n")
+    let consumer = "import colors\n\nproc show() =\n  Color.gr\n"
+    writeFile(consumerPath, consumer)
+    let previous = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
+    defer:
+      if previous.len > 0:
+        putEnv("ONIM_CACHE_DIR", previous)
+      else:
+        delEnv("ONIM_CACHE_DIR")
+      removeFile(providerPath)
+      removeFile(consumerPath)
+      removeDir(root)
+      if dirExists(cacheRoot):
+        removeDir(cacheRoot)
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    check workspace.graphComplete
+    let snapshot = workspace.snapshotForFile(workspace.fileIdForPath(consumerPath))
+    let result = completeAt(
+      workspace, snapshot, consumer.find("Color.gr") + "Color.gr".len, emptyStdlibMap()
+    )
+    check result.state == completionAvailable
+    check result.items.mapIt(it.label) == @["green"]
+    let fromConsumer = "from colors import Color\n\nproc show() =\n  Color.gr\n"
+    discard
+      workspace.changeDocument("file://" & consumerPath, consumerPath, fromConsumer, 2)
+    let fromSnapshot = workspace.snapshotForFile(workspace.fileIdForPath(consumerPath))
+    let fromResult = completeAt(
+      workspace,
+      fromSnapshot,
+      fromConsumer.find("Color.gr") + "Color.gr".len,
+      emptyStdlibMap(),
+    )
+    check fromResult.state == completionAvailable
+    check fromResult.items.mapIt(it.label) == @["green"]
+
   test "supports ref, ptr, constructors, and lexical type shadowing":
     let source = """type
   Shared = ref object
@@ -690,6 +883,18 @@ proc show(value: Box[int]) =
     check genericResult.state == completionAvailable
     check genericResult.items.mapIt(it.label) == @["value"]
     check genericResult.items[0].kind == completionField
+
+    let multiGeneric = """type
+  Pair[A, B] = object
+    left: A
+    right: B
+
+proc show(value: Pair[int, string]) =
+  value.le
+"""
+    let multiGenericResult = memberCompletionAt(multiGeneric, "value.le")
+    check multiGenericResult.state == completionAvailable
+    check multiGenericResult.items.mapIt(it.label) == @["left"]
 
     let invalidGeneric = """type Plain = object
   value: int
