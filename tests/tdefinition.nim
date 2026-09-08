@@ -357,6 +357,55 @@ proc show() =
     )
     check resolveLast(workspace, consumerId, "scale").kind == definitionUnsupported
 
+  test "resolves a project unary generic UFCS target":
+    let root = getTempDir() / ("onim-generic-ufcs-definition-" & $getCurrentProcessId())
+    let cacheRoot =
+      getTempDir() / ("onim-generic-ufcs-definition-cache-" & $getCurrentProcessId())
+    cleanTree(root)
+    cleanTree(cacheRoot)
+    createDir(root)
+    let providerPath = root / "provider.nim"
+    let consumerPath = root / "consumer.nim"
+    writeFile(
+      providerPath,
+      """type Box*[T] = object
+  value: T
+
+proc first*(box: Box[int]): int = discard
+""",
+    )
+    let consumer = """import provider
+proc show(value: provider.Box[int]) =
+  discard value.first()
+"""
+    writeFile(consumerPath, consumer)
+
+    let previousCacheRoot = getEnv("ONIM_CACHE_DIR")
+    putEnv("ONIM_CACHE_DIR", cacheRoot)
+    defer:
+      if previousCacheRoot.len > 0:
+        putEnv("ONIM_CACHE_DIR", previousCacheRoot)
+      else:
+        delEnv("ONIM_CACHE_DIR")
+      cleanTree(root)
+      cleanTree(cacheRoot)
+
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    let providerId = workspace.fileIdForPath(providerPath)
+    let consumerId = workspace.fileIdForPath(consumerPath)
+    check workspace.graphComplete
+    let snapshot = workspace.snapshotForFile(consumerId)
+    let resolution = resolveDefinition(
+      workspace, snapshot, snapshot.text.find("value.first") + "value.".len + 1
+    )
+    check resolution.kind == definitionResolved
+    check resolution.target.fileId.value == providerId.value
+    let providerSnapshot = workspace.snapshotForFile(providerId)
+    check providerSnapshot.index.parsed.tokens.tokenText(
+      providerSnapshot.index.parsed.tokens[int(resolution.target.nameToken)]
+    ) == "first"
+
   test "selects exact UFCS overloads by complete call arity":
     let text = """proc choose(value: int; amount: int) = discard
 proc choose(value: int; amount: int; label: string) = discard

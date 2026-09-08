@@ -1008,6 +1008,34 @@ proc annotationDescriptor(tokens: TokenStore, first, past: int): TypeDescriptor 
     result.kind = typeNamed
     result.nameToken = typeToken
 
+proc explicitUnaryPrimitiveGeneric*(
+    types: TypeIndex, tokens: TokenStore, info: LocalTypeInfo
+): bool =
+  if info.kind != typeGenericInstance or info.state != typeStateResolved or
+      info.form != localTypeFormAnnotation or info.typeToken == InvalidTypeToken:
+    return false
+  let first = int(info.firstToken)
+  let past = int(info.pastToken)
+  if first < 0 or first >= past or past > tokens.len:
+    return false
+  let descriptor = genericAnnotationDescriptor(tokens, first, past)
+  if descriptor.kind != typeGenericInstance or not descriptor.baseKind.isPrimitiveType or
+      types.typeKind(types.typeBase(info.typeId)) != descriptor.baseKind:
+    return false
+  var opening = -1
+  var commas = 0
+  for index in first ..< past:
+    if tokens.tokenTextEquals(tokens[index], "["):
+      if opening >= 0:
+        return false
+      opening = index
+    elif tokens.tokenTextEquals(tokens[index], "]"):
+      if opening < 0 or index != past - 1:
+        return false
+    elif opening >= 0 and tokens.tokenTextEquals(tokens[index], ","):
+      inc commas
+  opening >= 0 and commas == 0
+
 proc sequenceLiteralStart*(tokens: TokenStore, index: int): bool {.inline.} =
   index >= 0 and index + 1 < tokens.len and tokens[index].kind == tkPunctuation and
     tokens[index + 1].kind == tkPunctuation and
@@ -1381,7 +1409,8 @@ proc indexUfcsProcedures(
     let parameter = scopes.declarations[parameterOrdinal]
     let info = types.localTypeAt(tokens, scopes, parameter.nameToken)
     if info.state != typeStateResolved or not info.typeId.valid or
-        info.kind == typeGenericInstance:
+        info.kind == typeGenericInstance and
+        not types.explicitUnaryPrimitiveGeneric(tokens, info):
       continue
     types.ufcsProcedures.add UfcsProcedureRecord(
       typeId: info.typeId,

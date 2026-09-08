@@ -783,6 +783,31 @@ proc exactNamedTypeMatch(
   result.state = typeStateResolved
   result.matches = leftResolution.target.sameDefinitionTarget(rightResolution.target)
 
+proc exactGenericInstanceMatch(
+    workspace: Workspace,
+    leftSource, rightSource: WorkspaceSnapshot,
+    left, right: LocalTypeInfo,
+): tuple[state: TypeState, matches: bool] =
+  if not leftSource.index.types.explicitUnaryPrimitiveGeneric(
+    leftSource.index.parsed.tokens, left
+  ) or
+      not rightSource.index.types.explicitUnaryPrimitiveGeneric(
+        rightSource.index.parsed.tokens, right
+      ):
+    return
+  let leftKind =
+    leftSource.index.types.typeKind(leftSource.index.types.typeBase(left.typeId))
+  let rightKind =
+    rightSource.index.types.typeKind(rightSource.index.types.typeBase(right.typeId))
+  if leftKind == typeUnknown or rightKind == typeUnknown:
+    return
+  if leftKind != rightKind:
+    result.state = typeStateResolved
+    return
+  exactNamedTypeMatch(
+    workspace, leftSource, rightSource, left.typeToken, right.typeToken
+  )
+
 proc exactTypeMatch*(
     workspace: Workspace,
     leftSource, rightSource: WorkspaceSnapshot,
@@ -836,7 +861,7 @@ proc exactTypeMatch*(
       workspace, leftSource, rightSource, left.typeToken, right.typeToken
     )
   of typeGenericInstance:
-    result.state = typeStateUnresolved
+    return exactGenericInstanceMatch(workspace, leftSource, rightSource, left, right)
   else:
     discard
 

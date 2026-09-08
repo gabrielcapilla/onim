@@ -957,3 +957,60 @@ proc show(value: ref ref Person) =
   value.na
 """
     check memberCompletionAt(primitiveArray, "value.na").state == completionUnsupported
+
+  test "completes project generic UFCS members":
+    let root = getTempDir() / ("onim-generic-ufcs-" & $getCurrentProcessId())
+    if dirExists(root):
+      removeDir(root)
+    createDir(root)
+    let providerPath = root / "provider.nim"
+    let consumerPath = root / "consumer.nim"
+    writeFile(
+      providerPath,
+      """type Box*[T] = object
+  value: T
+
+proc first*(box: Box[int]): int = discard
+
+type Pair*[A, B] = object
+  left: A
+  right: B
+
+proc pairFirst*(pair: Pair[int, string]): int = discard
+""",
+    )
+    let consumer = """import provider
+proc show(value: provider.Box[int]) =
+  value.fi
+proc showString(value: provider.Box[string]) =
+  value.fi
+proc showPair(value: provider.Pair[int, string]) =
+  value.pa
+"""
+    writeFile(consumerPath, consumer)
+    defer:
+      for path in [providerPath, consumerPath]:
+        if fileExists(path):
+          removeFile(path)
+      removeDir(root)
+
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    check workspace.graphComplete
+    let snapshot = workspace.snapshotForFile(workspace.fileIdForPath(consumerPath))
+    let result = completeAt(
+      workspace, snapshot, consumer.find("value.fi") + "value.fi".len, loadStdlibMap("")
+    )
+    check result.state == completionAvailable
+    check result.items.mapIt(it.label) == @["first"]
+    let stringResult = completeAt(
+      workspace,
+      snapshot,
+      consumer.find("value.fi", consumer.find("showString")) + "value.fi".len,
+      loadStdlibMap(""),
+    )
+    check stringResult.state == completionUnsupported
+    let pairResult = completeAt(
+      workspace, snapshot, consumer.find("value.pa") + "value.pa".len, loadStdlibMap("")
+    )
+    check pairResult.state == completionUnsupported
