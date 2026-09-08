@@ -474,6 +474,35 @@ proc main() =
       it.name == "get"
     )
 
+    let explicit = """import std/httpclient
+proc main() =
+  var client: HttpClient
+  client.ge
+"""
+    let explicitResult = completeAt(
+      workspace,
+      localSnapshot(explicit),
+      explicit.find("client.ge") + "client.ge".len,
+      stdlib,
+    )
+    check explicitResult.state == completionAvailable
+    check explicitResult.items.anyIt(it.label == "get")
+
+    let localType = """import std/httpclient
+type HttpClient = object
+  localOnly: int
+proc main() =
+  var client: HttpClient
+  client.ge
+"""
+    let localTypeResult = completeAt(
+      workspace,
+      localSnapshot(localType),
+      localType.find("client.ge") + "client.ge".len,
+      stdlib,
+    )
+    check not localTypeResult.items.anyIt(it.label == "get")
+
     let noImport = """proc main() =
   let client = newHttpClient()
   client.ge

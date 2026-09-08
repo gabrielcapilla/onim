@@ -891,6 +891,73 @@ proc appendStdlibDirectCallMembers(
     )
   candidates.len > 0
 
+proc stdlibNominalTypeModule(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    stdlib: StdlibMap,
+    localType: LocalTypeResolution,
+): string =
+  if workspace == nil or stdlib == nil or not stdlib.surfaceIsComplete or
+      source.index == nil or localType.info.state != typeStateResolved or
+      localType.info.form != localTypeFormAnnotation or localType.info.kind != typeNamed or
+      localType.info.typeToken >= uint32(source.index.parsed.tokens.len):
+    return
+  let typeToken = int(localType.info.typeToken)
+  let typeName =
+    source.index.parsed.tokens.tokenText(source.index.parsed.tokens[typeToken])
+  if typeName.len == 0 or source.index.moduleDeclarationShadows(typeToken) or
+      not source.importedUseSupported(typeToken, typeName) or
+      resolveDefinitionAtToken(workspace, source, typeToken).kind != definitionUnknown:
+    return
+
+  var provider = ""
+  for item in source.index.parsed.imports:
+    if item.form != importModule or item.alias.len > 0 or item.synthetic or
+        item.conditional or item.excluded.len > 0:
+      continue
+    let module = canonicalModule(item.module)
+    if not module.startsWith("std/"):
+      continue
+    var matches = 0
+    for candidate in stdlib.candidatesFor(typeName, ""):
+      if sameModule(candidate.module, module) and
+          (candidate.kind == "skType" or candidate.kind == "type"):
+        inc matches
+    if matches != 1:
+      if matches > 1:
+        return
+      continue
+    if provider.len > 0 and provider != module:
+      return
+    provider = module
+  provider
+
+proc appendStdlibNominalMembers(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    stdlib: StdlibMap,
+    localType: LocalTypeResolution,
+    prefix: string,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+): bool =
+  let module = stdlibNominalTypeModule(workspace, source, stdlib, localType)
+  if module.len == 0:
+    return
+  let typeName = source.index.parsed.tokens.tokenText(
+    source.index.parsed.tokens[int(localType.info.typeToken)]
+  )
+  let before = candidates.len
+  for candidate in stdlib.directNominalMembers(module, typeName, prefix):
+    discard appendCompletionCandidate(
+      candidate.name,
+      completionMethod,
+      identifierKey(prefix),
+      candidates,
+      candidateByName,
+    )
+  candidates.len > before
+
 proc completeLocalMembers(
     workspace: Workspace,
     source: WorkspaceSnapshot,
@@ -909,6 +976,7 @@ proc completeLocalMembers(
   let localType = workspace.resolveReceiverType(source, declarationToken, indexToken)
   var candidates: seq[VisibleCompletion] = @[]
   var candidateByName = initTable[string, int]()
+  var stdlibNominal = false
   if localType.info.state != typeStateResolved or not localType.info.typeId.valid:
     if not appendStdlibDirectCallMembers(
       workspace, source, stdlib, declarationToken, context.prefix, candidates,
@@ -940,6 +1008,9 @@ proc completeLocalMembers(
         candidateByName,
       ):
         return
+    stdlibNominal = appendStdlibNominalMembers(
+      workspace, source, stdlib, localType, context.prefix, candidates, candidateByName
+    )
     let implicitFile = appendImplicitFileMembers(
       workspace,
       source,
@@ -956,7 +1027,7 @@ proc completeLocalMembers(
       identifierKey(context.prefix),
       candidates,
       candidateByName,
-    ) and not implicitFile:
+    ) and not implicitFile and not stdlibNominal:
       return
   if candidates.len == 0:
     return
