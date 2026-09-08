@@ -74,6 +74,7 @@ type
   PendingWorkspaceKind = enum
     pendingDefinition
     pendingReferences
+    pendingPrepareRename
     pendingRename
     pendingImplementation
     pendingPrepareCallHierarchy
@@ -523,13 +524,13 @@ proc validMethodForm(methodName: string, hasId: bool): bool =
   case methodName
   of "initialize", "shutdown", "textDocument/definition", "textDocument/typeDefinition",
       "textDocument/implementation", "textDocument/references", "textDocument/hover",
-      "textDocument/rename", "textDocument/completion", "textDocument/documentSymbol",
-      "textDocument/documentHighlight", "textDocument/foldingRange",
-      "textDocument/selectionRange", "textDocument/signatureHelp",
-      "textDocument/semanticTokens/full", "textDocument/documentLink",
-      "textDocument/inlayHint", "textDocument/codeAction", "workspace/symbol",
-      "textDocument/prepareCallHierarchy", "callHierarchy/incomingCalls",
-      "callHierarchy/outgoingCalls":
+      "textDocument/prepareRename", "textDocument/rename", "textDocument/completion",
+      "textDocument/documentSymbol", "textDocument/documentHighlight",
+      "textDocument/foldingRange", "textDocument/selectionRange",
+      "textDocument/signatureHelp", "textDocument/semanticTokens/full",
+      "textDocument/documentLink", "textDocument/inlayHint", "textDocument/codeAction",
+      "workspace/symbol", "textDocument/prepareCallHierarchy",
+      "callHierarchy/incomingCalls", "callHierarchy/outgoingCalls":
     hasId
   of "initialized", "textDocument/didOpen", "textDocument/didChange",
       "textDocument/didSave", "textDocument/didClose",
@@ -556,7 +557,8 @@ proc validMethodParams(methodName: string, params: JsonNode): bool =
     validWatchedFileParams(params)
   of "textDocument/definition", "textDocument/typeDefinition",
       "textDocument/implementation", "textDocument/hover", "textDocument/completion",
-      "textDocument/documentHighlight", "textDocument/signatureHelp":
+      "textDocument/documentHighlight", "textDocument/signatureHelp",
+      "textDocument/prepareRename":
     validPositionParams(params)
   of "textDocument/prepareCallHierarchy":
     validPositionParams(params)
@@ -1285,6 +1287,40 @@ proc renameResponse(
   ):
     return
   result.value = %*{"changes": changes}
+
+proc prepareRenameResponse(
+    params: JsonNode, workspace: Workspace
+): tuple[value: JsonNode, needsBootstrap: bool] =
+  result.value = newJNull()
+  let textDocument = valueOrEmpty(params, "textDocument")
+  if textDocument.kind != JObject or not textDocument.hasKey("uri") or
+      textDocument["uri"].kind != JString:
+    return
+  let uriText = textDocument["uri"].getStr
+  let path = uriToPath(uriText)
+  if path.len == 0 or path.toLowerAscii.endsWith(".nimble") or
+      path.toLowerAscii.endsWith(".cfg"):
+    return
+  let snapshot = workspace.snapshotForDocument(uriText, path)
+  if not snapshot.valid or snapshot.index == nil:
+    return
+  let positions = initPositionIndex(snapshot.text)
+  let offset = offsetAt(positions, snapshot.text, valueOrEmpty(params, "position"))
+  let resolution = resolveDefinition(workspace, snapshot, offset)
+  result.needsBootstrap = resolution.kind == definitionUnresolved
+  if resolution.kind != definitionResolved or resolution.target.kind != targetDeclaration:
+    return
+  let tokenIndex = tokenAtOffset(snapshot.index.parsed.tokens, offset)
+  if tokenIndex < 0 or tokenIndex >= snapshot.index.parsed.tokens.len:
+    return
+  let token = snapshot.index.parsed.tokens[tokenIndex]
+  if token.kind != tkIdentifier or not validIdentifier(token) or token.startOffset < 0 or
+      token.endOffset <= token.startOffset or token.endOffset > snapshot.text.len:
+    return
+  result.value = %*{
+    "start": positionAt(positions, snapshot.text, token.startOffset),
+    "end": positionAt(positions, snapshot.text, token.endOffset),
+  }
 
 proc completionItemKind(kind: CompletionKind): int {.inline.} =
   case kind
@@ -2366,6 +2402,15 @@ proc finishPendingWorkspace(
         else:
           response.value,
       )
+    of pendingPrepareRename:
+      let response = prepareRenameResponse(item.params, workspace)
+      sendResponse(
+        item.id,
+        if response.needsBootstrap:
+          newJNull()
+        else:
+          response.value,
+      )
     of pendingRename:
       let response = renameResponse(item.params, workspace)
       sendResponse(
@@ -2559,7 +2604,7 @@ proc runLsp*() =
       capabilities["callHierarchyProvider"] = %true
       capabilities["completionProvider"] = %*{"resolveProvider": false}
       capabilities["hoverProvider"] = %true
-      capabilities["renameProvider"] = %*{"prepareProvider": false}
+      capabilities["renameProvider"] = %*{"prepareProvider": true}
       capabilities["referencesProvider"] = %true
       capabilities["documentSymbolProvider"] = %true
       capabilities["documentHighlightProvider"] = %true
@@ -2727,6 +2772,19 @@ proc runLsp*() =
         if response.needsBootstrap:
           pendingWorkspace.add PendingWorkspaceRequest(
             kind: pendingReferences, id: id, params: params
+          )
+          if not bootstrap.active:
+            if not scheduleBootstrap(bootstrap, workspace):
+              pendingWorkspace.setLen(pendingWorkspace.len - 1)
+              sendResponse(id, newJNull())
+        else:
+          sendResponse(id, response.value)
+    of "textDocument/prepareRename":
+      if hasId:
+        let response = prepareRenameResponse(params, workspace)
+        if response.needsBootstrap:
+          pendingWorkspace.add PendingWorkspaceRequest(
+            kind: pendingPrepareRename, id: id, params: params
           )
           if not bootstrap.active:
             if not scheduleBootstrap(bootstrap, workspace):

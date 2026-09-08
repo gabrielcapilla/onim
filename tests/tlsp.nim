@@ -377,7 +377,7 @@ suite "stdio LSP":
     check initialized["result"]["capabilities"]["implementationProvider"].getBool
     check initialized["result"]["capabilities"]["callHierarchyProvider"].getBool
     check initialized["result"]["capabilities"]["hoverProvider"].getBool
-    check not initialized["result"]["capabilities"]["renameProvider"]["prepareProvider"].getBool
+    check initialized["result"]["capabilities"]["renameProvider"]["prepareProvider"].getBool
     check initialized["result"]["capabilities"]["referencesProvider"].getBool
     check initialized["result"]["capabilities"]["documentSymbolProvider"].getBool
     check initialized["result"]["capabilities"]["documentHighlightProvider"].getBool
@@ -1109,6 +1109,25 @@ suite "stdio LSP":
       process.inputStream,
       %*{
         "jsonrpc": "2.0",
+        "id": 104,
+        "method": "textDocument/prepareRename",
+        "params": {
+          "textDocument": {"uri": referencesUri},
+          "position": {"line": 1, "character": 16},
+        },
+      },
+    )
+    let preparedLocalRename = readResponse(process.outputStream, 104)
+    check preparedLocalRename != nil
+    check preparedLocalRename["result"]["start"]["line"].getInt == 1
+    check preparedLocalRename["result"]["start"]["character"].getInt == 16
+    check preparedLocalRename["result"]["end"]["line"].getInt == 1
+    check preparedLocalRename["result"]["end"]["character"].getInt == 21
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
         "id": 13,
         "method": "textDocument/hover",
         "params": {
@@ -1254,6 +1273,24 @@ suite "stdio LSP":
     check crossFileDefinition["result"]["uri"].getStr == providerUri
     check crossFileDefinition["result"]["range"]["start"]["line"].getInt == 0
     check crossFileDefinition["result"]["range"]["start"]["character"].getInt == 5
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 105,
+        "method": "textDocument/prepareRename",
+        "params": {
+          "textDocument": {"uri": consumerUri}, "position": {"line": 1, "character": 9}
+        },
+      },
+    )
+    let preparedCrossFileRename = readResponse(process.outputStream, 105)
+    check preparedCrossFileRename != nil
+    check preparedCrossFileRename["result"]["start"]["line"].getInt == 1
+    check preparedCrossFileRename["result"]["start"]["character"].getInt == 9
+    check preparedCrossFileRename["result"]["end"]["line"].getInt == 1
+    check preparedCrossFileRename["result"]["end"]["character"].getInt == 15
 
     sendMessage(
       process.inputStream,
