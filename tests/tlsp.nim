@@ -920,6 +920,51 @@ suite "stdio LSP":
     check signature["result"]["signatures"][0]["parameters"].len == 2
     check signature["result"]["activeParameter"].getInt == 1
 
+    let overloadSignatureUri = "file:///tmp/onim-overload-signature.nim"
+    let overloadSignatureText =
+      "proc run(value: int) = discard\n" & "proc run(value: string) = discard\n" &
+      "proc main() =\n  discard run(\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": overloadSignatureUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": overloadSignatureText,
+          }
+        },
+      },
+    )
+    check readDiagnostics(process.outputStream, overloadSignatureUri) != nil
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 35,
+        "method": "textDocument/signatureHelp",
+        "params": {
+          "textDocument": {"uri": overloadSignatureUri},
+          "position": {"line": 3, "character": 14},
+        },
+      },
+    )
+    let overloadSignature = readResponse(process.outputStream, 35)
+    check overloadSignature != nil
+    check overloadSignature["result"]["signatures"].len == 2
+    let overloadLabels = [
+      overloadSignature["result"]["signatures"][0]["label"].getStr,
+      overloadSignature["result"]["signatures"][1]["label"].getStr,
+    ]
+    check overloadLabels[0].contains("proc run(value: int)") or
+      overloadLabels[1].contains("proc run(value: int)")
+    check overloadLabels[0].contains("proc run(value: string)") or
+      overloadLabels[1].contains("proc run(value: string)")
+    check overloadSignature["result"]["activeParameter"].getInt == 0
+
     let stdlibSignatureUri = "file:///tmp/onim-stdlib-signature.nim"
     let stdlibSignatureText = "import std/os\nproc main() =\n  discard walkDir(\n"
     sendMessage(

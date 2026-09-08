@@ -188,6 +188,34 @@ proc addCandidate(
       return
   candidates.add candidate
 
+proc sameFileOverloadSignatures(
+    source: WorkspaceSnapshot, context: CallContext
+): seq[SignatureCandidate] =
+  if not source.valid or source.index == nil or context.qualifierToken >= 0 or
+      context.calleeToken < 0 or context.calleeToken >= source.index.parsed.tokens.len:
+    return
+  if resolveLocalDefinitionAtToken(source, context.calleeToken).kind != definitionUnknown:
+    return
+  let tokens = source.index.parsed.tokens
+  let wanted = identifierKey(tokens, tokens[context.calleeToken])
+  if wanted.len == 0:
+    return
+  var matches = 0
+  for symbol in source.index.symbols:
+    if symbol.nameToken >= uint32(context.calleeToken) or not symbol.kind.routineKind or
+        symbol.nameToken >= uint32(tokens.len):
+      continue
+    if identifierKey(tokens, tokens[int(symbol.nameToken)]) == wanted:
+      inc matches
+  if matches < 2:
+    return
+  for symbol in source.index.symbols:
+    if symbol.nameToken >= uint32(context.calleeToken) or not symbol.kind.routineKind or
+        symbol.nameToken >= uint32(tokens.len):
+      continue
+    if identifierKey(tokens, tokens[int(symbol.nameToken)]) == wanted:
+      result.addCandidate sourceSignature(source, symbol)
+
 proc projectSignature(
     workspace: Workspace, source: WorkspaceSnapshot, context: CallContext
 ): SignatureCandidate =
@@ -256,10 +284,14 @@ proc resolveSignatureHelp*(
   if not context.valid:
     return
   result.activeParameter = context.value.activeParameter
-  let project = workspace.projectSignature(source, context.value)
-  if project.label.len > 0:
-    result.signatures.addCandidate project
+  let overloads = sameFileOverloadSignatures(source, context.value)
+  if overloads.len > 0:
+    result.signatures = overloads
   else:
-    result.signatures = stdlibSignatures(source, stdlib, context.value)
+    let project = workspace.projectSignature(source, context.value)
+    if project.label.len > 0:
+      result.signatures.addCandidate project
+    else:
+      result.signatures = stdlibSignatures(source, stdlib, context.value)
   if result.signatures.len > 0:
     result.state = signatureAvailable
