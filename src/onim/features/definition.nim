@@ -788,25 +788,50 @@ proc exactGenericInstanceMatch(
     leftSource, rightSource: WorkspaceSnapshot,
     left, right: LocalTypeInfo,
 ): tuple[state: TypeState, matches: bool] =
-  if not leftSource.index.types.explicitUnaryPrimitiveGeneric(
-    leftSource.index.parsed.tokens, left
-  ) or
-      not rightSource.index.types.explicitUnaryPrimitiveGeneric(
-        rightSource.index.parsed.tokens, right
-      ):
+  if not leftSource.index.types.supportedGenericInstance(left) or
+      not rightSource.index.types.supportedGenericInstance(right):
     return
-  let leftKind =
-    leftSource.index.types.typeKind(leftSource.index.types.typeBase(left.typeId))
-  let rightKind =
-    rightSource.index.types.typeKind(rightSource.index.types.typeBase(right.typeId))
-  if leftKind == typeUnknown or rightKind == typeUnknown:
-    return
-  if leftKind != rightKind:
-    result.state = typeStateResolved
-    return
-  exactNamedTypeMatch(
+  let constructor = exactNamedTypeMatch(
     workspace, leftSource, rightSource, left.typeToken, right.typeToken
   )
+  if constructor.state != typeStateResolved:
+    return constructor
+  result.state = typeStateResolved
+  if not constructor.matches:
+    return
+  let leftCount = leftSource.index.types.genericArgumentCount(left.typeId)
+  let rightCount = rightSource.index.types.genericArgumentCount(right.typeId)
+  if leftCount == 0 or leftCount != rightCount:
+    return
+  for argumentIndex in 0 ..< leftCount:
+    let leftArgument =
+      leftSource.index.types.genericArgumentType(left.typeId, argumentIndex)
+    let rightArgument =
+      rightSource.index.types.genericArgumentType(right.typeId, argumentIndex)
+    let leftKind = leftSource.index.types.typeKind(leftArgument)
+    let rightKind = rightSource.index.types.typeKind(rightArgument)
+    if leftKind == typeUnknown or rightKind == typeUnknown:
+      result.state = typeStateUnknown
+      return
+    if leftKind != rightKind:
+      return
+    if leftKind.isPrimitiveType:
+      continue
+    if leftKind != typeNamed:
+      result.state = typeStateUnknown
+      return
+    let argumentMatch = exactNamedTypeMatch(
+      workspace,
+      leftSource,
+      rightSource,
+      leftSource.index.types.typeNameToken(leftArgument),
+      rightSource.index.types.typeNameToken(rightArgument),
+    )
+    if argumentMatch.state != typeStateResolved:
+      return argumentMatch
+    if not argumentMatch.matches:
+      return
+  result.matches = true
 
 proc exactTypeMatch*(
     workspace: Workspace,

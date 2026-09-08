@@ -65,11 +65,17 @@ type
     nameToken*: uint32
     baseType*: TypeId
     extent*: uint32
+    firstArgument*: uint32
+    pastArgument*: uint32
 
   UfcsProcedureRecord* = object
     typeId*: TypeId
     symbolOrdinal*: uint32
     parameterOrdinal*: uint32
+
+  GenericArgumentDescriptor = object
+    kind: TypeKind
+    nameToken: uint32
 
   TypeDescriptor = object
     kind: TypeKind
@@ -77,6 +83,7 @@ type
     baseKind: TypeKind
     baseNameToken: uint32
     extent: uint32
+    genericArguments: seq[GenericArgumentDescriptor]
 
   LocalTypeInfo* = object
     kind*: TypeKind
@@ -89,6 +96,7 @@ type
 
   TypeIndex* = object
     records*: seq[TypeRecord]
+    genericArgumentTypeIds*: seq[TypeId]
     objects*: seq[ObjectTypeRecord]
     fields*: seq[ObjectField]
     localTupleObjects*: seq[ObjectTypeRecord]
@@ -126,6 +134,38 @@ proc typeBase*(types: TypeIndex, id: TypeId): TypeId {.inline.} =
     types.records[ordinal].baseType
   else:
     InvalidTypeId
+
+proc typeNameToken*(types: TypeIndex, id: TypeId): uint32 {.inline.} =
+  let ordinal = int(uint32(id)) - 1
+  if ordinal >= 0 and ordinal < types.records.len and
+      types.records[ordinal].kind == typeNamed:
+    types.records[ordinal].nameToken
+  else:
+    InvalidTypeToken
+
+proc genericArgumentCount*(types: TypeIndex, id: TypeId): int {.inline.} =
+  let ordinal = int(uint32(id)) - 1
+  if ordinal < 0 or ordinal >= types.records.len or
+      types.records[ordinal].kind != typeGenericInstance:
+    return 0
+  let record = types.records[ordinal]
+  if record.pastArgument < record.firstArgument or
+      record.pastArgument > uint32(types.genericArgumentTypeIds.len):
+    return 0
+  int(record.pastArgument - record.firstArgument)
+
+proc genericArgumentType*(types: TypeIndex, id: TypeId, index: int): TypeId {.inline.} =
+  let ordinal = int(uint32(id)) - 1
+  if ordinal < 0 or ordinal >= types.records.len or
+      types.records[ordinal].kind != typeGenericInstance:
+    return InvalidTypeId
+  let record = types.records[ordinal]
+  let argument = int(record.firstArgument) + index
+  if index < 0 or argument < int(record.firstArgument) or
+      argument >= int(record.pastArgument) or
+      argument >= types.genericArgumentTypeIds.len:
+    return InvalidTypeId
+  types.genericArgumentTypeIds[argument]
 
 proc namedTypeId*(types: TypeIndex, id: TypeId): TypeId {.inline.} =
   case types.typeKind(id)
@@ -181,18 +221,49 @@ proc validTypeShape(
   else:
     nameToken == InvalidTypeToken and not baseType.valid and extent == 0'u32
 
+proc sameGenericArguments(
+    types: TypeIndex, record: TypeRecord, arguments: seq[TypeId]
+): bool {.inline.} =
+  if record.pastArgument < record.firstArgument or
+      record.pastArgument > uint32(types.genericArgumentTypeIds.len) or
+      int(record.pastArgument - record.firstArgument) != arguments.len:
+    return false
+  for index, argument in arguments:
+    if types.genericArgumentTypeIds[int(record.firstArgument) + index] != argument:
+      return false
+  true
+
+proc sameGenericRecordArguments(
+    types: TypeIndex, left, right: TypeRecord
+): bool {.inline.} =
+  if left.pastArgument < left.firstArgument or right.pastArgument < right.firstArgument or
+      left.pastArgument > uint32(types.genericArgumentTypeIds.len) or
+      right.pastArgument > uint32(types.genericArgumentTypeIds.len) or
+      left.pastArgument - left.firstArgument != right.pastArgument - right.firstArgument:
+    return false
+  for index in 0 ..< int(left.pastArgument - left.firstArgument):
+    if types.genericArgumentTypeIds[int(left.firstArgument) + index] !=
+        types.genericArgumentTypeIds[int(right.firstArgument) + index]:
+      return false
+  true
+
 proc typeIdFor(
     types: TypeIndex,
     kind: TypeKind,
     nameToken = InvalidTypeToken,
     baseType = InvalidTypeId,
     extent = 0'u32,
+    genericArguments: seq[TypeId] = @[],
 ): TypeId {.inline.} =
   if not validTypeShape(kind, nameToken, baseType, extent):
     return InvalidTypeId
+  if kind == typeGenericInstance and
+      (genericArguments.len == 0 or genericArguments[0] != baseType):
+    return InvalidTypeId
   for ordinal, record in types.records:
     if record.kind == kind and record.nameToken == nameToken and
-        record.baseType == baseType and record.extent == extent:
+        record.baseType == baseType and record.extent == extent and
+        types.sameGenericArguments(record, genericArguments):
       return TypeId(uint32(ordinal + 1))
   InvalidTypeId
 
@@ -202,14 +273,25 @@ proc internType(
     nameToken = InvalidTypeToken,
     baseType = InvalidTypeId,
     extent = 0'u32,
+    genericArguments: seq[TypeId] = @[],
 ): TypeId =
-  let existing = types.typeIdFor(kind, nameToken, baseType, extent)
+  let existing = types.typeIdFor(kind, nameToken, baseType, extent, genericArguments)
   if existing.valid:
     return existing
   if not validTypeShape(kind, nameToken, baseType, extent):
     return InvalidTypeId
+  if kind == typeGenericInstance and
+      (genericArguments.len == 0 or genericArguments[0] != baseType):
+    return InvalidTypeId
+  let firstArgument = uint32(types.genericArgumentTypeIds.len)
+  types.genericArgumentTypeIds.add genericArguments
   types.records.add TypeRecord(
-    kind: kind, nameToken: nameToken, baseType: baseType, extent: extent
+    kind: kind,
+    nameToken: nameToken,
+    baseType: baseType,
+    extent: extent,
+    firstArgument: firstArgument,
+    pastArgument: uint32(types.genericArgumentTypeIds.len),
   )
   TypeId(uint32(types.records.len))
 
@@ -926,6 +1008,7 @@ proc genericAnnotationDescriptor(tokens: TokenStore, first, past: int): TypeDesc
   result.baseKind = typeUnknown
   result.baseNameToken = InvalidTypeToken
   result.extent = 0'u32
+  result.genericArguments = @[]
   if first < 0 or first + 3 >= past or past > tokens.len or
       not tokens.tokenTextEquals(tokens[past - 1], "]"):
     return
@@ -956,6 +1039,9 @@ proc genericAnnotationDescriptor(tokens: TokenStore, first, past: int): TypeDesc
     if arguments == 0:
       argumentKind = segmentKind
       argumentName = segmentName
+    result.genericArguments.add GenericArgumentDescriptor(
+      kind: segmentKind, nameToken: segmentName
+    )
     inc arguments
     segmentFirst = index + 1
   var segmentKind = typeUnknown
@@ -965,10 +1051,49 @@ proc genericAnnotationDescriptor(tokens: TokenStore, first, past: int): TypeDesc
   if arguments == 0:
     argumentKind = segmentKind
     argumentName = segmentName
+  result.genericArguments.add GenericArgumentDescriptor(
+    kind: segmentKind, nameToken: segmentName
+  )
   result.kind = typeGenericInstance
   result.nameToken = nameToken
   result.baseKind = argumentKind
   result.baseNameToken = argumentName
+
+proc genericArgumentTypeId(
+    types: TypeIndex, argument: GenericArgumentDescriptor
+): TypeId {.inline.} =
+  if argument.kind.isPrimitiveType:
+    types.typeIdFor(argument.kind)
+  elif argument.kind == typeNamed:
+    types.typeIdFor(typeNamed, argument.nameToken)
+  else:
+    InvalidTypeId
+
+proc internGenericArgumentTypeId(
+    types: var TypeIndex, argument: GenericArgumentDescriptor
+): TypeId {.inline.} =
+  if argument.kind.isPrimitiveType:
+    types.internType(argument.kind)
+  elif argument.kind == typeNamed:
+    types.internType(typeNamed, argument.nameToken)
+  else:
+    InvalidTypeId
+
+proc genericArgumentTypeIds(types: TypeIndex, descriptor: TypeDescriptor): seq[TypeId] =
+  for argument in descriptor.genericArguments:
+    let typeId = types.genericArgumentTypeId(argument)
+    if not typeId.valid:
+      return @[]
+    result.add typeId
+
+proc internGenericArgumentTypeIds(
+    types: var TypeIndex, descriptor: TypeDescriptor
+): seq[TypeId] =
+  for argument in descriptor.genericArguments:
+    let typeId = types.internGenericArgumentTypeId(argument)
+    if not typeId.valid:
+      return @[]
+    result.add typeId
 
 proc annotationDescriptor(tokens: TokenStore, first, past: int): TypeDescriptor =
   result.kind = typeUnknown
@@ -1008,33 +1133,23 @@ proc annotationDescriptor(tokens: TokenStore, first, past: int): TypeDescriptor 
     result.kind = typeNamed
     result.nameToken = typeToken
 
-proc explicitUnaryPrimitiveGeneric*(
-    types: TypeIndex, tokens: TokenStore, info: LocalTypeInfo
-): bool =
+proc supportedGenericInstance*(types: TypeIndex, info: LocalTypeInfo): bool =
   if info.kind != typeGenericInstance or info.state != typeStateResolved or
       info.form != localTypeFormAnnotation or info.typeToken == InvalidTypeToken:
     return false
-  let first = int(info.firstToken)
-  let past = int(info.pastToken)
-  if first < 0 or first >= past or past > tokens.len:
+  if types.typeKind(info.typeId) != typeGenericInstance:
     return false
-  let descriptor = genericAnnotationDescriptor(tokens, first, past)
-  if descriptor.kind != typeGenericInstance or not descriptor.baseKind.isPrimitiveType or
-      types.typeKind(types.typeBase(info.typeId)) != descriptor.baseKind:
+  let count = types.genericArgumentCount(info.typeId)
+  if count == 0:
     return false
-  var opening = -1
-  var commas = 0
-  for index in first ..< past:
-    if tokens.tokenTextEquals(tokens[index], "["):
-      if opening >= 0:
-        return false
-      opening = index
-    elif tokens.tokenTextEquals(tokens[index], "]"):
-      if opening < 0 or index != past - 1:
-        return false
-    elif opening >= 0 and tokens.tokenTextEquals(tokens[index], ","):
-      inc commas
-  opening >= 0 and commas == 0
+  for index in 0 ..< count:
+    let argument = types.genericArgumentType(info.typeId, index)
+    let kind = types.typeKind(argument)
+    if not kind.isPrimitiveType and kind != typeNamed:
+      return false
+    if kind == typeNamed and types.typeNameToken(argument) == InvalidTypeToken:
+      return false
+  true
 
 proc sequenceLiteralStart*(tokens: TokenStore, index: int): bool {.inline.} =
   index >= 0 and index + 1 < tokens.len and tokens[index].kind == tkPunctuation and
@@ -1176,6 +1291,7 @@ proc declarationTypeDescriptor(
       result.kind = directLiteralKind(tokens, first, past)
 
 proc descriptorTypeId(types: TypeIndex, descriptor: TypeDescriptor): TypeId =
+  let genericArguments = types.genericArgumentTypeIds(descriptor)
   let baseType =
     case descriptor.kind
     of typeSeq:
@@ -1191,17 +1307,18 @@ proc descriptorTypeId(types: TypeIndex, descriptor: TypeDescriptor): TypeId =
       else:
         types.typeIdFor(descriptor.baseKind)
     of typeGenericInstance:
-      if descriptor.baseKind == typeNamed:
-        types.typeIdFor(typeNamed, descriptor.baseNameToken)
-      elif descriptor.baseKind.isPrimitiveType:
-        types.typeIdFor(descriptor.baseKind)
+      if genericArguments.len > 0:
+        genericArguments[0]
       else:
         InvalidTypeId
     else:
       InvalidTypeId
-  types.typeIdFor(descriptor.kind, descriptor.nameToken, baseType, descriptor.extent)
+  types.typeIdFor(
+    descriptor.kind, descriptor.nameToken, baseType, descriptor.extent, genericArguments
+  )
 
 proc internDescriptor(types: var TypeIndex, descriptor: TypeDescriptor): TypeId =
+  let genericArguments = types.internGenericArgumentTypeIds(descriptor)
   let baseType =
     case descriptor.kind
     of typeSeq:
@@ -1217,15 +1334,15 @@ proc internDescriptor(types: var TypeIndex, descriptor: TypeDescriptor): TypeId 
       else:
         types.internType(descriptor.baseKind)
     of typeGenericInstance:
-      if descriptor.baseKind == typeNamed:
-        types.internType(typeNamed, descriptor.baseNameToken)
-      elif descriptor.baseKind.isPrimitiveType:
-        types.internType(descriptor.baseKind)
+      if genericArguments.len > 0:
+        genericArguments[0]
       else:
         InvalidTypeId
     else:
       InvalidTypeId
-  types.internType(descriptor.kind, descriptor.nameToken, baseType, descriptor.extent)
+  types.internType(
+    descriptor.kind, descriptor.nameToken, baseType, descriptor.extent, genericArguments
+  )
 
 proc localTypeAt*(
     types: TypeIndex, tokens: TokenStore, scopes: ScopeIndex, declarationToken: uint32
@@ -1409,8 +1526,7 @@ proc indexUfcsProcedures(
     let parameter = scopes.declarations[parameterOrdinal]
     let info = types.localTypeAt(tokens, scopes, parameter.nameToken)
     if info.state != typeStateResolved or not info.typeId.valid or
-        info.kind == typeGenericInstance and
-        not types.explicitUnaryPrimitiveGeneric(tokens, info):
+        info.kind == typeGenericInstance and not types.supportedGenericInstance(info):
       continue
     types.ufcsProcedures.add UfcsProcedureRecord(
       typeId: info.typeId,
@@ -1430,6 +1546,7 @@ proc indexTypes*(
     tokens: TokenStore, symbols: openArray[SourceSymbol], scopes: ScopeIndex
 ): TypeIndex =
   result.records = @[]
+  result.genericArgumentTypeIds = @[]
   result.localTupleObjects = @[]
   result.localTupleFields = @[]
   result.genericParameterTokens = @[]
@@ -1562,6 +1679,11 @@ proc validateTypeIndex*(
       index.routineReturnTypeIds.len != symbols.len:
     return false
   for recordIndex, record in index.records:
+    if record.firstArgument > record.pastArgument or
+        record.pastArgument > uint32(index.genericArgumentTypeIds.len) or
+        record.kind != typeGenericInstance and
+        record.firstArgument != record.pastArgument:
+      return false
     case record.kind
     of typeUnknown:
       return false
@@ -1589,6 +1711,8 @@ proc validateTypeIndex*(
     of typeGenericInstance:
       if record.nameToken == InvalidTypeToken or not record.baseType.valid or
           uint32(record.baseType) > uint32(recordIndex) or record.extent != 0'u32 or
+          record.firstArgument == record.pastArgument or
+          record.baseType != index.genericArgumentTypeIds[int(record.firstArgument)] or
           record.nameToken >= uint32(tokens.len) or
           not validNameToken(tokens, int(record.nameToken)) or
           not (
@@ -1596,6 +1720,12 @@ proc validateTypeIndex*(
             index.typeKind(record.baseType) == typeNamed
           ):
         return false
+      for argumentIndex in record.firstArgument ..< record.pastArgument:
+        let argument = index.genericArgumentTypeIds[int(argumentIndex)]
+        let argumentKind = index.typeKind(argument)
+        if not argument.valid or uint32(argument) > uint32(recordIndex) or
+            not argumentKind.isPrimitiveType and argumentKind != typeNamed:
+          return false
     else:
       if record.nameToken != InvalidTypeToken or record.baseType.valid or
           record.extent != 0'u32:
@@ -1604,7 +1734,8 @@ proc validateTypeIndex*(
       if index.records[previous].kind == record.kind and
           index.records[previous].nameToken == record.nameToken and
           index.records[previous].baseType == record.baseType and
-          index.records[previous].extent == record.extent:
+          index.records[previous].extent == record.extent and
+          index.sameGenericRecordArguments(index.records[previous], record):
         return false
   var previousObject = high(uint32)
   for objectType in index.objects:

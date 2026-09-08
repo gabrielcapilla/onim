@@ -1067,6 +1067,7 @@ type Pair*[A, B] = object
   right: B
 
 proc pairFirst*(pair: Pair[int, string]): int = discard
+proc pairBool*(pair: Pair[int, bool]): int = discard
 """,
     )
     let consumer = """import provider
@@ -1075,6 +1076,8 @@ proc show(value: provider.Box[int]) =
 proc showString(value: provider.Box[string]) =
   value.fi
 proc showPair(value: provider.Pair[int, string]) =
+  value.pa
+proc showPairBool(value: provider.Pair[int, bool]) =
   value.pa
 """
     writeFile(consumerPath, consumer)
@@ -1103,4 +1106,13 @@ proc showPair(value: provider.Pair[int, string]) =
     let pairResult = completeAt(
       workspace, snapshot, consumer.find("value.pa") + "value.pa".len, loadStdlibMap("")
     )
-    check pairResult.state == completionUnsupported
+    check pairResult.state == completionAvailable
+    check pairResult.items.mapIt(it.label) == @["pairFirst"]
+    let mismatchResult = completeAt(
+      workspace,
+      snapshot,
+      consumer.find("value.pa", consumer.find("showPairBool")) + "value.pa".len,
+      loadStdlibMap(""),
+    )
+    check mismatchResult.state == completionAvailable
+    check mismatchResult.items.mapIt(it.label) == @["pairBool"]

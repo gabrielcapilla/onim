@@ -372,11 +372,22 @@ proc show() =
   value: T
 
 proc first*(box: Box[int]): int = discard
+
+type Pair*[A, B] = object
+  left: A
+  right: B
+
+proc pairFirst*(pair: Pair[int, string]): int = discard
+proc pairBool*(pair: Pair[int, bool]): int = discard
 """,
     )
     let consumer = """import provider
 proc show(value: provider.Box[int]) =
   discard value.first()
+proc showPair(value: provider.Pair[int, string]) =
+  discard value.pairFirst()
+proc showPairMismatch(value: provider.Pair[int, bool]) =
+  discard value.pairFirst()
 """
     writeFile(consumerPath, consumer)
 
@@ -405,6 +416,18 @@ proc show(value: provider.Box[int]) =
     check providerSnapshot.index.parsed.tokens.tokenText(
       providerSnapshot.index.parsed.tokens[int(resolution.target.nameToken)]
     ) == "first"
+    let pairOffset = snapshot.text.find("value.pairFirst") + "value.".len + 1
+    let pairResolution = resolveDefinition(workspace, snapshot, pairOffset)
+    check pairResolution.kind == definitionResolved
+    check pairResolution.target.fileId.value == providerId.value
+    check providerSnapshot.index.parsed.tokens.tokenText(
+      providerSnapshot.index.parsed.tokens[int(pairResolution.target.nameToken)]
+    ) == "pairFirst"
+    let mismatchOffset =
+      snapshot.text.find("value.pairFirst", snapshot.text.find("showPairMismatch")) +
+      "value.".len + 1
+    check resolveDefinition(workspace, snapshot, mismatchOffset).kind ==
+      definitionUnsupported
 
   test "selects exact UFCS overloads by complete call arity":
     let text = """proc choose(value: int; amount: int) = discard
