@@ -563,9 +563,6 @@ proc firstParameterType(signature: string): string {.inline.} =
   if past > colon + 1:
     result = signature[colon + 1 ..< past].strip
 
-proc firstParameterIsFile(signature: string): bool {.inline.} =
-  sameIdentifier(signature.firstParameterType, "File")
-
 proc callableCandidate(candidate: SymbolCandidate): bool {.inline.} =
   case candidate.kind
   of "skProc", "skFunc", "skIterator", "skMethod", "skMacro", "skTemplate",
@@ -628,15 +625,14 @@ proc fileMembersForModule(
   if module.len == 0:
     return
   let prefixKey = identifierKey(prefix)
-  for _, candidates in stdlib.symbols:
-    for candidate in candidates:
-      if canonicalModule(candidate.module) != module or not candidate.callableCandidate or
-          not firstParameterIsFile(candidate.signature):
-        continue
-      let key = identifierKey(candidate.name)
-      if key.len == 0 or (prefixKey.len > 0 and not key.startsWith(prefixKey)):
-        continue
-      discard addUniqueCandidate(result, candidate)
+  let receiverKey = receiverIndexKey(module, "File")
+  if not stdlib.receiverCandidates.hasKey(receiverKey):
+    return
+  for candidate in stdlib.receiverCandidates[receiverKey]:
+    let key = identifierKey(candidate.name)
+    if key.len == 0 or (prefixKey.len > 0 and not key.startsWith(prefixKey)):
+      continue
+    discard addUniqueCandidate(result, candidate)
 
 proc implicitFileMembers*(
     stdlib: StdlibMap, name, prefix: string
