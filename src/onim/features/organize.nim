@@ -364,7 +364,9 @@ proc addUniqueModule(
 
 proc findFromImport(imports: SourceImports, module: string, name: string): int =
   for index, item in imports.imports:
-    if item.synthetic or item.conditional:
+    if item.synthetic or
+        imports.conditionalImportDisposition(item) notin
+        {importUnconditional, importConditionalActive}:
       continue
     if item.form == fromModule and item.alias.len == 0 and
         sameModule(item.module, module) and name notin item.imported:
@@ -376,7 +378,9 @@ proc findExistingModule(
 ): tuple[plain, aliased, excluded: int] =
   result = (-1, -1, -1)
   for index, item in imports.imports:
-    if item.synthetic or item.conditional:
+    if item.synthetic or
+        imports.conditionalImportDisposition(item) notin
+        {importUnconditional, importConditionalActive}:
       continue
     if item.form != importModule or not sameModule(item.module, module):
       continue
@@ -1333,7 +1337,7 @@ proc nativeImportRemovalPlan(
     return
   for itemIndex, item in info.imports:
     let module = canonicalModule(item.module)
-    if item.keep:
+    if item.keep or item.conditional:
       continue
     case item.form
     of importModule:
@@ -1369,7 +1373,9 @@ proc nativeImportRemovalPlan(
 
 proc nativeProvidesName(info: SourceImports, name: string): bool =
   for item in info.imports:
-    if item.synthetic or item.conditional or item.form != fromModule:
+    if item.synthetic or
+        info.conditionalImportDisposition(item) notin
+        {importUnconditional, importConditionalActive} or item.form != fromModule:
       continue
     for imported in item.importedSymbols:
       if sameIdentifier(imported.name, name):

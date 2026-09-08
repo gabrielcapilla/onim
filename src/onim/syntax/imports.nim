@@ -9,6 +9,12 @@ type
     importModule
     fromModule
 
+  ConditionalImportDisposition* = enum
+    importUnconditional
+    importConditionalActive
+    importConditionalInactive
+    importConditionalUnknown
+
   ImportSymbol* = object
     name*: string
     startOffset*: int
@@ -138,6 +144,63 @@ proc conditionalImport(lines: openArray[string], token: Token): bool =
       return false
     dec line
   false
+
+proc conditionalLineStart(source: string, offset: int): int {.inline.} =
+  result = max(0, min(offset, source.len))
+  while result > 0 and source[result - 1] notin {'\n', '\r'}:
+    dec result
+
+proc conditionalLinePast(source: string, start: int): int {.inline.} =
+  result = max(0, min(start, source.len))
+  while result < source.len and source[result] notin {'\n', '\r'}:
+    inc result
+
+proc conditionalNextLine(source: string, past: int): int {.inline.} =
+  result = past
+  while result < source.len and source[result] in {'\n', '\r'}:
+    inc result
+
+proc conditionalPreviousLine(source: string, start: int): int {.inline.} =
+  if start <= 0:
+    return -1
+  var cursor = start - 1
+  while cursor >= 0 and source[cursor] in {'\n', '\r'}:
+    dec cursor
+  while cursor >= 0 and source[cursor] notin {'\n', '\r'}:
+    dec cursor
+  cursor + 1
+
+proc conditionalLineIndent(source: string, start, past: int): int {.inline.} =
+  var cursor = start
+  while cursor < past and source[cursor] in {' ', '\t'}:
+    inc cursor
+  cursor - start
+
+proc conditionalLineText(source: string, start, past: int): string =
+  var first = start
+  while first < past and source[first] in {' ', '\t'}:
+    inc first
+  var finish = past
+  while finish > first and source[finish - 1] in {' ', '\t'}:
+    dec finish
+  if first < finish:
+    result = source[first ..< finish]
+
+proc conditionalHeaderDisposition(line: string): ConditionalImportDisposition =
+  var compact = newStringOfCap(line.len)
+  for character in line:
+    if character == '#':
+      break
+    if character notin {' ', '\t', '\r'}:
+      compact.add character
+  case compact
+  of "whendefined(posix):", "whendefined(linux):": importConditionalActive
+  of "whendefined(windows):": importConditionalInactive
+  else: importConditionalUnknown
+
+proc conditionalImportDisposition*(
+  imports: SourceImports, item: ImportInfo
+): ConditionalImportDisposition {.gcsafe.}
 
 proc isModuleStatementStart*(token: Token): bool {.inline.} =
   token.hasKeywordRole(roleImport) or token.hasKeywordRole(roleFrom) or
@@ -689,14 +752,6 @@ proc parseSourceImports*(source: string): SourceImports =
           var item = parsedItem
           item.conditional = conditionalImport(lines, tokens[index])
           result.imports.add item
-          if item.conditional:
-            continue
-          if item.alias.len > 0:
-            result.qualifiedNames.incl item.alias
-          else:
-            result.qualifiedNames.incl moduleLeaf(item.module)
-            for excluded in item.excluded:
-              discard excluded
       index = max(index + 1, parsed.next)
     elif tokens[index].isKeyword(kwFrom):
       let parsed = parseFrom(tokens, source, index)
@@ -704,15 +759,116 @@ proc parseSourceImports*(source: string): SourceImports =
         var item = parsed.item
         item.conditional = conditionalImport(lines, tokens[index])
         result.imports.add item
-        if not item.conditional:
-          for name in item.imported:
-            result.availableNames.incl name
       index = max(index + 1, parsed.next)
     else:
       inc index
+  result.tokens = tokens
+  for item in result.imports:
+    let disposition = result.conditionalImportDisposition(item)
+    if disposition notin {importUnconditional, importConditionalActive}:
+      continue
+    case item.form
+    of importModule:
+      if item.alias.len > 0:
+        result.qualifiedNames.incl item.alias
+      else:
+        result.qualifiedNames.incl moduleLeaf(item.module)
+    of fromModule:
+      for name in item.imported:
+        result.availableNames.incl name
   for name in result.localDefinitions:
     result.availableNames.incl name
-  result.tokens = tokens
+
+proc conditionalImportDisposition*(
+    imports: SourceImports, item: ImportInfo
+): ConditionalImportDisposition {.gcsafe.} =
+  if not item.conditional:
+    return importUnconditional
+  if imports.tokens.sourceText.len == 0 or item.synthetic or item.form != importModule or
+      item.excluded.len > 0:
+    return importConditionalUnknown
+
+  let source = imports.tokens.sourceText
+  let bodyStart = conditionalLineStart(source, item.startOffset)
+  let bodyIndent = item.indent.len
+  if bodyIndent == 0:
+    return importConditionalUnknown
+
+  var headerStart = conditionalPreviousLine(source, bodyStart)
+  while headerStart >= 0:
+    let headerPast = conditionalLinePast(source, headerStart)
+    if conditionalLineText(source, headerStart, headerPast).len == 0:
+      headerStart = conditionalPreviousLine(source, headerStart)
+      continue
+    let headerIndent = conditionalLineIndent(source, headerStart, headerPast)
+    if headerIndent < bodyIndent:
+      if headerIndent != 0:
+        return importConditionalUnknown
+      break
+    headerStart = conditionalPreviousLine(source, headerStart)
+  if headerStart < 0:
+    return importConditionalUnknown
+
+  let headerPast = conditionalLinePast(source, headerStart)
+  result =
+    conditionalHeaderDisposition(conditionalLineText(source, headerStart, headerPast))
+  if result == importConditionalUnknown:
+    return
+
+  var cursor = conditionalNextLine(source, headerPast)
+  var itemFound = false
+  while cursor < source.len:
+    let past = conditionalLinePast(source, cursor)
+    let text = conditionalLineText(source, cursor, past)
+    if text.len == 0 or text[0] == '#':
+      cursor = conditionalNextLine(source, past)
+      continue
+    let indent = conditionalLineIndent(source, cursor, past)
+    if indent <= 0:
+      if indent == 0 and (text.startsWith("elif ") or text.startsWith("else:")):
+        return importConditionalUnknown
+      break
+    if indent != bodyIndent or not text.startsWith("import ") or text.contains(';'):
+      return importConditionalUnknown
+
+    var lineImport = false
+    for peer in imports.imports:
+      if peer.startOffset < cursor or peer.startOffset >= past:
+        continue
+      lineImport = true
+      if not peer.conditional or peer.synthetic or peer.form != importModule or
+          peer.excluded.len > 0:
+        return importConditionalUnknown
+    if not lineImport:
+      return importConditionalUnknown
+    if item.startOffset >= cursor and item.startOffset < past:
+      itemFound = true
+    cursor = conditionalNextLine(source, past)
+  if not itemFound:
+    return importConditionalUnknown
+
+proc conditionalTokenDisposition*(
+    imports: SourceImports, token: Token
+): ConditionalImportDisposition {.gcsafe.} =
+  let source = imports.tokens.sourceText
+  for item in imports.imports:
+    if not item.conditional:
+      continue
+    let disposition = imports.conditionalImportDisposition(item)
+    if disposition == importConditionalUnknown:
+      continue
+    let bodyStart = conditionalLineStart(source, item.startOffset)
+    var headerStart = conditionalPreviousLine(source, bodyStart)
+    while headerStart >= 0:
+      let headerPast = conditionalLinePast(source, headerStart)
+      let text = conditionalLineText(source, headerStart, headerPast)
+      if text.len > 0:
+        if conditionalLineIndent(source, headerStart, headerPast) < item.indent.len:
+          if token.startOffset >= headerStart and token.endOffset <= headerPast:
+            return disposition
+          break
+      headerStart = conditionalPreviousLine(source, headerStart)
+  importConditionalUnknown
 
 proc cloneSourceImports*(source: SourceImports): SourceImports =
   result.tokens = source.tokens

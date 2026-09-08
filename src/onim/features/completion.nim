@@ -244,7 +244,9 @@ proc appendCompletionCandidate(
   true
 
 proc importedSelection(source: WorkspaceSnapshot, item: ImportInfo): ImportedSelection =
-  if source.index == nil or item.synthetic or item.conditional:
+  if source.index == nil or item.synthetic or
+      source.index.parsed.conditionalImportDisposition(item) notin
+      {importUnconditional, importConditionalActive}:
     return
   case item.form
   of importModule:
@@ -496,7 +498,9 @@ proc appendUnqualifiedImports(
     else:
       ""
   for item in source.index.parsed.imports:
-    if item.synthetic or item.conditional:
+    if item.synthetic or
+        source.index.parsed.conditionalImportDisposition(item) notin
+        {importUnconditional, importConditionalActive}:
       continue
     if item.form == importModule and item.alias.len > 0:
       continue
@@ -857,7 +861,8 @@ proc stdlibDirectCall(
       ""
   for item in source.index.parsed.imports:
     if item.form != importModule or item.alias.len > 0 or item.synthetic or
-        item.conditional or item.excluded.len > 0:
+        source.index.parsed.conditionalImportDisposition(item) notin
+        {importUnconditional, importConditionalActive} or item.excluded.len > 0:
       continue
     if qualified and not sameIdentifier(moduleLeaf(item.module), qualifier):
       continue
@@ -913,7 +918,8 @@ proc stdlibNominalTypeModule(
   var provider = ""
   for item in source.index.parsed.imports:
     if item.form != importModule or item.alias.len > 0 or item.synthetic or
-        item.conditional or item.excluded.len > 0:
+        source.index.parsed.conditionalImportDisposition(item) notin
+        {importUnconditional, importConditionalActive} or item.excluded.len > 0:
       continue
     let module = canonicalModule(item.module)
     if not module.startsWith("std/"):
@@ -1130,7 +1136,8 @@ proc completeModuleMembers(
       result.items.add candidate.item
     return
   if matched.state != importMatchUnique or matched.item.synthetic or
-      matched.item.conditional or matched.item.excluded.len > 0:
+      source.index.parsed.conditionalImportDisposition(matched.item) notin
+      {importUnconditional, importConditionalActive} or matched.item.excluded.len > 0:
     return
   let catalog = workspace.moduleCatalog()
   if catalog == nil or not catalog.complete:

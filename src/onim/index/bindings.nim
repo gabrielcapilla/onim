@@ -54,8 +54,16 @@ proc hasDuplicateDeclaration(index: SourceIndex, declarationIndex: int): bool =
   false
 
 proc bindingsReady*(index: SourceIndex): bool =
-  if index == nil or not index.scopes.isComplete:
+  if index == nil:
     return false
+  for reason in index.scopes.uncertainty:
+    if reason != scopeConditional:
+      return false
+  if scopeConditional in index.scopes.uncertainty:
+    for token in index.parsed.tokens:
+      if token.hasKeywordRole(roleConditional) and
+          index.parsed.conditionalTokenDisposition(token) == importConditionalUnknown:
+        return false
   for reason in index.occurrences.uncertainty:
     case reason
     of uncertaintyNestedScope, uncertaintyDeclarationOrder:

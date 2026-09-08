@@ -739,8 +739,10 @@ proc use() =
       workspace.changeDocument("file://" & consumerPath, consumerPath, conditional, 5)
     let conditionalSnapshot = workspace.snapshotForFile(consumerId)
     let conditionalOffset = conditional.find("p.an") + "p.an".len
-    check completeAt(workspace, conditionalSnapshot, conditionalOffset, stdlib).state ==
-      completionUnsupported
+    let conditionalResult =
+      completeAt(workspace, conditionalSnapshot, conditionalOffset, stdlib)
+    check conditionalResult.state == completionAvailable
+    check conditionalResult.items.anyIt(it.label == "answer")
 
     let excluded = """import provider except answer
 proc use() =

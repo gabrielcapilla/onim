@@ -55,10 +55,19 @@ suite "native hover":
     check info.state == hoverAvailable
     check info.module == "std/os"
 
-  test "does not guess conditional or missing imports":
+  test "resolves proven Linux conditionals and rejects unknown imports":
     let conditional =
       hoverFor("when defined(posix):\n  import std/os\nwalkDir(\"/tmp\")\n", "walkDir")
-    check conditional.state == hoverUnavailable
+    check conditional.state == hoverAvailable
+    check conditional.module == "std/os"
+    let inactive = hoverFor(
+      "when defined(windows):\n  import std/os\nwalkDir(\"/tmp\")\n", "walkDir"
+    )
+    check inactive.state == hoverUnavailable
+    let unknown = hoverFor(
+      "when defined(enableOs):\n  import std/os\nwalkDir(\"/tmp\")\n", "walkDir"
+    )
+    check unknown.state == hoverUnavailable
     let missing = hoverFor("walkDir(\"/tmp\")\n", "walkDir")
     check missing.state == hoverUnavailable
 

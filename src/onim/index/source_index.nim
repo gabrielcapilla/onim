@@ -86,17 +86,25 @@ proc moduleAliasesSafe(info: SourceImports): bool =
   var aliases = initHashSet[string]()
   var hasAlias = false
   for item in info.imports:
+    let disposition = info.conditionalImportDisposition(item)
+    if disposition == importConditionalUnknown:
+      return false
+    if disposition == importConditionalInactive:
+      continue
     if item.alias.len == 0:
       continue
     hasAlias = true
-    if item.form != importModule or item.synthetic or item.conditional or
-        item.excluded.len > 0 or isNimKeyword(item.alias) or
-        identifierKey(item.alias).len == 0:
+    if item.form != importModule or item.synthetic or item.excluded.len > 0 or
+        isNimKeyword(item.alias) or identifierKey(item.alias).len == 0:
       return false
   if not hasAlias:
     return true
   for item in info.imports:
-    if item.synthetic or item.conditional or item.form != importModule:
+    let disposition = info.conditionalImportDisposition(item)
+    if disposition == importConditionalUnknown:
+      return false
+    if item.synthetic or disposition == importConditionalInactive or
+        item.form != importModule:
       continue
     let qualifier =
       if item.alias.len > 0:
@@ -117,7 +125,7 @@ proc deriveNativeIndexSafety(
     return nativeSafetyRejected
   for reason in index.scopes.uncertainty:
     case reason
-    of scopeNestedBlock:
+    of scopeNestedBlock, scopeConditional:
       discard
     else:
       return nativeSafetyRejected
@@ -146,7 +154,9 @@ proc deriveNativeIndexSafety(
     else:
       return nativeSafetyRejected
   for item in info.imports:
-    if item.synthetic or item.conditional or item.excluded.len > 0:
+    if item.synthetic or
+        info.conditionalImportDisposition(item) == importConditionalUnknown or
+        item.excluded.len > 0:
       return nativeSafetyRejected
   nativeSafetyAccepted
 

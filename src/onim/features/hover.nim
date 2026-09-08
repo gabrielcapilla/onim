@@ -134,9 +134,12 @@ proc qualifierMatches(item: ImportInfo, qualifier: string): bool {.inline.} =
   sameIdentifier(moduleLeaf(item.module), qualifier)
 
 proc stdlibCandidate(
-    stdlib: StdlibMap, item: ImportInfo, name, qualifier: string
+    stdlib: StdlibMap, imports: SourceImports, item: ImportInfo, name, qualifier: string
 ): SymbolCandidate =
-  if stdlib == nil or item.synthetic or item.conditional or item.excluded.len > 0:
+  if stdlib == nil or item.synthetic or item.excluded.len > 0:
+    return
+  let disposition = imports.conditionalImportDisposition(item)
+  if disposition notin {importUnconditional, importConditionalActive}:
     return
   if qualifier.len > 0:
     if item.form != importModule or not item.qualifierMatches(qualifier):
@@ -170,7 +173,11 @@ proc stdlibHover(
       source.index.parsed.tokens.tokenText(source.index.parsed.tokens[qualifierToken])
   for item in source.index.parsed.imports:
     let candidate = stdlibCandidate(
-      stdlib, item, source.index.parsed.tokens.tokenText(token), qualifier
+      stdlib,
+      source.index.parsed,
+      item,
+      source.index.parsed.tokens.tokenText(token),
+      qualifier,
     )
     if candidate.module.len == 0:
       continue

@@ -183,7 +183,7 @@ suite "organize imports":
   test "falls back for ambiguous or unsupported aliases":
     for source in [
       "import std/os as fs, std/strformat as f_s\n\ndiscard fs.walkDir(\"/tmp\")\n",
-      "when defined(posix):\n  import std/os as fs\n\ndiscard fs.walkDir(\"/tmp\")\n",
+      "when defined(enableOs):\n  import std/os as fs\n\ndiscard fs.walkDir(\"/tmp\")\n",
       "import std/os as fs except walkDir\n\ndiscard fs.walkDir(\"/tmp\")\n",
     ]:
       let attempt = tryOrganizeSourceWithIndex(
@@ -191,6 +191,22 @@ suite "organize imports":
       )
       check not attempt.handled
       check attempt.edits.len == 0
+
+  test "handles exact Linux conditional imports without rewriting them":
+    let active =
+      "when defined(posix):\n  import std/os as fs\n\ndiscard fs.walkDir(\"/tmp\")\n"
+    let activeAttempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim", active, indexSource(active), loadStdlibMap("")
+    )
+    check activeAttempt.handled
+    check activeAttempt.edits.len == 0
+
+    let inactive = "when defined(windows):\n  import std/os as fs\n\ndiscard\n"
+    let inactiveAttempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim", inactive, indexSource(inactive), loadStdlibMap("")
+    )
+    check inactiveAttempt.handled
+    check inactiveAttempt.edits.len == 0
 
   test "does not treat a local alias shadow as module use":
     let source = "import std/os as fs\n\nproc main(fs: int) =\n  discard fs\n"

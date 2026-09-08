@@ -106,7 +106,8 @@ proc markUncertainty(
     parsed: SourceImports, excluded: seq[bool], result: var OccurrenceIndex
 ) =
   for item in parsed.imports:
-    if item.conditional:
+    if item.conditional and
+        parsed.conditionalImportDisposition(item) == importConditionalUnknown:
       result.uncertainty.incl uncertaintyConditional
 
   for index, token in parsed.tokens:
@@ -125,7 +126,8 @@ proc markUncertainty(
       if isStropped(token):
         continue
       if token.hasKeywordRole(roleConditional):
-        result.uncertainty.incl uncertaintyConditional
+        if parsed.conditionalTokenDisposition(token) == importConditionalUnknown:
+          result.uncertainty.incl uncertaintyConditional
       if token.hasKeywordRole(roleInclude):
         result.uncertainty.incl uncertaintyInclude
       if token.hasKeywordRole(roleGenerated):
