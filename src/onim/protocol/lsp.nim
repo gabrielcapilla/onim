@@ -6,6 +6,13 @@ when defined(posix):
 elif defined(windows):
   import std/winlean
 
+when defined(linux):
+  proc setParentDeathSignal(
+    option: cint, signal: culong, arg3, arg4, arg5: culong
+  ): cint {.importc: "prctl", header: "<sys/prctl.h>".}
+
+  const parentDeathSignalOption = 1.cint
+
 import ../features/completion
 import ../features/definition
 import ../features/hover
@@ -232,6 +239,13 @@ proc terminateProcessNow(code: int) {.noreturn.} =
     quit(code)
   else:
     quit(code)
+
+when defined(linux):
+  proc bindToParentProcess() {.inline.} =
+    let parent = getppid()
+    discard setParentDeathSignal(parentDeathSignalOption, culong(SIGTERM), 0, 0, 0)
+    if getppid() != parent:
+      exitnow(1)
 
 proc readMessageText(): string {.gcsafe.} =
   var contentLength = -1
@@ -2469,6 +2483,8 @@ proc handleBootstrapEvent(
   accepted
 
 proc runLsp*() =
+  when defined(linux):
+    bindToParentProcess()
   lspTraceEnabled = getEnv("ONIM_TRACE_LSP").len > 0
   let workspace = initWorkspace()
   var stdlib = stdlibMap()
