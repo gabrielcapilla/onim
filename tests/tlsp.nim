@@ -1001,6 +1001,45 @@ suite "stdio LSP":
     check stdlibSignature["result"]["signatures"][0]["label"].getStr.contains("walkDir")
     check stdlibSignature["result"]["signatures"][0]["parameters"].len >= 1
 
+    let aliasedStdlibSignatureUri = "file:///tmp/onim-aliased-stdlib-signature.nim"
+    let aliasedStdlibSignatureText =
+      "from std/os import walkDir as visit\nproc main() =\n  discard visit(\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": aliasedStdlibSignatureUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": aliasedStdlibSignatureText,
+          }
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 109,
+        "method": "textDocument/signatureHelp",
+        "params": {
+          "textDocument": {"uri": aliasedStdlibSignatureUri},
+          "position": {"line": 2, "character": 16},
+        },
+      },
+    )
+    let aliasedStdlibSignature = readResponse(process.outputStream, 109)
+    check aliasedStdlibSignature != nil
+    check aliasedStdlibSignature["result"]["signatures"].len >= 1
+    check aliasedStdlibSignature["result"]["signatures"][0]["label"].getStr.contains(
+      "walkDir"
+    )
+    check aliasedStdlibSignature["result"]["signatures"][0]["parameters"].len >= 1
+    check aliasedStdlibSignature["result"]["activeParameter"].getInt == 0
+
     sendMessage(
       process.inputStream,
       %*{

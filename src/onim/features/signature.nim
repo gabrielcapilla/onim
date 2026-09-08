@@ -393,6 +393,7 @@ proc stdlibSignatures(
     return
   let tokens = source.index.parsed.tokens
   let name = tokens.tokenText(tokens[context.calleeToken])
+  var lookupName = name
   var qualifier = ""
   if context.qualifierToken >= 0:
     qualifier = tokens.tokenText(tokens[context.qualifierToken])
@@ -403,15 +404,15 @@ proc stdlibSignatures(
     if qualifier.len > 0:
       matchesImport = item.importQualifierMatches(qualifier)
     elif item.form == fromModule:
-      for imported in item.importedSymbols:
-        if sameIdentifier(imported.name, name):
-          matchesImport = true
-          break
+      let binding = source.fromImportBinding(item, name)
+      if binding.kind in {fromImportPlain, fromImportAlias}:
+        matchesImport = true
+        lookupName = binding.providerName
     else:
       matchesImport = item.form == importModule and item.alias.len == 0
     if not matchesImport:
       continue
-    for candidate in stdlib.candidatesFor(name, qualifier):
+    for candidate in stdlib.candidatesFor(lookupName, qualifier):
       if sameModule(candidate.module, item.module):
         result.addCandidate SignatureCandidate(
           label: candidate.signature,
