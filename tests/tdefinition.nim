@@ -68,6 +68,64 @@ proc use(item: Left) = discard item.render()
       check implementations[0].fileId.value == fileId.value
       check implementations[0].nameToken == target.target.nameToken
 
+  test "resolves project generic method implementations":
+    let root =
+      getTempDir() / ("onim-generic-method-implementation-" & $getCurrentProcessId())
+    cleanTree(root)
+    createDir(root)
+    let providerPath = root / "provider.nim"
+    let consumerPath = root / "consumer.nim"
+    let unresolvedPath = root / "unresolved.nim"
+    let providerText =
+      "type Pair*[A, B] = object\n" & "  first: A\n" & "  second: B\n" &
+      "method render*(item: Pair[int, string]) = discard\n" &
+      "method render*(item: Pair[int, bool]) = discard\n"
+    let consumerText =
+      "import provider\n" & "proc usePair(item: provider.Pair[int, string]) =\n" &
+      "  discard item.render()\n" &
+      "proc usePairBool(item: provider.Pair[int, bool]) =\n" &
+      "  discard item.render()\n"
+    writeFile(providerPath, providerText)
+    writeFile(consumerPath, consumerText)
+    writeFile(unresolvedPath, "include missing_module\n")
+    defer:
+      cleanTree(root)
+
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    check not workspace.graphComplete
+    let providerId = workspace.fileIdForPath(providerPath)
+    let consumerId = workspace.fileIdForPath(consumerPath)
+    let snapshot = workspace.snapshotForFile(consumerId)
+    let matchOffset = consumerText.find("item.render") + "item.".len + 1
+    let match = implementationTargets(workspace, snapshot, matchOffset)
+    check match.len == 1
+    if match.len == 1:
+      check match[0].fileId.value == providerId.value
+      check workspace.snapshotForFile(providerId).text.find(
+        "method render*(item: Pair[int, string])"
+      ) + "method ".len ==
+        int(
+          workspace.snapshotForFile(providerId).index.parsed.tokens[
+            int(match[0].nameToken)
+          ].startOffset
+        )
+    let mismatchOffset =
+      consumerText.find("item.render", consumerText.find("usePairBool")) + "item.".len +
+      1
+    let mismatch = implementationTargets(workspace, snapshot, mismatchOffset)
+    check mismatch.len == 1
+    if mismatch.len == 1:
+      check mismatch[0].fileId.value == providerId.value
+      check workspace.snapshotForFile(providerId).text.find(
+        "method render*(item: Pair[int, bool])"
+      ) + "method ".len ==
+        int(
+          workspace.snapshotForFile(providerId).index.parsed.tokens[
+            int(mismatch[0].nameToken)
+          ].startOffset
+        )
+
   test "resolves routine parameters and direct locals":
     let text = """proc add(value: int) =
   let total = value + 1

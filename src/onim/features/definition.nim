@@ -1141,8 +1141,6 @@ proc collectUfcsTargetRecords(
       providers.add provider
   if providers.len == 0:
     return
-  if not workspace.graphComplete:
-    return
   let catalog = workspace.moduleCatalog()
   if catalog == nil or not catalog.complete():
     return
