@@ -46,6 +46,25 @@ converter convert() = discard
     check index.symbols[11].kind == symbolTemplate
     check index.symbols[12].kind == symbolConverter
 
+  test "scopes field duplicate checks to one declaration":
+    let index = indexSource(
+      "type First = object\n" & "  value: int\n" & "type Second = object\n" &
+        "  value: string\n" & "type Invalid = object\n" & "  value: int\n" &
+        "  value_: string\n"
+    )
+    check index.types.objects.len == 2
+    check index.types.fields.len == 2
+    for objectType in index.types.objects:
+      check objectType.pastField - objectType.firstField == 1'u32
+      check index.parsed.tokens.tokenText(
+        index.parsed.tokens[
+          int(index.types.fields[int(objectType.firstField)].nameToken)
+        ]
+      ) == "value"
+    check validateTypeIndex(
+      index.types, index.parsed.tokens, index.symbols, index.scopes
+    )
+
   test "ignores nested fields, conditionals, comments, strings, and backticked keywords":
     let source = """# proc fake() = discard
 let text = "proc alsoFake() = discard"

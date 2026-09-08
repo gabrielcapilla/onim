@@ -1,4 +1,5 @@
 import std/algorithm
+import std/sets
 
 import ../syntax/lexer
 import ./scopes
@@ -418,16 +419,16 @@ proc addField(
     tokens: TokenStore,
     tokenIndex: int,
     fields: var seq[ObjectField],
+    seen: var HashSet[string],
     defaultVisibility = objectFieldPrivate,
 ): bool =
   if not validNameToken(tokens, tokenIndex):
     return false
   let token = tokens[tokenIndex]
-  for field in fields:
-    if sameIdentifier(
-      tokens.tokenText(tokens[int(field.nameToken)]), tokens.tokenText(token)
-    ):
-      return false
+  let key = tokens.identifierKey(token)
+  if key.len == 0 or key in seen:
+    return false
+  seen.incl key
   fields.add ObjectField(
     nameToken: uint32(tokenIndex),
     visibility:
@@ -443,6 +444,7 @@ proc parseFieldSegment(
     tokens: TokenStore,
     first, past: int,
     fields: var seq[ObjectField],
+    seen: var HashSet[string],
     defaultVisibility = objectFieldPrivate,
 ): bool =
   if first >= past:
@@ -488,7 +490,7 @@ proc parseFieldSegment(
     return false
 
   for nameToken in names:
-    if not addField(tokens, nameToken, fields, defaultVisibility):
+    if not addField(tokens, nameToken, fields, seen, defaultVisibility):
       return false
   true
 
@@ -496,23 +498,25 @@ proc parseFieldLine(
     tokens: TokenStore,
     first, past: int,
     fields: var seq[ObjectField],
+    seen: var HashSet[string],
     defaultVisibility = objectFieldPrivate,
 ): bool =
   var segment = first
   for index in first ..< past:
     if not tokens.tokenTextEquals(tokens[index], ";"):
       continue
-    if not parseFieldSegment(tokens, segment, index, fields, defaultVisibility):
+    if not parseFieldSegment(tokens, segment, index, fields, seen, defaultVisibility):
       return false
     segment = index + 1
   if segment < past and
-      not parseFieldSegment(tokens, segment, past, fields, defaultVisibility):
+      not parseFieldSegment(tokens, segment, past, fields, seen, defaultVisibility):
     return false
   true
 
 proc parseObjectFields(
     tokens: TokenStore, nameToken, objectToken, limit: int, fields: var seq[ObjectField]
 ): bool =
+  var seen = initHashSet[string]()
   var baseColumn = tokens[nameToken].column
   var declarationToken = nameToken - 1
   while declarationToken >= 0 and tokens[declarationToken].line == tokens[nameToken].line:
@@ -543,7 +547,7 @@ proc parseObjectFields(
       var linePast = cursor + 1
       while linePast < limit and tokens[linePast].line == token.line:
         inc linePast
-      if not parseFieldLine(tokens, cursor, linePast, fields):
+      if not parseFieldLine(tokens, cursor, linePast, fields, seen):
         return false
       cursor = linePast
       continue
@@ -590,18 +594,22 @@ proc tupleKeyword(tokens: TokenStore, nameToken, limit: int): int =
   tupleToken
 
 proc parseTupleFieldSegment(
-    tokens: TokenStore, first, past: int, fields: var seq[ObjectField]
+    tokens: TokenStore,
+    first, past: int,
+    fields: var seq[ObjectField],
+    seen: var HashSet[string],
 ): bool =
   if first >= past:
     return false
   for index in first ..< past:
     if tokens[index].isKeyword(kwTuple):
       return false
-  parseFieldSegment(tokens, first, past, fields, objectFieldExported)
+  parseFieldSegment(tokens, first, past, fields, seen, objectFieldExported)
 
 proc parseTupleFields(
     tokens: TokenStore, tupleToken, limit: int, fields: var seq[ObjectField]
 ): bool =
+  var seen = initHashSet[string]()
   let opening = tupleToken + 1
   if opening >= limit or not tokens.tokenTextEquals(tokens[opening], "["):
     return false
@@ -621,14 +629,14 @@ proc parseTupleFields(
           return false
         delimiters.setLen(delimiters.len - 1)
       elif delimiter == ']':
-        if not parseTupleFieldSegment(tokens, segment, cursor, fields):
+        if not parseTupleFieldSegment(tokens, segment, cursor, fields, seen):
           return false
         closing = cursor
         break
       else:
         return false
     elif delimiters.len == 0 and tokens.tokenTextEquals(token, ","):
-      if not parseTupleFieldSegment(tokens, segment, cursor, fields):
+      if not parseTupleFieldSegment(tokens, segment, cursor, fields, seen):
         return false
       segment = cursor + 1
   if closing < 0 or fields.len == 0:
@@ -638,16 +646,20 @@ proc parseTupleFields(
   true
 
 proc parseTupleLiteralFieldSegment(
-    tokens: TokenStore, first, past: int, fields: var seq[ObjectField]
+    tokens: TokenStore,
+    first, past: int,
+    fields: var seq[ObjectField],
+    seen: var HashSet[string],
 ): bool =
   if first + 2 >= past or not validNameToken(tokens, first) or
       not tokens.tokenTextEquals(tokens[first + 1], ":"):
     return false
-  addField(tokens, first, fields)
+  addField(tokens, first, fields, seen)
 
 proc parseTupleLiteralFields(
     tokens: TokenStore, first, past: int, fields: var seq[ObjectField]
 ): bool =
+  var seen = initHashSet[string]()
   if first < 0 or first + 2 >= past or past > tokens.len or
       not tokens.tokenTextEquals(tokens[first], "(") or
       not tokens.tokenTextEquals(tokens[past - 1], ")"):
@@ -666,11 +678,11 @@ proc parseTupleLiteralFields(
         return false
       delimiters.setLen(delimiters.len - 1)
     elif delimiters.len == 0 and tokens.tokenTextEquals(token, ","):
-      if not parseTupleLiteralFieldSegment(tokens, segment, cursor, fields):
+      if not parseTupleLiteralFieldSegment(tokens, segment, cursor, fields, seen):
         return false
       segment = cursor + 1
   if delimiters.len != 0 or
-      not parseTupleLiteralFieldSegment(tokens, segment, past - 1, fields):
+      not parseTupleLiteralFieldSegment(tokens, segment, past - 1, fields, seen):
     return false
   fields.len > 0
 
