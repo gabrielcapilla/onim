@@ -510,6 +510,23 @@ suite "stdio LSP":
           item["location"]["uri"].getStr == definitionUri:
         foundHelper = true
     check foundHelper
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 38,
+        "method": "workspace/symbol",
+        "params": {"query": "lp"},
+      },
+    )
+    let substringSymbols = readResponse(process.outputStream, 38)
+    check substringSymbols != nil
+    var foundSubstring = false
+    for item in substringSymbols["result"].items:
+      if item["name"].getStr == "helper" and
+          item["location"]["uri"].getStr == definitionUri:
+        foundSubstring = true
+    check foundSubstring
 
     let typeDefinitionUri = "file:///tmp/onim-type-definition.nim"
     let typeDefinitionText =

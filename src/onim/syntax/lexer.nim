@@ -145,6 +145,21 @@ proc spanEquals(source: string, start, past: int, wanted: string): bool {.inline
       return false
   true
 
+proc identifierCharacter(character: char, position: int): char {.inline.} =
+  if position > 0 and character >= 'A' and character <= 'Z':
+    char(ord(character) + (ord('a') - ord('A')))
+  else:
+    character
+
+proc appendIdentifierKey(result: var string, source: string, first, past: int) =
+  var position = 0
+  for index in first ..< past:
+    let character = source[index]
+    if character == '_' and position > 0:
+      continue
+    result.add identifierCharacter(character, position)
+    inc position
+
 proc identifierKey*(value: string): string =
   ## Nim's style-insensitive identifier key for the ASCII spelling common to
   ## source declarations. The first character retains its case; later ASCII
@@ -152,15 +167,7 @@ proc identifierKey*(value: string): string =
   if value.len == 0:
     return
   result = newStringOfCap(value.len)
-  result.add value[0]
-  for index in 1 ..< value.len:
-    let character = value[index]
-    if character == '_':
-      continue
-    if character >= 'A' and character <= 'Z':
-      result.add char(ord(character) + (ord('a') - ord('A')))
-    else:
-      result.add character
+  result.appendIdentifierKey(value, 0, value.len)
 
 proc sameIdentifier*(left, right: string): bool =
   identifierKey(left) == identifierKey(right)
@@ -226,15 +233,30 @@ proc identifierKey*(tokens: TokenStore, token: Token): string =
   if bounds.first >= bounds.past:
     return
   result = newStringOfCap(bounds.past - bounds.first)
-  result.add tokens.base.source[bounds.first]
-  for index in bounds.first + 1 ..< bounds.past:
-    let character = tokens.base.source[index]
-    if character == '_':
-      continue
-    if character >= 'A' and character <= 'Z':
-      result.add char(ord(character) + (ord('a') - ord('A')))
-    else:
-      result.add character
+  result.appendIdentifierKey(tokens.base.source, bounds.first, bounds.past)
+
+proc identifierContainsKey*(tokens: TokenStore, token: Token, wanted: string): bool =
+  if wanted.len == 0:
+    return true
+  let bounds = tokens.tokenTextBounds(token)
+  var start = bounds.first
+  while start < bounds.past:
+    var position = if start == bounds.first: 0 else: 1
+    var queryIndex = 0
+    var cursor = start
+    while cursor < bounds.past and queryIndex < wanted.len:
+      let character = tokens.base.source[cursor]
+      if character == '_' and position > 0:
+        inc cursor
+        continue
+      if identifierCharacter(character, position) != wanted[queryIndex]:
+        break
+      inc cursor
+      inc position
+      inc queryIndex
+    if queryIndex == wanted.len:
+      return true
+    inc start
 
 proc len*(tokens: TokenStore): int {.inline.} =
   if tokens.base == nil: 0 else: tokens.base.values.len

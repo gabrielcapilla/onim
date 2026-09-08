@@ -1413,7 +1413,8 @@ proc workspaceSymbols(params: JsonNode, workspace: Workspace): JsonNode =
           token.endOffset > snapshot.text.len or token.endOffset <= token.startOffset:
         continue
       let name = snapshot.index.parsed.tokens.tokenText(token)
-      if query.len > 0 and query notin identifierKey(name):
+      if query.len > 0 and
+          not snapshot.index.parsed.tokens.identifierContainsKey(token, query):
         continue
       let start = positionAt(positions, snapshot.text, token.startOffset)
       let finish = positionAt(positions, snapshot.text, token.endOffset)

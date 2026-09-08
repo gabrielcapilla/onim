@@ -25,8 +25,9 @@ These are fixed-workload observations, not guarantees. They were measured on Lin
 | Incremental source, 1,800 lines  | 0.268482 ms | 0.283761 ms |
 | Incremental source, 10,000 lines | 1.397408 ms | 1.501945 ms |
 | Workspace rebuild, 256 modules   | 1.148626 ms |           — |
+| Workspace symbols, 4,000 symbols | 2.838489 ms |           — |
 
-For a 256-module workspace, the observed cold bootstrap was 54.635785 ms, warm bootstrap 3.525845 ms, cached surface lookup 0.000850 ms, and rebuild 2.461026 ms. Native parent RSS was approximately 24.2 MiB; a fallback request measured approximately 24.8 MiB for the parent and 48.1 MiB for its semantic child, or 72.7 MiB combined RSS. These measurements did not reproduce the reported 2 GiB session.
+For a 256-module workspace, the observed cold bootstrap was 54.635785 ms, warm bootstrap 3.525845 ms, cached surface lookup 0.000850 ms, and rebuild 2.461026 ms. The workspace-symbol row is the p95 of 50 no-match LSP queries against 4,000 indexed declarations; it is a direct probe rather than a `nimble bench` workload. Native parent RSS was approximately 24.2 MiB; a fallback request measured approximately 24.8 MiB for the parent and 48.1 MiB for its semantic child, or 72.7 MiB combined RSS. These measurements did not reproduce the reported 2 GiB session.
 
 ## Boundary still open
 
