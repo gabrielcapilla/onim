@@ -467,6 +467,13 @@ proc main() =
     check result.replaceStart == source.find("ge")
     check result.replaceEnd == offset
 
+    let jsonStdlib = loadStdlibMap(getCurrentDir() / "src" / "stdlib_map.json")
+    check jsonStdlib.directNominalReturn("std/httpclient", "newHttpClient") ==
+      "HttpClient"
+    check jsonStdlib.directNominalMembers("std/httpclient", "HttpClient", "ge").anyIt(
+      it.name == "get"
+    )
+
     let noImport = """proc main() =
   let client = newHttpClient()
   client.ge

@@ -34,6 +34,7 @@ type
     surface*: SurfaceIndex
     symbolKeys: Table[string, seq[string]]
     implicitModules: HashSet[string]
+    receiverCandidates: Table[string, seq[SymbolCandidate]]
     metadata: StdlibMetadataState
 
 const
@@ -169,6 +170,9 @@ proc newStdlibMap(): StdlibMap =
   result.modules = initHashSet[string]()
   result.symbolKeys = initTable[string, seq[string]]()
   result.implicitModules = initHashSet[string]()
+  result.receiverCandidates = initTable[string, seq[SymbolCandidate]]()
+
+proc rebuildReceiverIndex(stdlib: StdlibMap)
 
 proc registerSymbolKey(stdlib: StdlibMap, name: string) =
   let key = identifierKey(name)
@@ -405,6 +409,7 @@ proc decodeStdlibBinary(data: string): StdlibMap =
     result.symbols[symbol.name] = values
   if result.symbols.len == 0:
     return emptyStdlibMap()
+  result.rebuildReceiverIndex()
   result.metadata = metadataComplete
   return result
 
@@ -509,6 +514,7 @@ proc loadStdlibMap*(path: string): StdlibMap =
           discard addUniqueCandidate(result.symbols.mgetOrPut(name, @[]), candidate)
     if result.symbols.len == 0:
       return emptyStdlibMap()
+    result.rebuildReceiverIndex()
   except CatchableError:
     return emptyStdlibMap()
 
@@ -567,6 +573,26 @@ proc callableCandidate(candidate: SymbolCandidate): bool {.inline.} =
     true
   else:
     false
+
+proc receiverIndexKey(module, nominal: string): string {.inline.} =
+  let canonical = canonicalModule(module)
+  let key = identifierKey(nominal)
+  if canonical.len == 0 or key.len == 0:
+    return
+  canonical & "|" & key
+
+proc rebuildReceiverIndex(stdlib: StdlibMap) =
+  stdlib.receiverCandidates.clear()
+  for _, candidates in stdlib.symbols:
+    for candidate in candidates:
+      if not candidate.callableCandidate:
+        continue
+      let key =
+        receiverIndexKey(candidate.module, candidate.signature.firstParameterType)
+      if key.len == 0:
+        continue
+      discard
+        addUniqueCandidate(stdlib.receiverCandidates.mgetOrPut(key, @[]), candidate)
 
 proc implicitValueCandidate*(stdlib: StdlibMap, name: string): SymbolCandidate =
   if stdlib == nil or not stdlib.implicitModule("std/system"):
@@ -664,16 +690,14 @@ proc directNominalMembers*(
   if not canonical.startsWith("std/") or nominal.len == 0:
     return
   let prefixKey = identifierKey(prefix)
-  for _, candidates in stdlib.symbols:
-    for candidate in candidates:
-      if canonicalModule(candidate.module) != canonical or
-          not candidate.callableCandidate or
-          not sameIdentifier(candidate.signature.firstParameterType, nominal):
-        continue
-      let key = identifierKey(candidate.name)
-      if key.len == 0 or (prefixKey.len > 0 and not key.startsWith(prefixKey)):
-        continue
-      discard addUniqueCandidate(result, candidate)
+  let receiverKey = receiverIndexKey(canonical, nominal)
+  if not stdlib.receiverCandidates.hasKey(receiverKey):
+    return
+  for candidate in stdlib.receiverCandidates[receiverKey]:
+    let key = identifierKey(candidate.name)
+    if key.len == 0 or (prefixKey.len > 0 and not key.startsWith(prefixKey)):
+      continue
+    discard addUniqueCandidate(result, candidate)
 
 proc resolveUniqueCandidate*(
   stdlib: StdlibMap, name, qualifier: string, arity = -1
