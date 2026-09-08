@@ -1423,6 +1423,49 @@ suite "stdio LSP":
     )
     check fromProjectOverloads["result"]["activeParameter"].getInt == 0
 
+    let aliasedOverloadConsumerUri =
+      "file:///tmp/onim-provider/aliased_overload_consumer.nim"
+    let aliasedOverloadConsumerText =
+      "from overload_provider import run as execute\n" &
+      "proc main() =\n  discard execute(\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": aliasedOverloadConsumerUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": aliasedOverloadConsumerText,
+          }
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 108,
+        "method": "textDocument/signatureHelp",
+        "params": {
+          "textDocument": {"uri": aliasedOverloadConsumerUri},
+          "position": {"line": 2, "character": 18},
+        },
+      },
+    )
+    let aliasedProjectOverloads = readResponse(process.outputStream, 108)
+    check aliasedProjectOverloads != nil
+    check aliasedProjectOverloads["result"]["signatures"].len == 2
+    check aliasedProjectOverloads["result"]["signatures"][0]["label"].getStr.contains(
+      "proc run*(value: int)"
+    )
+    check aliasedProjectOverloads["result"]["signatures"][1]["label"].getStr.contains(
+      "proc run*(value: string)"
+    )
+    check aliasedProjectOverloads["result"]["activeParameter"].getInt == 0
+
     sendMessage(
       process.inputStream,
       %*{

@@ -28,6 +28,24 @@ type
     qualifierToken: int
     activeParameter: int
 
+  FromImportBindingKind = enum
+    fromImportNone
+    fromImportPlain
+    fromImportAlias
+    fromImportUnsupported
+
+  FromImportBinding = object
+    kind: FromImportBindingKind
+    providerName: string
+
+  FromImportFallback = enum
+    fromFallbackAllowed
+    fromFallbackBlocked
+
+  FromProjectSignatures = object
+    fallback: FromImportFallback
+    signatures: seq[SignatureCandidate]
+
 proc tokenIs(tokens: TokenStore, index: int, wanted: string): bool {.inline.} =
   index >= 0 and index < tokens.len and tokens.tokenTextEquals(tokens[index], wanted)
 
@@ -274,14 +292,14 @@ proc qualifiedProjectOverloadSignatures(
   let tokens = source.index.parsed.tokens
   let qualifier = tokens.tokenText(tokens[context.qualifierToken])
   let name = tokens.tokenText(tokens[context.calleeToken])
-  var matched = false
+  var matches = 0
   for item in source.index.parsed.imports:
     if item.synthetic or item.conditional or item.excluded.len > 0 or
         not item.importQualifierMatches(qualifier) or item.module.startsWith("std/"):
       continue
-    if matched:
+    if matches > 0:
       return
-    matched = true
+    inc matches
     let moduleId = workspace.resolveModule(source.fileId, item.module)
     if not moduleId.valid:
       return
@@ -295,24 +313,47 @@ proc fromImportHasExcept(source: WorkspaceSnapshot, item: ImportInfo): bool {.in
     if token.isKeyword(kwExcept):
       return true
 
-proc plainFromImport(source: WorkspaceSnapshot, item: ImportInfo, name: string): bool =
-  if item.form != fromModule or item.synthetic or item.conditional or
-      item.excluded.len > 0 or source.fromImportHasExcept(item):
-    return false
+proc fromImportBinding(
+    source: WorkspaceSnapshot, item: ImportInfo, name: string
+): FromImportBinding =
+  if item.form != fromModule:
+    return
   for imported in item.importedSymbols:
     if not sameIdentifier(imported.name, name):
       continue
+    result.kind = fromImportUnsupported
+    if item.synthetic or item.conditional or item.excluded.len > 0 or
+        source.fromImportHasExcept(item):
+      return
     if imported.startOffset < 0 or imported.endOffset <= imported.startOffset or
         imported.endOffset > source.text.len:
-      return false
+      return
+    var firstToken = -1
+    var tokenCount = 0
+    for tokenIndex, token in source.index.parsed.tokens:
+      if token.startOffset < imported.startOffset or token.endOffset > imported.endOffset:
+        continue
+      if firstToken < 0:
+        firstToken = tokenIndex
+      inc tokenCount
+    if tokenCount == 1:
+      result.kind = fromImportPlain
+      result.providerName =
+        source.text[imported.startOffset ..< imported.endOffset].strip(chars = {'`'})
+    elif tokenCount == 3 and firstToken >= 0:
+      let tokens = source.index.parsed.tokens
+      let original = tokens[firstToken]
+      let asToken = tokens[firstToken + 1]
+      let alias = tokens[firstToken + 2]
+      if original.kind == tkIdentifier and asToken.isKeyword(kwAs) and
+          alias.kind == tkIdentifier:
+        result.kind = fromImportAlias
+        result.providerName = tokens.tokenText(original)
     return
-      source.text[imported.startOffset ..< imported.endOffset].strip(chars = {'`'}) ==
-      imported.name
-  false
 
 proc fromProjectOverloadSignatures(
     workspace: Workspace, source: WorkspaceSnapshot, context: CallContext
-): seq[SignatureCandidate] =
+): FromProjectSignatures =
   if workspace == nil or not source.valid or source.index == nil or
       context.qualifierToken >= 0 or context.calleeToken < 0 or
       context.calleeToken >= source.index.parsed.tokens.len:
@@ -320,18 +361,30 @@ proc fromProjectOverloadSignatures(
   let name = source.index.parsed.tokens.tokenText(
     source.index.parsed.tokens[context.calleeToken]
   )
-  var matched = false
+  var matches = 0
   for item in source.index.parsed.imports:
-    if item.module.startsWith("std/") or not source.plainFromImport(item, name):
+    let binding = source.fromImportBinding(item, name)
+    if binding.kind == fromImportNone:
       continue
-    if matched:
+    if binding.kind == fromImportUnsupported:
+      result.fallback = fromFallbackBlocked
       return
-    matched = true
+    if item.module.startsWith("std/"):
+      return
+    if matches > 0:
+      result.fallback = fromFallbackBlocked
+      return
+    inc matches
     let moduleId = workspace.resolveModule(source.fileId, item.module)
     if not moduleId.valid:
+      if binding.kind == fromImportAlias:
+        result.fallback = fromFallbackBlocked
       return
     let target = workspace.snapshotForFile(moduleId)
-    result = target.projectOverloadSignatures(source.id, name)
+    result.signatures =
+      target.projectOverloadSignatures(source.id, binding.providerName)
+    if binding.kind == fromImportAlias:
+      result.fallback = fromFallbackBlocked
 
 proc stdlibSignatures(
     source: WorkspaceSnapshot, stdlib: StdlibMap, context: CallContext
@@ -384,10 +437,12 @@ proc resolveSignatureHelp*(
       result.signatures = qualifiedOverloads
     else:
       var projectOverloads: seq[SignatureCandidate] = @[]
+      var fromFallback = fromFallbackAllowed
       if context.value.qualifierToken < 0:
-        projectOverloads =
-          workspace.fromProjectOverloadSignatures(source, context.value)
-      if projectOverloads.len > 0:
+        let fromProject = workspace.fromProjectOverloadSignatures(source, context.value)
+        projectOverloads = fromProject.signatures
+        fromFallback = fromProject.fallback
+      if fromFallback == fromFallbackBlocked or projectOverloads.len > 0:
         result.signatures = projectOverloads
       else:
         let project = workspace.projectSignature(source, context.value)
