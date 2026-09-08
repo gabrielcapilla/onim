@@ -270,7 +270,7 @@ proc declarationGroup(
       continue
     if delimiters.len == 0 and tokens.tokenTextEquals(token, ":"):
       return false
-  true
+  delimiters.len == 0
 
 proc loopHeaderEnd(tokens: TokenStore, first, past: int): int {.inline.} =
   for index in first ..< past:
@@ -352,23 +352,26 @@ proc bodyBounds(
     return
   result.first = equals + 1
   result.baseColumn = tokens[result.first].column
-  if tokens[result.first].line == tokens[equals].line:
-    result.past = result.first
-    while result.past < tokens.len and tokens[result.past].line == tokens[equals].line and
-        not tokens.tokenTextEquals(tokens[result.past], ";"):
-      inc result.past
-    result.valid = result.past > result.first
+  if tokens[result.first].line > tokens[equals].line and result.baseColumn <= 0:
     return
-
-  if result.baseColumn <= 0:
-    return
+  var delimiters: seq[char] = @[]
   result.past = result.first
   while result.past < tokens.len:
-    if result.past > result.first and tokens[result.past].line > tokens[equals].line and
-        tokens[result.past].column == 0:
+    let token = tokens[result.past]
+    if pushDelimiter(delimiters, tokens, token):
+      inc result.past
+      continue
+    if tokens.tokenTextLen(token) == 1 and
+        isClosingDelimiter(tokens.tokenTextChar(token, 0)):
+      if not popDelimiter(delimiters, tokens, token):
+        return
+      inc result.past
+      continue
+    if delimiters.len == 0 and result.past > result.first and
+        token.line > tokens[equals].line and token.column == 0:
       break
     inc result.past
-  result.valid = result.past > result.first
+  result.valid = result.past > result.first and delimiters.len == 0
 
 proc statementStart(
     tokens: TokenStore, index, first, baseColumn: int
@@ -385,10 +388,23 @@ proc localDeclarationEnd(
     tokens: TokenStore, start, past, baseColumn: int
 ): int {.gcsafe.} =
   result = start + 1
+  var delimiters: seq[char] = @[]
   while result < past:
-    if tokens.tokenTextEquals(tokens[result], ";"):
+    let token = tokens[result]
+    if pushDelimiter(delimiters, tokens, token):
+      inc result
+      continue
+    if tokens.tokenTextLen(token) == 1 and
+        isClosingDelimiter(tokens.tokenTextChar(token, 0)):
+      if not popDelimiter(delimiters, tokens, token):
+        inc result
+        continue
+      inc result
+      continue
+    if delimiters.len == 0 and tokens.tokenTextEquals(token, ";"):
       break
-    if tokens[result].line > tokens[start].line and tokens[result].column <= baseColumn:
+    if delimiters.len == 0 and token.line > tokens[start].line and
+        token.column <= baseColumn:
       break
     inc result
 

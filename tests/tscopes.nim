@@ -42,6 +42,50 @@ suite "native lexical scopes":
     check index.scopes.innermostScopeAt(index.tokenNamed("total")) == ScopeId(2)
     check index.scopes.isComplete
 
+  test "keeps multiline delimited locals inside their routine":
+    let source = """proc show() =
+  let point = (
+    x: 1,
+    y: 2
+  )
+  let values = [
+    1,
+    2
+  ]
+  let resultValue = combine(
+1
+  )
+  echo point
+  echo values
+  echo resultValue
+"""
+    let index = indexSource(source)
+    check index.scopes.validateScopes(index.parsed.tokens, index.symbols, source.len)
+    check declarationNames(index) == @["point", "values", "resultValue"]
+    check index.scopes.scopes.len == 2
+    check index.scopes.isComplete
+
+  test "keeps a same-line routine body through multiline delimiters":
+    let source = """proc show() = echo combine(
+1
+)
+proc next() = discard
+"""
+    let index = indexSource(source)
+    check index.scopes.validateScopes(index.parsed.tokens, index.symbols, source.len)
+    check index.scopes.scopes.len == 3
+    check index.scopes.isComplete
+
+  test "rejects an unclosed multiline declaration conservatively":
+    let source = """proc show() =
+  let value = combine(
+    1
+  echo value
+"""
+    let index = indexSource(source)
+    check scopeMalformed in index.scopes.uncertainty
+    check not index.scopes.isComplete
+
   test "keeps routine scopes and same-name locals distinct":
     let source = """proc first(value: int) =
   let local = value
