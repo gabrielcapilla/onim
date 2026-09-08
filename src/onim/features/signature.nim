@@ -2,6 +2,7 @@ import std/[sets, strutils]
 
 import ../index/source_index
 import ../index/symbols
+import ../session/ids
 import ../session/workspace
 import ../stdlib/map
 import ../syntax/imports
@@ -239,6 +240,49 @@ proc projectSignature(
   if symbolIndex >= 0:
     result = sourceSignature(target, target.index.symbols[symbolIndex])
 
+proc importQualifierMatches(item: ImportInfo, qualifier: string): bool {.inline.} =
+  item.form == importModule and (
+    (item.alias.len > 0 and sameIdentifier(item.alias, qualifier)) or
+    (item.alias.len == 0 and sameIdentifier(moduleLeaf(item.module), qualifier))
+  )
+
+proc qualifiedProjectOverloadSignatures(
+    workspace: Workspace, source: WorkspaceSnapshot, context: CallContext
+): seq[SignatureCandidate] =
+  if workspace == nil or not source.valid or source.index == nil or
+      context.qualifierToken < 0 or context.calleeToken < 0 or
+      context.calleeToken >= source.index.parsed.tokens.len:
+    return
+  let tokens = source.index.parsed.tokens
+  let qualifier = tokens.tokenText(tokens[context.qualifierToken])
+  let name = tokens.tokenText(tokens[context.calleeToken])
+  var matched = false
+  for item in source.index.parsed.imports:
+    if item.synthetic or item.conditional or item.excluded.len > 0 or
+        not item.importQualifierMatches(qualifier) or item.module.startsWith("std/"):
+      continue
+    if matched:
+      return
+    matched = true
+    let moduleId = workspace.resolveModule(source.fileId, item.module)
+    if not moduleId.valid:
+      return
+    let target = workspace.snapshotForFile(moduleId)
+    if not target.valid or target.id.value != source.id.value or target.index == nil or
+        not target.index.nativeIndexSafe():
+      return
+    for symbol in target.index.symbols:
+      if not symbol.exported or not symbol.kind.routineKind or
+          symbol.nameToken >= uint32(target.index.parsed.tokens.len):
+        continue
+      if sameIdentifier(
+        target.index.parsed.tokens.tokenText(
+          target.index.parsed.tokens[int(symbol.nameToken)]
+        ),
+        name,
+      ):
+        result.addCandidate target.sourceSignature(symbol)
+
 proc stdlibSignatures(
     source: WorkspaceSnapshot, stdlib: StdlibMap, context: CallContext
 ): seq[SignatureCandidate] =
@@ -254,11 +298,7 @@ proc stdlibSignatures(
       continue
     var matchesImport = false
     if qualifier.len > 0:
-      matchesImport =
-        item.form == importModule and (
-          (item.alias.len > 0 and sameIdentifier(item.alias, qualifier)) or
-          (item.alias.len == 0 and sameIdentifier(moduleLeaf(item.module), qualifier))
-        )
+      matchesImport = item.importQualifierMatches(qualifier)
     elif item.form == fromModule:
       for imported in item.importedSymbols:
         if sameIdentifier(imported.name, name):
@@ -288,10 +328,15 @@ proc resolveSignatureHelp*(
   if overloads.len > 0:
     result.signatures = overloads
   else:
-    let project = workspace.projectSignature(source, context.value)
-    if project.label.len > 0:
-      result.signatures.addCandidate project
+    let qualifiedOverloads =
+      workspace.qualifiedProjectOverloadSignatures(source, context.value)
+    if qualifiedOverloads.len > 0:
+      result.signatures = qualifiedOverloads
     else:
-      result.signatures = stdlibSignatures(source, stdlib, context.value)
+      let project = workspace.projectSignature(source, context.value)
+      if project.label.len > 0:
+        result.signatures.addCandidate project
+      else:
+        result.signatures = stdlibSignatures(source, stdlib, context.value)
   if result.signatures.len > 0:
     result.state = signatureAvailable

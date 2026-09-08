@@ -1322,6 +1322,66 @@ suite "stdio LSP":
     check crossFileDefinition["result"]["range"]["start"]["line"].getInt == 0
     check crossFileDefinition["result"]["range"]["start"]["character"].getInt == 5
 
+    let overloadProviderUri = "file:///tmp/onim-provider/overload_provider.nim"
+    let overloadConsumerUri = "file:///tmp/onim-provider/overload_consumer.nim"
+    let overloadProviderText =
+      "proc run*(value: int) = discard\n" & "proc run*(value: string) = discard\n" &
+      "proc run(value: float) = discard\n"
+    let overloadConsumerText =
+      "import overload_provider\nproc main() =\n  discard overload_provider.run(\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": overloadProviderUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": overloadProviderText,
+          }
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": overloadConsumerUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": overloadConsumerText,
+          }
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 106,
+        "method": "textDocument/signatureHelp",
+        "params": {
+          "textDocument": {"uri": overloadConsumerUri},
+          "position": {"line": 2, "character": 32},
+        },
+      },
+    )
+    let projectOverloads = readResponse(process.outputStream, 106)
+    check projectOverloads != nil
+    check projectOverloads["result"]["signatures"].len == 2
+    check projectOverloads["result"]["signatures"][0]["label"].getStr.contains(
+      "proc run*(value: int)"
+    )
+    check projectOverloads["result"]["signatures"][1]["label"].getStr.contains(
+      "proc run*(value: string)"
+    )
+    check projectOverloads["result"]["activeParameter"].getInt == 0
+
     sendMessage(
       process.inputStream,
       %*{
