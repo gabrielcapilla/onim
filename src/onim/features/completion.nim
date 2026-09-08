@@ -826,6 +826,71 @@ proc appendImplicitFileMembers(
       candidateByName,
     )
 
+proc stdlibDirectCall(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    stdlib: StdlibMap,
+    declarationToken: uint32,
+): tuple[module, typeName: string] =
+  if workspace == nil or stdlib == nil or not stdlib.surfaceIsComplete or
+      source.index == nil:
+    return
+  let local = source.index.types.localTypeAt(
+    source.index.parsed.tokens, source.index.scopes, declarationToken
+  )
+  if local.form != localTypeFormCall or local.typeToken == InvalidTypeToken or
+      local.typeToken >= uint32(source.index.parsed.tokens.len):
+    return
+  let nameToken = int(local.typeToken)
+  let name = source.index.parsed.tokens.tokenText(source.index.parsed.tokens[nameToken])
+  if source.index.moduleDeclarationShadows(nameToken) or
+      not source.importedUseSupported(nameToken, name) or
+      resolveDefinitionAtToken(workspace, source, nameToken).kind != definitionUnknown:
+    return
+  let qualified = local.firstToken != local.typeToken
+  let qualifier =
+    if qualified and local.firstToken < uint32(source.index.parsed.tokens.len):
+      source.index.parsed.tokens.tokenText(
+        source.index.parsed.tokens[int(local.firstToken)]
+      )
+    else:
+      ""
+  for item in source.index.parsed.imports:
+    if item.form != importModule or item.alias.len > 0 or item.synthetic or
+        item.conditional or item.excluded.len > 0:
+      continue
+    if qualified and not sameIdentifier(moduleLeaf(item.module), qualifier):
+      continue
+    let typeName = stdlib.directNominalReturn(item.module, name)
+    if typeName.len == 0:
+      continue
+    let module = canonicalModule(item.module)
+    if result.module.len > 0 and result.module != module:
+      return ("", "")
+    result = (module, typeName)
+
+proc appendStdlibDirectCallMembers(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    stdlib: StdlibMap,
+    declarationToken: uint32,
+    prefix: string,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+): bool =
+  let call = workspace.stdlibDirectCall(source, stdlib, declarationToken)
+  if call.module.len == 0:
+    return false
+  for candidate in stdlib.directNominalMembers(call.module, call.typeName, prefix):
+    discard appendCompletionCandidate(
+      candidate.name,
+      completionMethod,
+      identifierKey(prefix),
+      candidates,
+      candidateByName,
+    )
+  candidates.len > 0
+
 proc completeLocalMembers(
     workspace: Workspace,
     source: WorkspaceSnapshot,
@@ -842,51 +907,57 @@ proc completeLocalMembers(
     else:
       InvalidTypeToken
   let localType = workspace.resolveReceiverType(source, declarationToken, indexToken)
-  if localType.info.state != typeStateResolved or not localType.info.typeId.valid:
-    return
   var candidates: seq[VisibleCompletion] = @[]
   var candidateByName = initTable[string, int]()
-  let receiver = resolveObjectReceiver(workspace, source, declarationToken, indexToken)
-  if receiver.resolved:
-    let visibility = if receiver.exportedOnly: fieldsExported else: fieldsAll
-    let objectType =
-      if receiver.fieldSource == objectFieldsLocalTuple:
-        receiver.provider.types.localTupleObjects[int(receiver.objectOrdinal)]
-      else:
-        receiver.provider.types.objects[int(receiver.objectOrdinal)]
-    let fields =
-      if receiver.fieldSource == objectFieldsLocalTuple:
-        receiver.provider.types.localTupleFields
-      else:
-        receiver.provider.types.fields
-    if not appendObjectFields(
-      receiver.provider,
-      fields,
-      objectType,
-      identifierKey(context.prefix),
-      visibility,
-      candidates,
+  if localType.info.state != typeStateResolved or not localType.info.typeId.valid:
+    if not appendStdlibDirectCallMembers(
+      workspace, source, stdlib, declarationToken, context.prefix, candidates,
       candidateByName,
     ):
       return
-  let implicitFile = appendImplicitFileMembers(
-    workspace,
-    source,
-    stdlib,
-    localType.info,
-    identifierKey(context.prefix),
-    candidates,
-    candidateByName,
-  )
-  if not appendUfcsMembers(
-    workspace,
-    source,
-    localType,
-    identifierKey(context.prefix),
-    candidates,
-    candidateByName,
-  ) and not implicitFile:
-    return
+  else:
+    let receiver =
+      resolveObjectReceiver(workspace, source, declarationToken, indexToken)
+    if receiver.resolved:
+      let visibility = if receiver.exportedOnly: fieldsExported else: fieldsAll
+      let objectType =
+        if receiver.fieldSource == objectFieldsLocalTuple:
+          receiver.provider.types.localTupleObjects[int(receiver.objectOrdinal)]
+        else:
+          receiver.provider.types.objects[int(receiver.objectOrdinal)]
+      let fields =
+        if receiver.fieldSource == objectFieldsLocalTuple:
+          receiver.provider.types.localTupleFields
+        else:
+          receiver.provider.types.fields
+      if not appendObjectFields(
+        receiver.provider,
+        fields,
+        objectType,
+        identifierKey(context.prefix),
+        visibility,
+        candidates,
+        candidateByName,
+      ):
+        return
+    let implicitFile = appendImplicitFileMembers(
+      workspace,
+      source,
+      stdlib,
+      localType.info,
+      identifierKey(context.prefix),
+      candidates,
+      candidateByName,
+    )
+    if not appendUfcsMembers(
+      workspace,
+      source,
+      localType,
+      identifierKey(context.prefix),
+      candidates,
+      candidateByName,
+    ) and not implicitFile:
+      return
   if candidates.len == 0:
     return
   candidates.sort(compareCompletion)

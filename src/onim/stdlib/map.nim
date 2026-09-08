@@ -542,19 +542,23 @@ proc candidatesFor*(
 proc implicitModule*(stdlib: StdlibMap, module: string): bool =
   stdlib != nil and canonicalModule(module) in stdlib.implicitModules
 
-proc firstParameterIsFile(signature: string): bool {.inline.} =
+proc firstParameterType(signature: string): string {.inline.} =
   let open = signature.find('(')
   if open < 0:
-    return false
+    return
   let colon = signature.find(':', open + 1)
   if colon < 0:
-    return false
+    return
   let semicolon = signature.find(';', colon + 1)
   let close = signature.find(')', colon + 1)
   var past = semicolon
   if past < 0 or (close >= 0 and close < past):
     past = close
-  past >= 0 and signature[colon + 1 ..< past].strip == "File"
+  if past > colon + 1:
+    result = signature[colon + 1 ..< past].strip
+
+proc firstParameterIsFile(signature: string): bool {.inline.} =
+  sameIdentifier(signature.firstParameterType, "File")
 
 proc callableCandidate(candidate: SymbolCandidate): bool {.inline.} =
   case candidate.kind
@@ -615,6 +619,61 @@ proc implicitFileMembers*(
 
 proc implicitFileMembers*(stdlib: StdlibMap, prefix: string): seq[SymbolCandidate] =
   stdlib.fileMembersForModule(stdlib.implicitFileModule(), prefix)
+
+proc plainNominalName(value: string): bool {.inline.} =
+  if value.len == 0 or not (value[0].isAlphaAscii or value[0] == '_'):
+    return false
+  for character in value[1 .. ^1]:
+    if not (character.isAlphaAscii or character.isDigit or character == '_'):
+      return false
+  true
+
+proc directNominalReturn*(stdlib: StdlibMap, module, name: string): string =
+  if stdlib == nil:
+    return
+  let canonical = canonicalModule(module)
+  if not canonical.startsWith("std/"):
+    return
+  let candidates = stdlib.candidatesFor(name, moduleBase(canonical), -1)
+  if candidates.len != 1 or not candidates[0].callableCandidate or
+      canonicalModule(candidates[0].module) != canonical:
+    return
+  let signature = candidates[0].signature
+  let close = signature.rfind(')')
+  if close < 0:
+    return
+  let colon = signature.find(':', close + 1)
+  if colon < 0:
+    return
+  var first = colon + 1
+  while first < signature.len and signature[first] in {' ', '\t', '\r', '\n'}:
+    inc first
+  var past = first
+  while past < signature.len and signature[past] notin {' ', '\t', '\r', '\n', '{'}:
+    inc past
+  let candidate = signature[first ..< past]
+  if candidate.plainNominalName:
+    result = candidate
+
+proc directNominalMembers*(
+    stdlib: StdlibMap, module, nominal, prefix: string
+): seq[SymbolCandidate] =
+  if stdlib == nil:
+    return
+  let canonical = canonicalModule(module)
+  if not canonical.startsWith("std/") or nominal.len == 0:
+    return
+  let prefixKey = identifierKey(prefix)
+  for _, candidates in stdlib.symbols:
+    for candidate in candidates:
+      if canonicalModule(candidate.module) != canonical or
+          not candidate.callableCandidate or
+          not sameIdentifier(candidate.signature.firstParameterType, nominal):
+        continue
+      let key = identifierKey(candidate.name)
+      if key.len == 0 or (prefixKey.len > 0 and not key.startsWith(prefixKey)):
+        continue
+      discard addUniqueCandidate(result, candidate)
 
 proc resolveUniqueCandidate*(
   stdlib: StdlibMap, name, qualifier: string, arity = -1

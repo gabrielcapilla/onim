@@ -452,6 +452,97 @@ walkD
     check completeAt(workspace, stderrSnapshot, stderrOffset, loadStdlibMap("")).state ==
       completionAvailable
 
+  test "completes members from a strict stdlib nominal return":
+    let stdlib = loadStdlibMap("")
+    let source = """import std/httpclient
+proc main() =
+  let client = newHttpClient()
+  client.ge
+"""
+    let workspace = initWorkspace()
+    let offset = source.find("client.ge") + "client.ge".len
+    let result = completeAt(workspace, localSnapshot(source), offset, stdlib)
+    check result.state == completionAvailable
+    check result.items.anyIt(it.label == "get")
+    check result.replaceStart == source.find("ge")
+    check result.replaceEnd == offset
+
+    let noImport = """proc main() =
+  let client = newHttpClient()
+  client.ge
+"""
+    let noImportResult = completeAt(
+      workspace,
+      localSnapshot(noImport),
+      noImport.find("client.ge") + "client.ge".len,
+      stdlib,
+    )
+    check not noImportResult.items.anyIt(it.label == "get")
+
+    let conditional = """when defined(enableHttp):
+  import std/httpclient
+proc main() =
+  let client = newHttpClient()
+  client.ge
+"""
+    let conditionalResult = completeAt(
+      workspace,
+      localSnapshot(conditional),
+      conditional.find("client.ge") + "client.ge".len,
+      stdlib,
+    )
+    check not conditionalResult.items.anyIt(it.label == "get")
+
+    let fromImport = """from std/httpclient import newHttpClient
+proc main() =
+  let client = newHttpClient()
+  client.ge
+"""
+    let fromResult = completeAt(
+      workspace,
+      localSnapshot(fromImport),
+      fromImport.find("client.ge") + "client.ge".len,
+      stdlib,
+    )
+    check not fromResult.items.anyIt(it.label == "get")
+
+    let alias = """import std/httpclient as http
+proc main() =
+  let client = newHttpClient()
+  client.ge
+"""
+    let aliasResult = completeAt(
+      workspace, localSnapshot(alias), alias.find("client.ge") + "client.ge".len, stdlib
+    )
+    check not aliasResult.items.anyIt(it.label == "get")
+
+    let excluded = """import std/httpclient except newHttpClient
+proc main() =
+  let client = newHttpClient()
+  client.ge
+"""
+    let excludedResult = completeAt(
+      workspace,
+      localSnapshot(excluded),
+      excluded.find("client.ge") + "client.ge".len,
+      stdlib,
+    )
+    check not excludedResult.items.anyIt(it.label == "get")
+
+    let shadowed = """import std/httpclient
+proc newHttpClient(): int = 0
+proc main() =
+  let client = newHttpClient()
+  client.ge
+"""
+    let shadowedResult = completeAt(
+      workspace,
+      localSnapshot(shadowed),
+      shadowed.find("client.ge") + "client.ge".len,
+      stdlib,
+    )
+    check not shadowedResult.items.anyIt(it.label == "get")
+
   test "completes project members, refreshes overlays, and respects precedence":
     let root = getTempDir() / ("onim-project-completion-" & $getCurrentProcessId())
     let cacheRoot =
