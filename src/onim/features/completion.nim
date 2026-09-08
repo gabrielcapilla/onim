@@ -573,6 +573,52 @@ proc unsupportedStructure(index: SourceIndex): bool =
       return true
   false
 
+proc completeModuleImportedNames(
+    workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int, stdlib: StdlibMap
+): CompletionResult =
+  if workspace == nil or not source.valid or source.index == nil or
+      source.path.toLowerAscii.endsWith(".nimble") or
+      source.path.toLowerAscii.endsWith(".cfg") or byteOffset < 0 or
+      byteOffset > source.text.len or not source.index.bindingsReady or
+      source.index.unsupportedStructure or not source.index.nativeIndexSafe():
+    return
+  let tokenIndex = source.index.prefixToken(byteOffset)
+  if tokenIndex < 0 or not source.index.completionContext(tokenIndex) or
+      source.index.implicitNameKind(uint32(tokenIndex)) != implicitNone:
+    return
+  let active = source.index.scopes.innermostScopeAt(uint32(tokenIndex))
+  let ordinal = active.scopeOrdinal
+  if ordinal < 0 or ordinal >= source.index.scopes.scopes.len or
+      source.index.scopes.scopes[ordinal].kind != scopeModule:
+    return
+
+  var candidates: seq[VisibleCompletion] = @[]
+  var candidateByName = initTable[string, int]()
+  for symbol in source.index.symbols:
+    if symbol.nameToken >= uint32(source.index.parsed.tokens.len):
+      continue
+    let name = source.index.parsed.tokens.tokenText(
+      source.index.parsed.tokens[int(symbol.nameToken)]
+    )
+    let key = identifierKey(name)
+    if key.len == 0 or candidateByName.hasKey(key):
+      continue
+    candidateByName[key] = candidates.len
+    candidates.add VisibleCompletion(key: "", declarationToken: symbol.nameToken)
+  let prefix =
+    source.index.parsed.tokens.tokenText(source.index.parsed.tokens[tokenIndex])
+  discard appendUnqualifiedImports(
+    workspace, source, stdlib, identifierKey(prefix), candidates, candidateByName
+  )
+  candidates.sort(compareCompletion)
+  result.state = completionAvailable
+  result.replaceStart = source.index.parsed.tokens[tokenIndex].startOffset
+  result.replaceEnd = byteOffset
+  result.items = newSeqOfCap[CompletionItem](candidates.len)
+  for candidate in candidates:
+    if candidate.key.len > 0:
+      result.items.add candidate.item
+
 proc addScopeDistances(
     index: ScopeIndex, active: ScopeId, distances: var Table[uint32, uint32]
 ): bool =
@@ -1009,4 +1055,7 @@ proc completeAt*(
     result = CompletionResult()
   of memberContextAbsent:
     result = completeLocals(source, byteOffset)
-    mergeImportedCompletions(workspace, source, stdlib, result)
+    if result.state == completionAvailable:
+      mergeImportedCompletions(workspace, source, stdlib, result)
+    else:
+      result = completeModuleImportedNames(workspace, source, byteOffset, stdlib)

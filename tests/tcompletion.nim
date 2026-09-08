@@ -391,6 +391,34 @@ proc main() =
     check visitResult.items.anyIt(it.label == "visit")
     check not visitResult.items.anyIt(it.label == "walkDir")
 
+    let moduleSource = """import std/os
+walkD
+"""
+    let moduleSnapshot = localSnapshot(moduleSource)
+    let moduleOffset = moduleSource.rfind("walkD") + "walkD".len
+    let moduleResult = completeAt(workspace, moduleSnapshot, moduleOffset, stdlib)
+    check moduleResult.state == completionAvailable
+    check moduleResult.items.anyIt(it.label == "walkDir")
+    check moduleResult.replaceStart == moduleSource.rfind("walkD")
+    check moduleResult.replaceEnd == moduleOffset
+
+    let shadowSource = """import std/os
+proc walkDir() = discard
+walkD
+"""
+    let shadowSnapshot = localSnapshot(shadowSource)
+    let shadowOffset = shadowSource.rfind("walkD") + "walkD".len
+    let shadow = completeAt(workspace, shadowSnapshot, shadowOffset, stdlib)
+    check not shadow.items.anyIt(it.label == "walkDir")
+
+    let aliasSource = """import std/os as filesystem
+walkD
+"""
+    let aliasSnapshot = localSnapshot(aliasSource)
+    let aliasOffset = aliasSource.rfind("walkD") + "walkD".len
+    let alias = completeAt(workspace, aliasSnapshot, aliasOffset, stdlib)
+    check not alias.items.anyIt(it.label == "walkDir")
+
   test "completes implicit File receivers from stdlib metadata":
     let source = """proc main() =
   stdout.wri
@@ -446,6 +474,7 @@ proc private() = discard
     let consumer = """import provider as p
 from provider import scale, total, answer
 from provider import answer as execute
+ans
 proc main() =
   p.an
 proc useImported() =
@@ -492,6 +521,15 @@ proc shadow() =
     check projectResult.items.anyIt(it.label == "another")
     check not projectResult.items.anyIt(it.label == "private")
     check projectResult.items.anyIt(it.kind == completionFunction)
+
+    let moduleAnswerStart = consumer.find("\nans\n") + 1
+    let moduleAnswerOffset = moduleAnswerStart + "ans".len
+    let moduleAnswerResult =
+      completeAt(workspace, consumerSnapshot, moduleAnswerOffset, emptyStdlibMap())
+    check moduleAnswerResult.state == completionAvailable
+    check moduleAnswerResult.items.anyIt(it.label == "answer")
+    check moduleAnswerResult.replaceStart == moduleAnswerStart
+    check moduleAnswerResult.replaceEnd == moduleAnswerOffset
 
     let answerOffset = consumer.find("  ans\n") + 5
     let answerResult =
