@@ -394,6 +394,9 @@ suite "stdio LSP":
     check not initialized["result"]["capabilities"]["completionProvider"][
       "resolveProvider"
     ].getBool
+    check initialized["result"]["capabilities"]["completionProvider"][
+      "triggerCharacters"
+    ][0].getStr == "."
 
     sendMessage(
       process.inputStream, %*{"jsonrpc": "2.0", "method": "initialized", "params": {}}

@@ -2602,7 +2602,8 @@ proc runLsp*() =
       capabilities["typeDefinitionProvider"] = %true
       capabilities["implementationProvider"] = %true
       capabilities["callHierarchyProvider"] = %true
-      capabilities["completionProvider"] = %*{"resolveProvider": false}
+      capabilities["completionProvider"] =
+        %*{"resolveProvider": false, "triggerCharacters": ["."]}
       capabilities["hoverProvider"] = %true
       capabilities["renameProvider"] = %*{"prepareProvider": true}
       capabilities["referencesProvider"] = %true
