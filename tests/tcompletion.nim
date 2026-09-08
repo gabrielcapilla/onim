@@ -367,6 +367,30 @@ proc main() =
     let legacyResult = completeAt(workspace, legacySnapshot, legacyOffset, stdlib)
     check legacyResult.state == completionUnsupported
 
+  test "completes unqualified stdlib and from-import names":
+    let source = """import std/os
+from std/os import walkDir as visit
+proc main() =
+  walkD
+  visi
+"""
+    let snapshot = localSnapshot(source)
+    let workspace = initWorkspace()
+    let stdlib = loadStdlibMap("")
+
+    let walkOffset = source.rfind("walkD") + "walkD".len
+    let walkResult = completeAt(workspace, snapshot, walkOffset, stdlib)
+    check walkResult.state == completionAvailable
+    check walkResult.items.anyIt(it.label == "walkDir")
+    check walkResult.replaceStart == source.rfind("walkD")
+    check walkResult.replaceEnd == walkOffset
+
+    let visitOffset = source.rfind("visi") + "visi".len
+    let visitResult = completeAt(workspace, snapshot, visitOffset, stdlib)
+    check visitResult.state == completionAvailable
+    check visitResult.items.anyIt(it.label == "visit")
+    check not visitResult.items.anyIt(it.label == "walkDir")
+
   test "completes implicit File receivers from stdlib metadata":
     let source = """proc main() =
   stdout.wri
@@ -420,14 +444,21 @@ proc total*(values: seq[int]) = discard
 proc private() = discard
 """
     let consumer = """import provider as p
-from provider import scale, total
+from provider import scale, total, answer
+from provider import answer as execute
 proc main() =
   p.an
+proc useImported() =
+  ans
+  exe
 proc use(value: int) =
   value.sc
 proc useValues() =
   let values = p.makeValues()
   values.to
+proc shadow() =
+  let answer = 1
+  ans
 """
     writeFile(providerPath, provider)
     writeFile(consumerPath, consumer)
@@ -461,6 +492,27 @@ proc useValues() =
     check projectResult.items.anyIt(it.label == "another")
     check not projectResult.items.anyIt(it.label == "private")
     check projectResult.items.anyIt(it.kind == completionFunction)
+
+    let answerOffset = consumer.find("  ans\n") + 5
+    let answerResult =
+      completeAt(workspace, consumerSnapshot, answerOffset, emptyStdlibMap())
+    check answerResult.state == completionAvailable
+    check answerResult.items.anyIt(it.label == "answer")
+    check not answerResult.items.anyIt(it.label == "private")
+
+    let executeOffset = consumer.find("  exe\n") + 5
+    let executeResult = completeAt(workspace, consumerSnapshot, executeOffset, stdlib)
+    check executeResult.state == completionAvailable
+    check executeResult.items.mapIt(it.label) == @["execute"]
+
+    let localShadowOffset = consumer.rfind("  ans\n") + 5
+    let localShadowResult =
+      completeAt(workspace, consumerSnapshot, localShadowOffset, stdlib)
+    check localShadowResult.state == completionAvailable
+    check localShadowResult.items.countIt(it.label == "answer") == 1
+    check localShadowResult.items.anyIt(
+      it.label == "answer" and it.kind == completionVariable
+    )
 
     let ufcsOffset = consumer.find("value.sc") + "value.sc".len
     let ufcsResult = completeAt(workspace, consumerSnapshot, ufcsOffset, stdlib)

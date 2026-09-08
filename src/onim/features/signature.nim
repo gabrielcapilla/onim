@@ -28,16 +28,6 @@ type
     qualifierToken: int
     activeParameter: int
 
-  FromImportBindingKind = enum
-    fromImportNone
-    fromImportPlain
-    fromImportAlias
-    fromImportUnsupported
-
-  FromImportBinding = object
-    kind: FromImportBindingKind
-    providerName: string
-
   FromImportFallback = enum
     fromFallbackAllowed
     fromFallbackBlocked
@@ -306,51 +296,6 @@ proc qualifiedProjectOverloadSignatures(
     let target = workspace.snapshotForFile(moduleId)
     result = target.projectOverloadSignatures(source.id, name)
 
-proc fromImportHasExcept(source: WorkspaceSnapshot, item: ImportInfo): bool {.inline.} =
-  for token in source.index.parsed.tokens:
-    if token.startOffset < item.startOffset or token.endOffset > item.endOffset:
-      continue
-    if token.isKeyword(kwExcept):
-      return true
-
-proc fromImportBinding(
-    source: WorkspaceSnapshot, item: ImportInfo, name: string
-): FromImportBinding =
-  if item.form != fromModule:
-    return
-  for imported in item.importedSymbols:
-    if not sameIdentifier(imported.name, name):
-      continue
-    result.kind = fromImportUnsupported
-    if item.synthetic or item.conditional or item.excluded.len > 0 or
-        source.fromImportHasExcept(item):
-      return
-    if imported.startOffset < 0 or imported.endOffset <= imported.startOffset or
-        imported.endOffset > source.text.len:
-      return
-    var firstToken = -1
-    var tokenCount = 0
-    for tokenIndex, token in source.index.parsed.tokens:
-      if token.startOffset < imported.startOffset or token.endOffset > imported.endOffset:
-        continue
-      if firstToken < 0:
-        firstToken = tokenIndex
-      inc tokenCount
-    if tokenCount == 1:
-      result.kind = fromImportPlain
-      result.providerName =
-        source.text[imported.startOffset ..< imported.endOffset].strip(chars = {'`'})
-    elif tokenCount == 3 and firstToken >= 0:
-      let tokens = source.index.parsed.tokens
-      let original = tokens[firstToken]
-      let asToken = tokens[firstToken + 1]
-      let alias = tokens[firstToken + 2]
-      if original.kind == tkIdentifier and asToken.isKeyword(kwAs) and
-          alias.kind == tkIdentifier:
-        result.kind = fromImportAlias
-        result.providerName = tokens.tokenText(original)
-    return
-
 proc fromProjectOverloadSignatures(
     workspace: Workspace, source: WorkspaceSnapshot, context: CallContext
 ): FromProjectSignatures =
@@ -363,7 +308,7 @@ proc fromProjectOverloadSignatures(
   )
   var matches = 0
   for item in source.index.parsed.imports:
-    let binding = source.fromImportBinding(item, name)
+    let binding = fromImportBinding(source.index.parsed.tokens, source.text, item, name)
     if binding.kind == fromImportNone:
       continue
     if binding.kind == fromImportUnsupported:
@@ -404,7 +349,8 @@ proc stdlibSignatures(
     if qualifier.len > 0:
       matchesImport = item.importQualifierMatches(qualifier)
     elif item.form == fromModule:
-      let binding = source.fromImportBinding(item, name)
+      let binding =
+        fromImportBinding(source.index.parsed.tokens, source.text, item, name)
       if binding.kind in {fromImportPlain, fromImportAlias}:
         matchesImport = true
         lookupName = binding.providerName

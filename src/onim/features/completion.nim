@@ -75,6 +75,19 @@ type
     fieldsAll
     fieldsExported
 
+  ImportedSelectionKind = enum
+    importedSelectionSkip
+    importedSelectionAll
+    importedSelectionNamed
+
+  ImportedName = object
+    localName: string
+    providerName: string
+
+  ImportedSelection = object
+    kind: ImportedSelectionKind
+    names: seq[ImportedName]
+
 proc scopeOrdinal(scope: ScopeId): int {.inline.} =
   int(uint32(scope)) - 1
 
@@ -230,6 +243,81 @@ proc appendCompletionCandidate(
     candidates[candidateByName[key]] = visible
   true
 
+proc importedSelection(source: WorkspaceSnapshot, item: ImportInfo): ImportedSelection =
+  if source.index == nil or item.synthetic or item.conditional:
+    return
+  case item.form
+  of importModule:
+    if item.alias.len == 0:
+      result.kind = importedSelectionAll
+  of fromModule:
+    result.kind = importedSelectionNamed
+    for imported in item.importedSymbols:
+      let binding =
+        fromImportBinding(source.index.parsed.tokens, source.text, item, imported.name)
+      if binding.kind in {fromImportPlain, fromImportAlias}:
+        result.names.add ImportedName(
+          localName: imported.name, providerName: binding.providerName
+        )
+    if result.names.len == 0:
+      result.kind = importedSelectionSkip
+
+proc excludedImportName(item: ImportInfo, name: string): bool {.inline.} =
+  for excluded in item.excluded:
+    if sameIdentifier(excluded, name):
+      return true
+
+proc selectedImportedName(
+    selection: ImportedSelection, providerName: string
+): string {.inline.} =
+  case selection.kind
+  of importedSelectionAll:
+    result = providerName
+  of importedSelectionNamed:
+    for imported in selection.names:
+      if sameIdentifier(imported.providerName, providerName):
+        return imported.localName
+  of importedSelectionSkip:
+    discard
+
+proc appendImportedCandidate(
+    name, providerKey: string,
+    kind: CompletionKind,
+    prefixKey: string,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+    importedProviders: var Table[string, string],
+    ambiguousNames: var HashSet[string],
+): bool =
+  let key = identifierKey(name)
+  if key.len == 0 or (prefixKey.len > 0 and not key.startsWith(prefixKey)):
+    return true
+  if key in ambiguousNames:
+    return true
+  if candidateByName.hasKey(key):
+    if not importedProviders.hasKey(key):
+      return true
+    if importedProviders[key] == providerKey:
+      return true
+    candidates[candidateByName[key]].key = ""
+    candidateByName.del(key)
+    importedProviders.del(key)
+    ambiguousNames.incl(key)
+    return true
+  discard appendCompletionCandidate(name, kind, prefixKey, candidates, candidateByName)
+  if candidateByName.hasKey(key):
+    importedProviders[key] = providerKey
+  true
+
+proc compareCompletion(left, right: VisibleCompletion): int =
+  result = cmp(left.key, right.key)
+  if result != 0:
+    return
+  result = cmp(left.item.label, right.item.label)
+  if result != 0:
+    return
+  result = cmp(left.declarationToken, right.declarationToken)
+
 proc memberCompletionKind(kind: SourceSymbolKind): CompletionKind {.inline.} =
   case kind
   of symbolConst:
@@ -300,6 +388,176 @@ proc appendStdlibMembers(
     )
   true
 
+proc appendProjectImport(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    item: ImportInfo,
+    owner: string,
+    catalog: ModuleCatalog,
+    prefixKey: string,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+    importedProviders: var Table[string, string],
+    ambiguousNames: var HashSet[string],
+): bool =
+  if catalog == nil or not catalog.complete or not workspace.graphComplete:
+    return true
+  let project = catalog.resolveModuleName(owner, item.module)
+  if project.kind != moduleResolved:
+    return true
+  let view = workspace.indexViewForFile(project.id)
+  if not view.valid or view.index == nil or view.id.value != source.id.value or
+      not view.index.nativeIndexSafe():
+    return true
+  let input = projectSurfaceInput(project.module, view.index)
+  if input.module.len == 0 or input.uncertainty != {}:
+    return true
+  let selection = source.importedSelection(item)
+  if selection.kind == importedSelectionSkip:
+    return true
+  for exported in input.exports:
+    if not exported.kindKnown:
+      continue
+    if selection.kind == importedSelectionAll and item.excludedImportName(exported.name):
+      continue
+    let localName = selection.selectedImportedName(exported.name)
+    if localName.len == 0:
+      continue
+    discard appendImportedCandidate(
+      localName,
+      canonicalModule(project.module) & "|" & identifierKey(exported.name),
+      memberCompletionKind(exported.kind),
+      prefixKey,
+      candidates,
+      candidateByName,
+      importedProviders,
+      ambiguousNames,
+    )
+  true
+
+proc appendStdlibImport(
+    stdlib: StdlibMap,
+    source: WorkspaceSnapshot,
+    item: ImportInfo,
+    prefixKey: string,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+    importedProviders: var Table[string, string],
+    ambiguousNames: var HashSet[string],
+): bool =
+  let module = stdlib.stdlibModuleName(item.module)
+  if module.len == 0:
+    return true
+  let selection = source.importedSelection(item)
+  if selection.kind == importedSelectionSkip:
+    return true
+  let surface = stdlib.surfaceIndex()
+  var bindings: seq[BindingCandidate] = @[]
+  if not surface.appendBindingsInModule(module, "", bindings):
+    return true
+  for binding in bindings:
+    let exports = surface.exportsFor(binding)
+    if exports.len == 0:
+      continue
+    if selection.kind == importedSelectionAll and item.excludedImportName(binding.name):
+      continue
+    let localName = selection.selectedImportedName(binding.name)
+    if localName.len == 0:
+      continue
+    discard appendImportedCandidate(
+      localName,
+      module & "|" & identifierKey(binding.name),
+      memberCompletionKind(exports[0].kind),
+      prefixKey,
+      candidates,
+      candidateByName,
+      importedProviders,
+      ambiguousNames,
+    )
+  true
+
+proc appendUnqualifiedImports(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    stdlib: StdlibMap,
+    prefixKey: string,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+): bool =
+  if workspace == nil or not source.valid or source.index == nil or
+      not source.index.bindingsReady or not source.index.nativeIndexSafe():
+    return false
+  var importedProviders = initTable[string, string]()
+  var ambiguousNames = initHashSet[string]()
+  let catalog = workspace.moduleCatalog()
+  let owner =
+    if catalog != nil:
+      catalog.moduleForPath(source.path)
+    else:
+      ""
+  for item in source.index.parsed.imports:
+    if item.synthetic or item.conditional:
+      continue
+    if item.form == importModule and item.alias.len > 0:
+      continue
+    var projectResolved = false
+    if catalog != nil and catalog.complete:
+      let project = catalog.resolveModuleName(owner, item.module)
+      case project.kind
+      of moduleResolved:
+        projectResolved = true
+        discard appendProjectImport(
+          workspace, source, item, owner, catalog, prefixKey, candidates,
+          candidateByName, importedProviders, ambiguousNames,
+        )
+      of moduleAmbiguous, moduleUnknown:
+        projectResolved = true
+      of moduleMissing:
+        discard
+    if not projectResolved:
+      discard appendStdlibImport(
+        stdlib, source, item, prefixKey, candidates, candidateByName, importedProviders,
+        ambiguousNames,
+      )
+  true
+
+proc mergeImportedCompletions(
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    stdlib: StdlibMap,
+    result: var CompletionResult,
+) =
+  if result.state != completionAvailable:
+    return
+  var candidates = newSeqOfCap[VisibleCompletion](result.items.len)
+  var candidateByName = initTable[string, int]()
+  for item in result.items:
+    let key = identifierKey(item.label)
+    if key.len == 0:
+      continue
+    candidateByName[key] = candidates.len
+    candidates.add VisibleCompletion(
+      item: item, key: key, declarationToken: high(uint32)
+    )
+  discard appendUnqualifiedImports(
+    workspace,
+    source,
+    stdlib,
+    identifierKey(
+      if result.replaceEnd > result.replaceStart:
+        source.text[result.replaceStart ..< result.replaceEnd]
+      else:
+        ""
+    ),
+    candidates,
+    candidateByName,
+  )
+  candidates.sort(compareCompletion)
+  result.items = newSeqOfCap[CompletionItem](candidates.len)
+  for candidate in candidates:
+    if candidate.key.len > 0:
+      result.items.add candidate.item
+
 proc unsupportedStructure(index: SourceIndex): bool =
   for symbol in index.symbols:
     if symbol.kind in {symbolMacro, symbolTemplate}:
@@ -331,15 +589,6 @@ proc addScopeDistances(
     distances[uint32(current)] = uint32(distances.len)
     current = index.parentScope(current)
   false
-
-proc compareCompletion(left, right: VisibleCompletion): int =
-  result = cmp(left.key, right.key)
-  if result != 0:
-    return
-  result = cmp(left.item.label, right.item.label)
-  if result != 0:
-    return
-  result = cmp(left.declarationToken, right.declarationToken)
 
 proc appendVisible(
     index: SourceIndex,
@@ -741,20 +990,23 @@ proc completeAt*(
     let binding = source.index.resolveBinding(uint32(context.qualifierToken))
     case binding.state
     of bindingResolved:
-      completeLocalMembers(workspace, source, stdlib, context, binding.declarationToken)
+      result = completeLocalMembers(
+        workspace, source, stdlib, context, binding.declarationToken
+      )
     of bindingAmbiguous:
-      CompletionResult()
+      result = CompletionResult()
     of bindingUnknown:
       if context.qualifierKind == qualifierIndexedSequence:
-        CompletionResult()
+        result = CompletionResult()
       else:
         let enumReceiver =
           resolveEnumTypeReceiver(workspace, source, uint32(context.qualifierToken))
         if enumReceiver.resolved:
-          completeEnumMembers(source, context, enumReceiver)
+          result = completeEnumMembers(source, context, enumReceiver)
         else:
-          completeModuleMembers(workspace, source, stdlib, context)
+          result = completeModuleMembers(workspace, source, stdlib, context)
   of memberContextInvalid:
-    CompletionResult()
+    result = CompletionResult()
   of memberContextAbsent:
-    completeLocals(source, byteOffset)
+    result = completeLocals(source, byteOffset)
+    mergeImportedCompletions(workspace, source, stdlib, result)

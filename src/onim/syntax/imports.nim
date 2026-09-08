@@ -36,6 +36,16 @@ type
     conditional*: bool
     keep*: bool
 
+  FromImportBindingKind* = enum
+    fromImportNone
+    fromImportPlain
+    fromImportAlias
+    fromImportUnsupported
+
+  FromImportBinding* = object
+    kind*: FromImportBindingKind
+    providerName*: string
+
   SourceImports* = object
     tokens*: TokenStore
     imports*: seq[ImportInfo]
@@ -216,6 +226,50 @@ proc addFromImportedName(
   info.importedSymbols.add ImportSymbol(
     name: name, startOffset: start, endOffset: finishOffset
   )
+
+proc fromImportHasExcept(tokens: TokenStore, item: ImportInfo): bool {.inline.} =
+  for token in tokens:
+    if token.startOffset < item.startOffset or token.endOffset > item.endOffset:
+      continue
+    if token.isKeyword(kwExcept):
+      return true
+
+proc fromImportBinding*(
+    tokens: TokenStore, source: string, item: ImportInfo, localName: string
+): FromImportBinding =
+  if item.form != fromModule:
+    return
+  for imported in item.importedSymbols:
+    if not sameIdentifier(imported.name, localName):
+      continue
+    result.kind = fromImportUnsupported
+    if item.synthetic or item.conditional or item.excluded.len > 0 or
+        fromImportHasExcept(tokens, item):
+      return
+    if imported.startOffset < 0 or imported.endOffset <= imported.startOffset or
+        imported.endOffset > source.len:
+      return
+    var firstToken = -1
+    var tokenCount = 0
+    for tokenIndex, token in tokens:
+      if token.startOffset < imported.startOffset or token.endOffset > imported.endOffset:
+        continue
+      if firstToken < 0:
+        firstToken = tokenIndex
+      inc tokenCount
+    if tokenCount == 1 and firstToken >= 0 and tokens[firstToken].kind == tkIdentifier:
+      result.kind = fromImportPlain
+      result.providerName =
+        source[imported.startOffset ..< imported.endOffset].strip(chars = {'`'})
+    elif tokenCount == 3 and firstToken >= 0:
+      let original = tokens[firstToken]
+      let asToken = tokens[firstToken + 1]
+      let alias = tokens[firstToken + 2]
+      if original.kind == tkIdentifier and asToken.isKeyword(kwAs) and
+          alias.kind == tkIdentifier:
+        result.kind = fromImportAlias
+        result.providerName = tokens.tokenText(original)
+    return
 
 proc parseImport(
     tokens: TokenStore, source: string, index: int
