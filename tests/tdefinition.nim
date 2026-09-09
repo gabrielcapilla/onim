@@ -2,11 +2,17 @@ import std/[algorithm, strutils, unittest]
 import std/os except FileId
 
 import onim/features/definition
+import onim/features/definition_models
 import onim/features/implementation
 import onim/index/symbols
+import onim/index/type_kinds
+import onim/index/type_queries
+import onim/index/type_states
 import onim/index/types
 import onim/session/ids
 import onim/session/workspace
+import onim/session/workspace_models
+import onim/syntax/tokens
 
 proc cleanTree(root: string) =
   if not dirExists(root):

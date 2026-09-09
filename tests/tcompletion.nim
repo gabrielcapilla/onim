@@ -1,11 +1,16 @@
 import std/[os, sequtils, strutils, unittest]
 
 import onim/features/completion
+import onim/features/completion_models
+import onim/features/completion_stdlib_call
 import onim/index/cache
 import onim/index/source_index
 import onim/session/ids as onimIds
 import onim/session/workspace
+import onim/session/workspace_models
 import onim/stdlib/map
+import onim/stdlib/map_receivers
+import onim/stdlib/map_runtime
 
 proc localSnapshot(source: string, path = "main.nim"): WorkspaceSnapshot =
   WorkspaceSnapshot(
@@ -50,6 +55,26 @@ suite "native local completion":
     check constants.items.len == 1
     check constants.items[0].label == "constantValue"
     check constants.items[0].kind == completionConstant
+
+  test "completes primitive type annotations":
+    let source = "proc show() =\n  var n: u\n  discard n\n"
+    let result = memberCompletionAt(source, "u")
+    check result.state == completionAvailable
+    check result.items.mapIt(it.label) ==
+      @["uint", "uint16", "uint32", "uint64", "uint8"]
+    check result.items.allIt(it.kind == completionType)
+
+  test "completes the built-in main-module condition":
+    let source = "when isMain:\n  discard\n"
+    let result = completeAt(
+      initWorkspace(),
+      localSnapshot(source),
+      source.rfind("isMain") + "isMain".len,
+      stdlibMap(),
+    )
+    check result.state == completionAvailable
+    check result.items.mapIt(it.label) == @["isMainModule"]
+    check result.items[0].kind == completionConstant
 
   test "orders candidates and respects Nim identifier spelling":
     let source = """proc show(value: int) =
@@ -365,7 +390,11 @@ proc main() =
     let legacySnapshot = workspace.snapshotForFile(directId)
     let legacyOffset = legacy.find("filesystem.") + "filesystem.".len
     let legacyResult = completeAt(workspace, legacySnapshot, legacyOffset, stdlib)
-    check legacyResult.state == completionUnsupported
+    check legacyResult.state == completionAvailable
+    check legacyResult.replaceStart == legacy.find("filesystem.") + "filesystem.".len
+    check legacyResult.replaceEnd == legacyOffset
+    check legacyResult.items.anyIt(it.label == "walkDir")
+    check legacyResult.items.anyIt(it.label == "walkDirRec")
 
   test "completes unqualified stdlib and from-import names":
     let source = """import std/os

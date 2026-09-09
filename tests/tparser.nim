@@ -2,6 +2,7 @@ import std/[os, strutils, unittest]
 
 import onim/index/source_index
 import onim/syntax/imports
+import onim/syntax/tokens
 import onim/syntax/lexer
 import onim/syntax/parser
 

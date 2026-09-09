@@ -3,7 +3,16 @@ import std/unittest
 import onim/index/source_index
 import onim/index/scopes
 import onim/index/symbols
+import onim/index/type_ids
+import onim/index/type_index_validation
+import onim/index/type_kinds
+import onim/index/type_local_models
+import onim/index/type_local_resolution
+import onim/index/type_queries
+import onim/index/type_routine_returns
+import onim/index/type_states
 import onim/index/types
+import onim/syntax/tokens
 
 proc symbolNames(index: SourceIndex): seq[string] =
   for symbol in index.symbols:

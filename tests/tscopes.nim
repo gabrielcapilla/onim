@@ -1,7 +1,11 @@
 import std/unittest
 
 import onim/index/scopes
+import onim/index/scope_queries
+import onim/index/scope_validation
+import onim/index/scope_uncertainty
 import onim/index/source_index
+import onim/syntax/tokens
 
 proc declarationNames(index: SourceIndex): seq[string] =
   for declaration in index.scopes.declarations:

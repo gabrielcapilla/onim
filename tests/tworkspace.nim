@@ -4,12 +4,20 @@ import std/os except FileId
 import onim/index/cache
 import onim/index/occurrences
 import onim/index/scopes
+import onim/index/scope_validation
 import onim/index/source_index
 import onim/index/surfaces
+import onim/index/surface_resolution
 import onim/session/ids
+import onim/session/paths
 import onim/session/workspace
+import onim/session/workspace_models
+import onim/index/type_kinds
+import onim/index/type_queries
+import onim/index/type_local_resolution
 import onim/syntax/parser
 import onim/index/types
+import onim/syntax/tokens
 
 proc uriFor(path: string): string =
   "file://" & path.replace('\\', '/')
@@ -61,6 +69,48 @@ proc replaceLine(source: string, line: int, name: string): string =
   lines.join("\n")
 
 suite "workspace index":
+  test "narrows document bootstrap to the nearest project root":
+    let root = getTempDir() / ("onim-root-selection-" & $getCurrentProcessId())
+    cleanTree(root)
+    defer:
+      cleanTree(root)
+    let project = root / "project"
+    let sourceRoot = project / "src"
+    let mainPath = sourceRoot / "main.nim"
+    let unrelatedPath = root / "unrelated" / "other.nim"
+    createDir(sourceRoot)
+    createDir(splitFile(unrelatedPath).dir)
+    writeFile(project / "nim.cfg", "")
+    writeFile(mainPath, "discard\n")
+    writeFile(sourceRoot / "module.nim", "discard\n")
+    writeFile(unrelatedPath, "discard\n")
+
+    let workspace = initWorkspace()
+    check broadWorkspaceRoot(getHomeDir())
+    check broadWorkspaceRoot("/")
+    check not broadWorkspaceRoot(root)
+    check workspace.root.len == 0
+    check workspace.prepareWorkspaceForDocument(mainPath)
+    check workspace.root == canonicalPath(project)
+
+    workspace.indexWorkspace()
+    check workspace.fileIdForPath(mainPath).valid
+    check not workspace.fileIdForPath(unrelatedPath).valid
+
+  test "keeps an unmarked document local without recursive bootstrap":
+    let root = getTempDir() / ("onim-root-selection-local-" & $getCurrentProcessId())
+    cleanTree(root)
+    defer:
+      cleanTree(root)
+    let path = root / "main.nim"
+    createDir(root)
+    writeFile(path, "discard\n")
+
+    let workspace = initWorkspace()
+    check not workspace.prepareWorkspaceForDocument(path)
+    check workspace.root.len == 0
+    check workspace.openDocument("file://" & path, path, "discard\n", 1).valid
+
   test "persists and reloads source indexes":
     let root = getTempDir() / ("onim-cache-project-" & $getCurrentProcessId())
     let cacheRoot = getTempDir() / ("onim-cache-" & $getCurrentProcessId())
@@ -195,13 +245,15 @@ suite "workspace index":
     createDir(root / "pkg")
     let mainPath = root / "main.nim"
     let source =
-      "include\n" & "import goodA\n" & "include first, \"second\", pkg/[third, fourth]\n" &
+      "include\n" & "import goodA\n" &
+      "include first, \"second\", \"included.nim\", pkg/[third, fourth]\n" &
       "include broken/[part,\n" & "include final\n"
     writeFile(mainPath, source)
     for path in [
       root / "goodA.nim",
       root / "first.nim",
       root / "second.nim",
+      root / "included.nim",
       root / "final.nim",
       root / "import.nim",
       root / "broken.nim",
@@ -241,6 +293,7 @@ suite "workspace index":
       root / "goodA.nim",
       root / "first.nim",
       root / "second.nim",
+      root / "included.nim",
       root / "final.nim",
       root / "pkg" / "third.nim",
       root / "pkg" / "fourth.nim",

@@ -5,6 +5,7 @@ import onim/index/bindings
 import onim/index/scopes
 import onim/index/source_index
 import onim/syntax/parser
+import onim/syntax/tokens
 
 suite "native lexical bindings":
   test "uses inner blocks for shadowing and restores the parent":

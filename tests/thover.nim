@@ -5,7 +5,8 @@ import onim/index/bindings
 import onim/index/scopes
 import onim/session/workspace
 import onim/stdlib/map
-import onim/syntax/lexer
+import onim/stdlib/map_runtime
+import onim/syntax/tokens
 
 proc hoverFor(source, wanted: string): HoverInfo =
   let workspace = initWorkspace()
@@ -30,6 +31,26 @@ suite "native hover":
     check info.module == "std/os"
     check info.documentation.contains("Walks over")
 
+  test "renders stdlib documentation as readable markdown":
+    let info = hoverFor("import std/strformat\nfmt(\"hi\")\n", "fmt")
+    check info.state == hoverAvailable
+    check info.documentation.contains("dummy untyped")
+    check info.documentation.contains("`fmt`")
+    check not info.documentation.contains("<tt")
+
+  test "resolves hover for an explicitly typed stdlib receiver":
+    let source = """import std/httpclient
+proc main() =
+  var client: HttpClient
+  client.get
+"""
+    let info = hoverAt(source, source.find("client.get") + "client.".len)
+    check info.state == hoverAvailable
+    check info.name == "get"
+    check info.module == "std/httpclient"
+    check info.signature.contains("get")
+    check info.documentation.len > 0
+
   test "resolves implicit stdlib File values":
     let info = hoverFor("proc show() = discard stdout\n", "stdout")
     check info.state == hoverAvailable
@@ -43,6 +64,15 @@ suite "native hover":
     let info = hoverFor(source, "greet")
     check info.state == hoverAvailable
     check info.documentation == "Say hello.\nThis line continues the contract."
+
+  test "shows leading body comments when a declaration has no doc comment":
+    let source =
+      "proc main() =\n" & "  # Main function with a simple comment\n" &
+      "  ## Main function with a docstring\n" & "  discard\n"
+    let info = hoverFor(source, "main")
+    check info.state == hoverAvailable
+    check info.documentation ==
+      "Main function with a simple comment\nMain function with a docstring"
 
   test "resolves qualified aliases":
     let info =

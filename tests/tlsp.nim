@@ -467,6 +467,52 @@ suite "stdio LSP":
       "import std/os"
     )
 
+    let mainConditionalUri = "file:///tmp/onim-main-conditional.nim"
+    let mainConditionalText =
+      "when isMainModule:\n  for k, v in walkDir(\"/tmp\"):\n    discard v\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": mainConditionalUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": mainConditionalText,
+          }
+        },
+      },
+    )
+    check readDiagnostics(process.outputStream, mainConditionalUri) != nil
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 91,
+        "method": "textDocument/codeAction",
+        "params": {
+          "textDocument": {"uri": mainConditionalUri},
+          "context": {"only": ["source.organizeImports"]},
+        },
+      },
+    )
+    let mainConditionalActions = readResponse(process.outputStream, 91)
+    check mainConditionalActions != nil
+    check mainConditionalActions["result"].len == 1
+    check mainConditionalActions["result"][0]["edit"]["changes"][mainConditionalUri][0][
+      "newText"
+    ].getStr == "import std/os\n\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didClose",
+        "params": {"textDocument": {"uri": mainConditionalUri}},
+      },
+    )
+
     sendMessage(
       process.inputStream,
       %*{
@@ -915,6 +961,54 @@ suite "stdio LSP":
     check inlays["result"][0]["kind"].getInt == 1
     check inlays["result"][0]["position"]["line"].getInt == 1
     check inlays["result"][0]["position"]["character"].getInt == 11
+
+    let stringHintUri = "file:///tmp/onim-string-hint.nim"
+    let stringHintText = "let w = \"text\"\n"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": stringHintUri,
+            "languageId": "nim",
+            "version": 1,
+            "text": stringHintText,
+          }
+        },
+      },
+    )
+    check readDiagnostics(process.outputStream, stringHintUri) != nil
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 90,
+        "method": "textDocument/inlayHint",
+        "params": {
+          "textDocument": {"uri": stringHintUri},
+          "range":
+            {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}},
+        },
+      },
+    )
+    let stringInlays = readResponse(process.outputStream, 90)
+    check stringInlays != nil
+    check stringInlays["result"].kind == JArray
+    check stringInlays["result"].len == 1
+    check stringInlays["result"][0]["label"].getStr == ": string"
+    check stringInlays["result"][0]["position"]["line"].getInt == 0
+    check stringInlays["result"][0]["position"]["character"].getInt == 5
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didClose",
+        "params": {"textDocument": {"uri": stringHintUri}},
+      },
+    )
+
     sendMessage(
       process.inputStream,
       %*{
@@ -1382,8 +1476,46 @@ suite "stdio LSP":
     )
     let stdlibHover = readResponse(process.outputStream, 14)
     check stdlibHover != nil
-    check stdlibHover["result"]["contents"]["value"].getStr.contains("std/os")
-    check stdlibHover["result"]["contents"]["value"].getStr.contains("Walks over")
+    let stdlibHoverValue = stdlibHover["result"]["contents"]["value"].getStr
+    check stdlibHoverValue.contains("*Module:* `std/os`")
+    check stdlibHoverValue.contains("Walks over")
+    check not stdlibHoverValue.contains("# std/os\n```")
+
+    let documentedHoverUri = "file:///tmp/onim-documented-hover.nim"
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+          "textDocument": {
+            "uri": documentedHoverUri,
+            "languageId": "nim",
+            "version": 1,
+            "text":
+              "proc main() =\n" & "  # Main function with a simple comment\n" &
+              "  ## Main function with a docstring\n" & "  discard\n",
+          }
+        },
+      },
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 141,
+        "method": "textDocument/hover",
+        "params": {
+          "textDocument": {"uri": documentedHoverUri},
+          "position": {"line": 0, "character": 6},
+        },
+      },
+    )
+    let documentedHover = readResponse(process.outputStream, 141)
+    check documentedHover != nil
+    let documentedHoverValue = documentedHover["result"]["contents"]["value"].getStr
+    check documentedHoverValue.contains("Main function with a simple comment")
+    check documentedHoverValue.contains("Main function with a docstring")
 
     sendMessage(
       process.inputStream,
@@ -2719,5 +2851,92 @@ proc show(person: Person) =
       process.inputStream, %*{"jsonrpc": "2.0", "id": 4, "method": "shutdown"}
     )
     check readResponse(process.outputStream, 4)["result"].kind == JNull
+    sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
+    check process.waitForExit(3000) == 0
+
+  test "applies sequential incremental edits with UTF-16 ranges":
+    let root = currentSourcePath().parentDir.parentDir
+    let filePath =
+      getTempDir() / ("onim-incremental-" & $getCurrentProcessId() & ".nim")
+    let uri = "file://" & filePath.replace('\\', '/')
+    let initial =
+      "proc main() =\n" & "  let smile = \"😀\"\n" & "  let value = 1\n" &
+      "  discard value\n"
+    writeFile(filePath, initial)
+    defer:
+      if fileExists(filePath):
+        removeFile(filePath)
+    let process = startProcess(root / "onim", args = ["--stdio"], workingDir = root)
+    defer:
+      close process
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"rootUri": "file://" & root.replace('\\', '/')},
+      },
+    )
+    check readResponse(process.outputStream, 1) != nil
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "method": "initialized", "params": {}}
+    )
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {"textDocument": {"uri": uri, "version": 1, "text": initial}},
+      },
+    )
+    discard readDiagnostics(process.outputStream, uri)
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+          "textDocument": {"uri": uri, "version": 2},
+          "contentChanges": [
+            {
+              "range": {
+                "start": {"line": 1, "character": 15},
+                "end": {"line": 1, "character": 17},
+              },
+              "text": "🙂",
+            },
+            {
+              "range": {
+                "start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 0}
+              },
+              "text": "  let extra = 2\n",
+            },
+          ],
+        },
+      },
+    )
+    discard readDiagnostics(process.outputStream, uri)
+
+    sendMessage(
+      process.inputStream,
+      %*{
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/hover",
+        "params":
+          {"textDocument": {"uri": uri}, "position": {"line": 4, "character": 10}},
+      },
+    )
+    let hover = readResponse(process.outputStream, 2)
+    check hover != nil
+    check hover["result"]["contents"]["value"].getStr.contains("let value: int")
+
+    sendMessage(
+      process.inputStream, %*{"jsonrpc": "2.0", "id": 3, "method": "shutdown"}
+    )
+    check readResponse(process.outputStream, 3)["result"].kind == JNull
     sendMessage(process.inputStream, %*{"jsonrpc": "2.0", "method": "exit"})
     check process.waitForExit(3000) == 0

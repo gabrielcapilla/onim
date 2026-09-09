@@ -5,7 +5,8 @@ import onim/features/references
 import onim/index/source_index
 import onim/session/ids
 import onim/session/workspace
-import onim/syntax/lexer
+import onim/session/workspace_models
+import onim/syntax/tokens
 
 proc cleanTree(root: string) =
   if not dirExists(root):

@@ -3,6 +3,8 @@ import std/[unittest]
 import onim/index/source_index
 import onim/index/symbols
 import onim/index/surfaces
+import onim/index/surface_project_input
+import onim/index/surface_resolution
 import onim/semantic/native_diagnostics
 import onim/stdlib/map
 

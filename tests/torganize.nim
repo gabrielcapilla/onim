@@ -1,10 +1,13 @@
 import std/[os, strutils, unittest]
 
 import onim/features/organize
+import onim/features/organize_edits
 import onim/index/cache
 import onim/index/occurrences
 import onim/index/source_index
 import onim/index/surfaces
+import onim/index/surface_project_input
+import onim/index/surface_resolution
 import onim/semantic/compiler_api
 import onim/session/ids
 import onim/session/module_catalog
@@ -101,6 +104,18 @@ suite "organize imports":
     let index = indexSource(source)
     let attempt =
       tryOrganizeSourceWithIndex("/no/such/file.nim", source, index, loadStdlibMap(""))
+    check attempt.handled
+    check attempt.edits.len == 1
+    check applyEdits(source, attempt.edits) == "import std/[os, strformat]\n\n" & source
+
+  test "recognizes macro string literal prefixes":
+    let source =
+      "let w: string = \"World\"\n" & "let n: uint8 = 99\n" & "proc main() =\n" &
+      "  stdout.writeLine fmt\"Hello, {w} {n}\"\n" & "proc listFiles(d: string) =\n" &
+      "  for k, p in walkDir(d):\n" & "    echo p\n"
+    let attempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim", source, indexSource(source), loadStdlibMap("")
+    )
     check attempt.handled
     check attempt.edits.len == 1
     check applyEdits(source, attempt.edits) == "import std/[os, strformat]\n\n" & source
@@ -207,6 +222,21 @@ suite "organize imports":
     )
     check inactiveAttempt.handled
     check inactiveAttempt.edits.len == 0
+
+  test "adds imports used in a main-module conditional":
+    let source = "when isMainModule:\n  for k, v in walkDir(\"/tmp\"):\n    discard v\n"
+    let actual = applyEdits(source, organizeSource("/no/such/file.nim", source))
+    check actual == "import std/os\n\n" & source
+
+  test "does not split an indented conditional import":
+    let source =
+      "when isMainModule:\n  import std/strformat\n  for k, v in walkDir(\"/tmp\"):\n    discard v\n"
+    let attempt = tryOrganizeSourceWithIndex(
+      "/no/such/file.nim", source, indexSource(source), loadStdlibMap("")
+    )
+    check not attempt.handled
+    check attempt.edits.len == 0
+    check applyEdits(source, organizeSource("/no/such/file.nim", source)) == source
 
   test "does not treat a local alias shadow as module use":
     let source = "import std/os as fs\n\nproc main(fs: int) =\n  discard fs\n"

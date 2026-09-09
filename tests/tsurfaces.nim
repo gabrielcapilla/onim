@@ -2,6 +2,8 @@ import std/[os, sequtils, tables, unittest]
 
 import onim/index/source_index
 import onim/index/surfaces
+import onim/index/surface_project_input
+import onim/index/surface_resolution
 import onim/index/symbols
 import onim/stdlib/map
 import onim/session/ids as onimIds

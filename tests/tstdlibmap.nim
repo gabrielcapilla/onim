@@ -1,6 +1,7 @@
 import std/[os, sets, strutils, tables, unittest]
 
 import onim/index/surfaces
+import onim/index/surface_resolution
 import onim/stdlib/map
 
 proc sameCandidate(left, right: SymbolCandidate): bool =
@@ -46,6 +47,13 @@ suite "packed stdlib map":
     check surface.lookupInModule("std/os", "walkDir").candidates.len == 1
     check surface.lookupInModule("std/tables", "Table").candidates.len == 1
     check actual.symbols["walkDir"][0].documentation.contains("Walks over")
+    check actual.symbols.hasKey("fmt")
+    var formattedDocumentation = false
+    for candidate in actual.symbols["fmt"]:
+      if candidate.documentation.contains("dummy untyped"):
+        formattedDocumentation = true
+        check not candidate.documentation.contains("<tt")
+    check formattedDocumentation
 
   test "rejects malformed binary envelopes":
     let source =

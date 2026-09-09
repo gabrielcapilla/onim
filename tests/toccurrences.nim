@@ -3,6 +3,7 @@ import std/unittest
 import onim/index/occurrences
 import onim/index/source_index
 import onim/index/symbols
+import onim/syntax/tokens
 import onim/syntax/lexer
 
 proc names(index: SourceIndex): seq[string] =

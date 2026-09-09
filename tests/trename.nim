@@ -4,7 +4,7 @@ import std/os except FileId
 import onim/features/rename
 import onim/session/ids
 import onim/session/workspace
-import onim/syntax/lexer
+import onim/syntax/tokens
 
 proc cleanTree(root: string) =
   if not dirExists(root):
