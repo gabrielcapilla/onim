@@ -1,7 +1,10 @@
 import ../syntax/imports
-import ../syntax/lexer
+import ../syntax/import_queries
+import ../syntax/tokens
 import ./occurrences
 import ./scopes
+import ./scope_queries
+import ./scope_uncertainty
 import ./source_index
 import ./symbols
 

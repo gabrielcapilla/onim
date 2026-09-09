@@ -1,16 +1,24 @@
 import std/[algorithm, sets, strutils]
 
 import ./definition
+import ./definition_models
+import ./definition_target_validation
+import ./definition_visibility
 import ./references
 import ../index/bindings
 import ../index/occurrences
 import ../index/source_index
 import ../index/symbols
 import ../index/surfaces
+import ../index/surface_resolution
 import ../session/ids
 import ../session/workspace
+import ../session/workspace_models
 import ../stdlib/map
+import ../stdlib/map_runtime
 import ../syntax/imports
+import ../syntax/import_queries
+import ../syntax/tokens
 import ../syntax/lexer
 
 type

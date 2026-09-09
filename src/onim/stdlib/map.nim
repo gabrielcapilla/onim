@@ -1,9 +1,15 @@
-import std/[algorithm, json, os, sets, strutils, tables]
+import std/[json, os, sets, strutils, tables]
 
 import ../index/source_index
 import ../index/surfaces
 import ../index/symbols
 import ../syntax/imports
+import ../syntax/module_names
+import ../syntax/tokens
+import ./doc_normalize
+import ./map_binary_reader
+import ./map_decode
+import ./receiver_helpers
 
 type
   CandidatePriority* = enum
@@ -34,7 +40,7 @@ type
     surface*: SurfaceIndex
     symbolKeys: Table[string, seq[string]]
     implicitModules: HashSet[string]
-    receiverCandidates: Table[string, seq[SymbolCandidate]]
+    receiverCandidates*: Table[string, seq[SymbolCandidate]]
     metadata: StdlibMetadataState
 
 const
@@ -46,11 +52,6 @@ const
   maxStdlibBinaryRecords = 1_000_000
 
 type
-  BinaryReader = object
-    data: string
-    position: int
-    valid: bool
-
   BinarySymbol = object
     name: string
     firstCandidate: uint32
@@ -68,9 +69,6 @@ type
 proc canonicalModule*(module: string): string =
   canonicalSurfaceModule(module)
 
-proc moduleBase*(module: string): string =
-  moduleLeaf(module)
-
 proc sameModule*(left, right: string): bool =
   let a = canonicalModule(left)
   let b = canonicalModule(right)
@@ -81,35 +79,6 @@ proc sameModule*(left, right: string): bool =
   if b.startsWith("std/") and a == b[4 .. ^1]:
     return true
   return false
-
-proc sourceSymbolKind(kind: string, kindKnown: var bool): SourceSymbolKind =
-  kindKnown = true
-  case kind
-  of "skProc", "proc":
-    symbolProc
-  of "skFunc", "func":
-    symbolFunc
-  of "skIterator", "iterator":
-    symbolIterator
-  of "skMethod", "method":
-    symbolMethod
-  of "skMacro", "macro":
-    symbolMacro
-  of "skTemplate", "template":
-    symbolTemplate
-  of "skConverter", "converter":
-    symbolConverter
-  of "skType", "type":
-    symbolType
-  of "skVar", "var":
-    symbolVar
-  of "skLet", "let":
-    symbolLet
-  of "skConst", "const":
-    symbolConst
-  else:
-    kindKnown = false
-    symbolProc
 
 proc surfaceForMap(stdlib: StdlibMap, origin: SurfaceOrigin): SurfaceIndex =
   var inputs: seq[SurfaceInput] = @[]
@@ -154,7 +123,7 @@ proc surfaceForMap(stdlib: StdlibMap, origin: SurfaceOrigin): SurfaceIndex =
       input.uncertainty.incl surfaceUniverseIncomplete
   buildSurfaceIndex(inputs, complete)
 
-proc addUniqueCandidate(
+proc addUniqueCandidate*(
     candidates: var seq[SymbolCandidate], candidate: SymbolCandidate
 ): bool =
   for existing in candidates:
@@ -201,51 +170,6 @@ proc surfaceIsComplete*(stdlib: StdlibMap): bool =
 proc emptyStdlibMap*(): StdlibMap =
   result = newStdlibMap()
 
-proc readByte(reader: var BinaryReader): uint8 =
-  if not reader.valid or reader.position < 0 or reader.position >= reader.data.len:
-    reader.valid = false
-    return
-  result = uint8(ord(reader.data[reader.position]))
-  inc reader.position
-
-proc readUint32(reader: var BinaryReader): uint32 =
-  for shift in 0 .. 3:
-    result = result or (uint32(reader.readByte()) shl (shift * 8))
-
-proc readInt32(reader: var BinaryReader): int32 =
-  cast[int32](reader.readUint32())
-
-proc readUint64(reader: var BinaryReader): uint64 =
-  for shift in 0 .. 7:
-    result = result or (uint64(reader.readByte()) shl (shift * 8))
-
-proc ensureBytes(reader: var BinaryReader, count: int): bool =
-  if not reader.valid or count < 0 or count > reader.data.len - reader.position:
-    reader.valid = false
-    return false
-  true
-
-proc ensureRecords(reader: var BinaryReader, count, width: int): bool =
-  if count < 0 or width < 0 or
-      uint64(count) * uint64(width) > uint64(max(reader.data.len - reader.position, 0)):
-    reader.valid = false
-    return false
-  true
-
-proc readCount(reader: var BinaryReader): int =
-  let count = reader.readUint32()
-  if not reader.valid or count > uint32(maxStdlibBinaryRecords):
-    reader.valid = false
-    return -1
-  int(count)
-
-proc readStringId(reader: var BinaryReader, strings: openArray[string]): string =
-  let id = reader.readUint32()
-  if not reader.valid or id >= uint32(strings.len):
-    reader.valid = false
-    return
-  strings[int(id)]
-
 proc decodeStdlibBinary(data: string): StdlibMap =
   if data.len < stdlibBinaryHeaderSize:
     return emptyStdlibMap()
@@ -275,11 +199,11 @@ proc decodeStdlibBinary(data: string): StdlibMap =
   if not reader.ensureBytes(6 * sizeof(uint32)):
     return emptyStdlibMap()
 
-  let stringCount = reader.readCount()
-  let moduleCount = reader.readCount()
-  let symbolCount = reader.readCount()
-  let candidateCount = reader.readCount()
-  let implicitCount = reader.readCount()
+  let stringCount = reader.readCount(maxStdlibBinaryRecords)
+  let moduleCount = reader.readCount(maxStdlibBinaryRecords)
+  let symbolCount = reader.readCount(maxStdlibBinaryRecords)
+  let candidateCount = reader.readCount(maxStdlibBinaryRecords)
+  let implicitCount = reader.readCount(maxStdlibBinaryRecords)
   let blobLengthValue = reader.readUint32()
   let blobLength =
     if reader.valid and blobLengthValue <= uint32(maxStdlibBinaryBytes):
@@ -366,7 +290,7 @@ proc decodeStdlibBinary(data: string): StdlibMap =
       if version == 1'u32:
         ""
       else:
-        reader.readStringId(strings)
+        normalizeDocumentation(reader.readStringId(strings))
     let priority = reader.readByte()
     if reader.readByte() != 0'u8 or reader.readByte() != 0'u8 or
         reader.readByte() != 0'u8 or not reader.valid or module.len == 0 or name.len == 0 or
@@ -430,18 +354,6 @@ proc loadStdlibBinary*(path: string): StdlibMap =
   except CatchableError:
     return emptyStdlibMap()
 
-proc intField(node: JsonNode, name: string, fallback: int): int =
-  if node != nil and node.kind == JObject and node.hasKey(name) and
-      node[name].kind == JInt:
-    return node[name].getInt
-  fallback
-
-proc stringField(node: JsonNode, name: string): string =
-  if node != nil and node.kind == JObject and node.hasKey(name) and
-      node[name].kind == JString:
-    return node[name].getStr
-  ""
-
 proc loadStdlibMap*(path: string): StdlibMap =
   if path.len == 0:
     return loadBundledStdlibMap()
@@ -504,7 +416,7 @@ proc loadStdlibMap*(path: string): StdlibMap =
           kind: stringField(entry, "kind"),
           arity: intField(entry, "arity", -1),
           signature: stringField(entry, "signature"),
-          documentation: stringField(entry, "description"),
+          documentation: normalizeDocumentation(stringField(entry, "description")),
           priority: CandidatePriority(priority),
         )
         discard addUniqueCandidate(candidates, candidate)
@@ -548,242 +460,15 @@ proc candidatesFor*(
 proc implicitModule*(stdlib: StdlibMap, module: string): bool =
   stdlib != nil and canonicalModule(module) in stdlib.implicitModules
 
-proc firstParameterType(signature: string): string {.inline.} =
-  let open = signature.find('(')
-  if open < 0:
-    return
-  let colon = signature.find(':', open + 1)
-  if colon < 0:
-    return
-  let semicolon = signature.find(';', colon + 1)
-  let close = signature.find(')', colon + 1)
-  var past = semicolon
-  if past < 0 or (close >= 0 and close < past):
-    past = close
-  if past > colon + 1:
-    result = signature[colon + 1 ..< past].strip
-
-proc callableCandidate(candidate: SymbolCandidate): bool {.inline.} =
-  case candidate.kind
-  of "skProc", "skFunc", "skIterator", "skMethod", "skMacro", "skTemplate",
-      "skConverter":
-    true
-  else:
-    false
-
-proc receiverIndexKey(module, nominal: string): string {.inline.} =
-  let canonical = canonicalModule(module)
-  let key = identifierKey(nominal)
-  if canonical.len == 0 or key.len == 0:
-    return
-  canonical & "|" & key
-
 proc rebuildReceiverIndex(stdlib: StdlibMap) =
   stdlib.receiverCandidates.clear()
   for _, candidates in stdlib.symbols:
     for candidate in candidates:
-      if not candidate.callableCandidate:
+      if not callableCandidate(candidate.kind):
         continue
       let key =
-        receiverIndexKey(candidate.module, candidate.signature.firstParameterType)
+        receiverIndexKey(candidate.module, firstParameterType(candidate.signature))
       if key.len == 0:
         continue
       discard
         addUniqueCandidate(stdlib.receiverCandidates.mgetOrPut(key, @[]), candidate)
-
-proc implicitValueCandidate*(stdlib: StdlibMap, name: string): SymbolCandidate =
-  if stdlib == nil or not stdlib.implicitModule("std/system"):
-    return
-  for candidate in stdlib.candidatesFor(name, "", -1):
-    if candidate.kind != "skVar" or not candidate.signature.endsWith("}: File"):
-      continue
-    if result.module.len > 0:
-      return SymbolCandidate()
-    result = candidate
-
-proc implicitFileModule(stdlib: StdlibMap, name: string): string =
-  let candidate = stdlib.implicitValueCandidate(name)
-  if candidate.module.len > 0:
-    result = canonicalModule(candidate.module)
-
-proc implicitFileModule(stdlib: StdlibMap): string =
-  if stdlib == nil or not stdlib.implicitModule("std/system"):
-    return
-  for _, candidates in stdlib.symbols:
-    for candidate in candidates:
-      if candidate.kind != "skVar" or not candidate.signature.endsWith("}: File"):
-        continue
-      let module = canonicalModule(candidate.module)
-      if result.len == 0:
-        result = module
-      elif result != module:
-        return ""
-
-proc fileMembersForModule(
-    stdlib: StdlibMap, module, prefix: string
-): seq[SymbolCandidate] =
-  if module.len == 0:
-    return
-  let prefixKey = identifierKey(prefix)
-  let receiverKey = receiverIndexKey(module, "File")
-  if not stdlib.receiverCandidates.hasKey(receiverKey):
-    return
-  for candidate in stdlib.receiverCandidates[receiverKey]:
-    let key = identifierKey(candidate.name)
-    if key.len == 0 or (prefixKey.len > 0 and not key.startsWith(prefixKey)):
-      continue
-    discard addUniqueCandidate(result, candidate)
-
-proc implicitFileMembers*(
-    stdlib: StdlibMap, name, prefix: string
-): seq[SymbolCandidate] =
-  stdlib.fileMembersForModule(stdlib.implicitFileModule(name), prefix)
-
-proc implicitFileMembers*(stdlib: StdlibMap, prefix: string): seq[SymbolCandidate] =
-  stdlib.fileMembersForModule(stdlib.implicitFileModule(), prefix)
-
-proc plainNominalName(value: string): bool {.inline.} =
-  if value.len == 0 or not (value[0].isAlphaAscii or value[0] == '_'):
-    return false
-  for character in value[1 .. ^1]:
-    if not (character.isAlphaAscii or character.isDigit or character == '_'):
-      return false
-  true
-
-proc directNominalReturn*(stdlib: StdlibMap, module, name: string): string =
-  if stdlib == nil:
-    return
-  let canonical = canonicalModule(module)
-  if not canonical.startsWith("std/"):
-    return
-  let candidates = stdlib.candidatesFor(name, moduleBase(canonical), -1)
-  if candidates.len != 1 or not candidates[0].callableCandidate or
-      canonicalModule(candidates[0].module) != canonical:
-    return
-  let signature = candidates[0].signature
-  let close = signature.rfind(')')
-  if close < 0:
-    return
-  let colon = signature.find(':', close + 1)
-  if colon < 0:
-    return
-  var first = colon + 1
-  while first < signature.len and signature[first] in {' ', '\t', '\r', '\n'}:
-    inc first
-  var past = first
-  while past < signature.len and signature[past] notin {' ', '\t', '\r', '\n', '{'}:
-    inc past
-  let candidate = signature[first ..< past]
-  if candidate.plainNominalName:
-    result = candidate
-
-proc directNominalMembers*(
-    stdlib: StdlibMap, module, nominal, prefix: string
-): seq[SymbolCandidate] =
-  if stdlib == nil:
-    return
-  let canonical = canonicalModule(module)
-  if not canonical.startsWith("std/") or nominal.len == 0:
-    return
-  let prefixKey = identifierKey(prefix)
-  let receiverKey = receiverIndexKey(canonical, nominal)
-  if not stdlib.receiverCandidates.hasKey(receiverKey):
-    return
-  for candidate in stdlib.receiverCandidates[receiverKey]:
-    let key = identifierKey(candidate.name)
-    if key.len == 0 or (prefixKey.len > 0 and not key.startsWith(prefixKey)):
-      continue
-    discard addUniqueCandidate(result, candidate)
-
-proc resolveUniqueCandidate*(
-  stdlib: StdlibMap, name, qualifier: string, arity = -1
-): tuple[state: CandidateResolutionState, candidate: SymbolCandidate]
-
-proc resolveCandidate*(
-    stdlib: StdlibMap, name, qualifier: string, arity = -1
-): SymbolCandidate =
-  let candidates = stdlib.candidatesFor(name, qualifier, arity)
-  if candidates.len == 0:
-    return
-  let unique = stdlib.resolveUniqueCandidate(name, qualifier, arity)
-  if unique.state == candidateResolutionResolved:
-    return unique.candidate
-  var ordered = candidates
-  ordered.sort(
-    proc(left, right: SymbolCandidate): int =
-      cmp(left.module, right.module)
-  )
-  ordered[0]
-
-proc resolveUniqueCandidate*(
-    stdlib: StdlibMap, name, qualifier: string, arity = -1
-): tuple[state: CandidateResolutionState, candidate: SymbolCandidate] =
-  ## Resolve only when the map gives one safe module identity. The legacy
-  ## `resolveCandidate` API remains available for callers that explicitly
-  ## accept its deterministic fallback; semantic features use this stricter
-  ## result so a collision cannot become an unsafe edit or diagnostic.
-  let candidates = stdlib.candidatesFor(name, qualifier, arity)
-  if candidates.len == 0:
-    return
-
-  if qualifier.len == 0:
-    var canonicalModuleName = ""
-    var canonicalFound = false
-    var canonicalCandidate: SymbolCandidate
-    for candidate in stdlib.candidatesFor(name, "", -1):
-      if candidate.priority != candidateCanonical:
-        continue
-      let module = canonicalModule(candidate.module)
-      if not canonicalFound:
-        canonicalModuleName = module
-        canonicalCandidate = candidate
-        canonicalFound = true
-      elif module != canonicalModuleName:
-        return (candidateResolutionAmbiguous, SymbolCandidate())
-    if canonicalFound:
-      return (candidateResolutionResolved, canonicalCandidate)
-
-  if candidates.len == 1:
-    return (candidateResolutionResolved, candidates[0])
-
-  let firstModule = canonicalModule(candidates[0].module)
-  var sameModule = true
-  for candidate in candidates[1 .. ^1]:
-    if canonicalModule(candidate.module) != firstModule:
-      sameModule = false
-      break
-  if sameModule:
-    return (candidateResolutionResolved, candidates[0])
-
-  result.state = candidateResolutionAmbiguous
-
-proc findStdlibMap*(): string =
-  let configured = getEnv("ONIM_STDLIB_MAP")
-  if configured.len > 0 and fileExists(configured):
-    return configured
-  let candidates = [
-    getAppDir() / "stdlib_map.json",
-    getCurrentDir() / "stdlib_map.json",
-    getAppDir() / ".." / "share" / "onim" / "stdlib_map.json",
-  ]
-  for candidate in candidates:
-    if fileExists(candidate):
-      return candidate
-  ""
-
-var cachedMap: StdlibMap
-var cachedMapPath = ""
-var hasCachedMap = false
-
-proc stdlibMap*(): StdlibMap =
-  let configured = getEnv("ONIM_STDLIB_MAP")
-  let cacheKey = if configured.len > 0: configured else: "<bundled>"
-  if not hasCachedMap or cacheKey != cachedMapPath:
-    cachedMap =
-      if configured.len > 0:
-        loadStdlibMap(configured)
-      else:
-        loadStdlibMap("")
-    cachedMapPath = cacheKey
-    hasCachedMap = true
-  cachedMap

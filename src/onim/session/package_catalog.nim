@@ -1,5 +1,6 @@
 import std/[algorithm, os, strutils]
 
+import ../syntax/tokens
 import ../syntax/lexer
 import ./paths
 

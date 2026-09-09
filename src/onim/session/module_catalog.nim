@@ -1,6 +1,7 @@
 import std/[algorithm, strutils, tables]
 import std/os except FileId
 
+import ../syntax/tokens
 import ../syntax/lexer
 import ./ids
 import ./package_catalog

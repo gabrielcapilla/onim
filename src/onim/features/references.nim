@@ -1,13 +1,16 @@
 import std/algorithm
 
 import ./definition
+import ./definition_local
+import ./definition_models
 import ../index/bindings
 import ../index/occurrences
 import ../index/source_index
 import ../index/symbols
 import ../session/ids
 import ../session/workspace
-import ../syntax/lexer
+import ../session/workspace_models
+import ../syntax/tokens
 
 type
   SameFileReferences* = object

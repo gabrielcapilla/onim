@@ -2,6 +2,7 @@ import std/[atomics, json, monotimes, osproc, streams, times]
 import std/os except FileId
 
 import ../features/organize
+import ../features/organize_edits
 import ../session/ids
 
 type

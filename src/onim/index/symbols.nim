@@ -1,6 +1,4 @@
-import ../syntax/lexer
-
-export lexer
+import ../syntax/tokens
 
 type
   SourceSymbolKind* = enum

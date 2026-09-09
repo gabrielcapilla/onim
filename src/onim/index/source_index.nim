@@ -1,14 +1,20 @@
 import std/[algorithm, sets, strutils]
 
 import ../syntax/imports
-import ../syntax/lexer
+import ../syntax/include_parser
+import ../syntax/export_parser
+import ../syntax/import_queries
+import ../syntax/module_names
+import ../syntax/tokens
 import ./occurrences
 import ./scopes
+import ./scope_uncertainty
 import ./symbols
+import ./type_literal_tokens
+import ./type_index_models
 import ./types
+import ./type_field_queries
 import ../syntax/parser
-
-export lexer
 
 type
   NativeIndexSafety = enum
@@ -166,6 +172,21 @@ proc initializeNativeIndexSafety*(index: SourceIndex) =
 
 proc nativeIndexSafe*(index: SourceIndex): bool {.inline.} =
   index != nil and index.nativeSafety == nativeSafetyAccepted
+
+proc unsupportedStructure*(index: SourceIndex): bool =
+  for symbol in index.symbols:
+    if symbol.kind in {symbolMacro, symbolTemplate}:
+      return true
+  for token in index.parsed.tokens:
+    if token.kind != tkIdentifier or token.isStropped or
+        index.parsed.tokenInsideImport(token):
+      continue
+    if token.hasKeywordRole(roleConditional) or token.hasKeywordRole(roleInclude) or
+        token.hasKeywordRole(roleGenerated):
+      return true
+    if token.hasKeywordRole(roleBlock) and not token.isKeyword(kwBlock):
+      return true
+  false
 
 proc classifyIncrementalEdit(
     oldIndex: SourceIndex, oldSource, newSource: string

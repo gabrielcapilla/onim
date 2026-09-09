@@ -4,10 +4,16 @@ import ../index/source_index
 import ../index/symbols
 import ../session/ids
 import ../session/workspace
+import ../session/workspace_models
 import ../stdlib/map
 import ../syntax/imports
+import ../syntax/module_names
+import ../syntax/tokens
 import ../syntax/lexer
 import ./definition
+import ./definition_local
+import ./definition_models
+import ./definition_routine_filter
 
 type
   SignatureState* = enum

@@ -1,7 +1,7 @@
 import std/[algorithm, tables]
 
 import ../syntax/imports
-import ../syntax/lexer
+import ../syntax/tokens
 import ./symbols
 
 type

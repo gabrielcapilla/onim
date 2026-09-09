@@ -1,12 +1,9 @@
 import std/[algorithm, strutils, tables]
 
-import ../syntax/lexer
 import ../session/ids
 import ../session/module_catalog
-import ./occurrences
-import ./scopes
-import ./source_index
 import ./symbols
+import ./surface_names
 
 type
   SurfaceId* = distinct uint32
@@ -123,12 +120,6 @@ proc `==`*(left, right: BindingId): bool {.borrow.}
 proc canonicalSurfaceModule*(module: string): string =
   canonicalModuleName(module)
 
-proc surfaceKey(name: string): string {.inline.} =
-  identifierKey(name)
-
-proc validSurfaceName(name: string): bool {.inline.} =
-  surfaceKey(name).len > 0
-
 proc sameExport(left, right: SurfaceExportInput): bool {.inline.} =
   surfaceKey(left.name) == surfaceKey(right.name) and left.kind == right.kind and
     left.declaredArity == right.declaredArity and left.signature == right.signature
@@ -181,9 +172,6 @@ proc findOrAdd(
 
 proc validExportInput(exported: SurfaceExportInput): bool =
   exported.kindKnown and validSurfaceName(exported.name)
-
-proc moduleUncertain(surface: ModuleSurface): bool {.inline.} =
-  surface.uncertainty != {}
 
 proc sameContributorSequence(left, right: openArray[SurfaceContributorIdentity]): bool =
   if left.len != right.len:
@@ -405,27 +393,12 @@ proc moduleAt*(index: SurfaceIndex, id: SurfaceId): ModuleSurface =
   if ordinal >= 0 and ordinal < index.modules.len:
     return index.modules[ordinal]
 
-proc appendBindingsInModule*(
-    index: SurfaceIndex, module, prefix: string, destination: var seq[BindingCandidate]
-): bool =
-  if index == nil or not index.valid or not index.universeComplete:
-    return false
+proc surfaceIdForModule*(index: SurfaceIndex, module: string): SurfaceId =
+  if index == nil or not index.valid:
+    return
   let canonical = canonicalSurfaceModule(module)
-  if canonical.len == 0 or not index.byModule.hasKey(canonical):
-    return false
-  let surface = index.moduleAt(index.byModule[canonical])
-  if surface.moduleUncertain:
-    return false
-  let wanted = surfaceKey(prefix)
-  let first = int(surface.firstBinding)
-  let past = int(surface.pastBinding)
-  if first < 0 or first > past or past > index.bindings.len:
-    return false
-  for ordinal in first ..< past:
-    let binding = index.bindings[ordinal]
-    if wanted.len == 0 or binding.key.startsWith(wanted):
-      destination.add binding
-  true
+  if canonical.len > 0 and index.byModule.hasKey(canonical):
+    return index.byModule[canonical]
 
 proc bindingAt*(index: SurfaceIndex, id: BindingId): BindingCandidate =
   if index == nil:
@@ -434,157 +407,14 @@ proc bindingAt*(index: SurfaceIndex, id: BindingId): BindingCandidate =
   if ordinal >= 0 and ordinal < index.bindings.len:
     return index.bindings[ordinal]
 
-proc exportsFor*(index: SurfaceIndex, binding: BindingCandidate): seq[ExportRecord] =
-  if index == nil or binding.firstExport > binding.pastExport or
-      binding.pastExport > uint32(index.exports.len):
-    return
-  for ordinal in int(binding.firstExport) ..< int(binding.pastExport):
-    result.add index.exports[ordinal]
+proc bindingIdsForName*(index: SurfaceIndex, key: string): seq[BindingId] =
+  if index != nil and index.valid and index.byName.hasKey(key):
+    return index.byName[key]
 
-proc appendCandidates(
-    index: SurfaceIndex, ids: openArray[BindingId], result: var BindingResolution
-) =
-  for id in ids:
-    result.candidates.add index.bindingAt(id)
-
-proc resolution(index: SurfaceIndex, ids: seq[BindingId]): BindingResolution =
-  if index == nil or not index.valid:
-    result.kind = surfaceUnknown
-    return
-  if ids.len == 0:
-    result.kind = if index.universeComplete: surfaceUnresolved else: surfaceUnknown
-    return
-  if ids.len > 1:
-    result.kind = surfaceAmbiguous
-    index.appendCandidates(ids, result)
-    return
-  let candidate = index.bindingAt(ids[0])
-  let surface = index.moduleAt(candidate.surface)
-  index.appendCandidates(ids, result)
-  if not index.universeComplete or surface.moduleUncertain:
-    result.kind = surfaceUnknown
-  else:
-    result.kind = surfaceResolved
-
-proc lookup*(index: SurfaceIndex, name: string): BindingResolution =
-  let key = surfaceKey(name)
-  if key.len == 0 or index == nil or not index.byName.hasKey(key):
-    return index.resolution(@[])
-  index.resolution(index.byName[key])
-
-proc lookupInModule*(index: SurfaceIndex, module, name: string): BindingResolution =
-  if index == nil:
-    result.kind = surfaceUnknown
-    return
-  let canonical = canonicalSurfaceModule(module)
-  if canonical.len == 0 or not index.byModule.hasKey(canonical):
-    return index.resolution(@[])
-  let surface = index.byModule[canonical]
-  let moduleInfo = index.moduleAt(surface)
-  let wanted = surfaceKey(name)
-  var ids: seq[BindingId] = @[]
-  for ordinal in int(moduleInfo.firstBinding) ..< int(moduleInfo.pastBinding):
-    let binding = index.bindings[ordinal]
-    if binding.key == wanted:
-      ids.add BindingId(uint32(ordinal + 1))
-  index.resolution(ids)
-
-proc resolveSurfaceReference*(
-    index: SurfaceIndex, catalog: ModuleCatalog, name, qualifier, owner: string
-): BindingResolution =
-  if index == nil:
-    result.kind = surfaceUnknown
-    return
-  if qualifier.len == 0:
-    return index.lookup(name)
-
-  if catalog != nil:
-    let module = catalog.resolveModuleName(owner, qualifier)
-    case module.kind
-    of moduleResolved:
-      return index.lookupInModule(module.module, name)
-    of moduleAmbiguous, moduleUnknown:
-      result.kind = surfaceUnknown
-    of moduleMissing:
-      result.kind = surfaceUnresolved
-    return
-
-  let module = index.moduleForReference(qualifier, owner)
-  if module.len == 0:
-    result.kind = if index.universeIsComplete: surfaceUnresolved else: surfaceUnknown
-    return
-  index.lookupInModule(module, name)
-
-proc moduleForResolution*(index: SurfaceIndex, resolution: BindingResolution): string =
-  if index == nil or resolution.kind != surfaceResolved or resolution.candidates.len != 1:
-    return
-  index.moduleAt(resolution.candidates[0].surface).module
-
-proc addSourceUncertainty(
-    target: var set[SurfaceUncertainty], reason: ScopeUncertainty
-) =
-  case reason
-  of scopeNestedBlock:
-    discard
-  of scopeConditional:
-    target.incl surfaceConditional
-  of scopeInclude:
-    target.incl surfaceInclude
-  of scopeGenerated:
-    target.incl surfaceGenerated
-  of scopeMalformed:
-    target.incl surfaceMalformed
-  else:
-    target.incl surfaceUnsupported
-
-proc addOccurrenceUncertainty(
-    target: var set[SurfaceUncertainty], reason: OccurrenceUncertainty
-) =
-  case reason
-  of uncertaintyNestedScope, uncertaintyDeclarationOrder:
-    discard
-  of uncertaintyConditional:
-    target.incl surfaceConditional
-  of uncertaintyInclude:
-    target.incl surfaceInclude
-  of uncertaintyGenerated:
-    target.incl surfaceGenerated
-  of uncertaintyMalformed:
-    target.incl surfaceMalformed
-  else:
-    target.incl surfaceUnsupported
-
-proc projectSurfaceInput*(
-    module: string, index: SourceIndex, origin = surfaceProject
-): SurfaceInput =
-  result.module = module
-  result.origin = origin
-  if index == nil:
-    result.uncertainty = {surfaceUnsupported, surfaceUniverseIncomplete}
-    return
-  for reason in index.scopes.uncertainty:
-    result.uncertainty.addSourceUncertainty(reason)
-  for reason in index.occurrences.uncertainty:
-    result.uncertainty.addOccurrenceUncertainty(reason)
-  if index.includes.len > 0:
-    result.uncertainty.incl surfaceInclude
-  if index.hasUnresolvedExports:
-    result.uncertainty.incl surfaceReexport
-  for symbol in index.symbols:
-    if not symbol.exported or symbol.nameToken >= uint32(index.parsed.tokens.len):
-      continue
-    let token = index.parsed.tokens[int(symbol.nameToken)]
-    if token.kind != tkIdentifier or index.parsed.tokens.tokenTextLen(token) == 0:
-      result.uncertainty.incl surfaceMalformed
-      continue
-    result.exports.add SurfaceExportInput(
-      name: index.parsed.tokens.tokenText(token),
-      kind: symbol.kind,
-      kindKnown: true,
-      declaredArity: -1,
-      shapeKnown: false,
-      nameToken: symbol.nameToken,
-    )
+proc exportAt*(index: SurfaceIndex, ordinal: uint32): ExportRecord =
+  let position = int(ordinal)
+  if index != nil and position >= 0 and position < index.exports.len:
+    return index.exports[position]
 
 proc validateSurfaceIndex*(index: SurfaceIndex): bool =
   if index == nil or not index.valid:

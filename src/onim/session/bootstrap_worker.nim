@@ -414,6 +414,10 @@ proc bootstrapLoop() {.thread.} =
     if request.root.len == 0 and request.jobGeneration == high(uint64):
       break
     let value = buildBootstrap(request)
+    if getEnv("ONIM_TRACE_WORKERS").len > 0:
+      stderr.writeLine(
+        "onim bootstrap worker: result=" & $value.kind & " files=" & $value.files.len
+      )
     bootstrapResults.send(encodeBootstrapResult(value))
     if bootstrapStopRequested.load(moRelaxed):
       break

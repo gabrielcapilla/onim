@@ -2,11 +2,19 @@ import std/algorithm
 
 import ../index/source_index
 import ../index/symbols
+import ../index/type_kinds
+import ../index/type_local_models
+import ../index/type_local_resolution
+import ../index/type_queries
+import ../index/type_states
 import ../index/types
 import ../session/ids
 import ../session/workspace
-import ../syntax/lexer
+import ../session/workspace_models
+import ../syntax/tokens
 import ./definition
+import ./definition_models
+import ./definition_symbol_target
 
 proc receiverType(source: WorkspaceSnapshot, symbolOrdinal: int): LocalTypeInfo =
   if not source.valid or source.index == nil or symbolOrdinal < 0:

@@ -5,10 +5,13 @@ import ../index/occurrences
 import ../index/source_index
 import ../index/symbols
 import ../index/surfaces
+import ../index/surface_resolution
 import ../stdlib/map
+import ../stdlib/map_resolution
 import ../session/module_catalog
 import ../syntax/imports
-import ../syntax/lexer
+import ../syntax/import_queries
+import ../syntax/tokens
 
 type
   NativeDiagnosticKind* = enum

@@ -1,12 +1,17 @@
 import ./definition
+import ./definition_models
+import ./definition_routine_filter
+import ./definition_symbol_target
 import ./references
 import ../index/occurrences
 import ../index/scopes
+import ../index/scope_queries
 import ../index/source_index
 import ../index/symbols
 import ../session/ids
 import ../session/workspace
-import ../syntax/lexer
+import ../session/workspace_models
+import ../syntax/tokens
 
 type
   CallHierarchyRelation* = object

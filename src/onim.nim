@@ -4,6 +4,7 @@ when NimMajor < 2 or (NimMajor == 2 and NimMinor < 2):
 import std/[os, osproc, strutils]
 
 import onim/features/organize
+import onim/features/organize_file
 import onim/protocol/lsp
 import onim/semantic/worker
 

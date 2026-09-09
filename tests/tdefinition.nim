@@ -740,8 +740,18 @@ proc show(point: Point) =
     discard workspace.changeDocument(
       "file://" & consumerPath,
       consumerPath,
+      "from provider import answer as execute\nexecute()\n",
+      4,
+    )
+    resolution = resolveLast(workspace, consumerId, "execute")
+    check resolution.kind == definitionResolved
+    check resolution.target.fileId.value == providerId.value
+
+    discard workspace.changeDocument(
+      "file://" & consumerPath,
+      consumerPath,
       "from provider import answer\nanswer()\n",
-      3,
+      5,
     )
     resolution = resolveLast(workspace, consumerId, "answer")
     check resolution.kind == definitionResolved
@@ -771,6 +781,7 @@ proc show(point: Point) =
 
     let workspace = initWorkspace(root)
     workspace.indexWorkspace()
+    let providerId = workspace.fileIdForPath(providerPath)
     let consumerId = workspace.fileIdForPath(consumerPath)
 
     check resolveLast(workspace, consumerId, "privateAnswer").kind == definitionUnknown
@@ -810,7 +821,69 @@ proc show(point: Point) =
       "from provider import answer as local\nlocal()\n",
       6,
     )
-    check resolveLast(workspace, consumerId, "local").kind == definitionUnknown
+    let localResolution = resolveLast(workspace, consumerId, "local")
+    check localResolution.kind == definitionResolved
+    check localResolution.target.fileId.value == providerId.value
+
+  test "selects fixed-arity definitions for direct calls":
+    let text = """proc overload(value: int) = discard
+proc overload(value: string; radix: int) = discard
+
+proc show() =
+  overload(1)
+  overload("text", 10)
+"""
+    let workspace = initWorkspace()
+    let fileId = workspace.openDocument(
+      "file:///tmp/onim-local-overloads.nim", "/tmp/onim-local-overloads.nim", text, 1
+    )
+    let snapshot = workspace.snapshotForFile(fileId)
+    let integerCall = resolveDefinition(workspace, snapshot, text.find("overload(1"))
+    check integerCall.kind == definitionResolved
+    if integerCall.kind == definitionResolved:
+      check snapshot.index.parsed.tokens[int(integerCall.target.nameToken)].line == 0
+    let stringCall =
+      resolveDefinition(workspace, snapshot, text.find("overload(\"text\", 10"))
+    check stringCall.kind == definitionResolved
+    if stringCall.kind == definitionResolved:
+      check snapshot.index.parsed.tokens[int(stringCall.target.nameToken)].line == 1
+
+  test "selects fixed-arity definitions for qualified project calls":
+    let root = getTempDir() / ("onim-qualified-overloads-" & $getCurrentProcessId())
+    cleanTree(root)
+    createDir(root)
+    let providerPath = root / "provider.nim"
+    let consumerPath = root / "consumer.nim"
+    writeFile(
+      providerPath,
+      """proc overload*(value: int) = discard
+proc overload*(value: int; label: string) = discard
+""",
+    )
+    writeFile(consumerPath, "import provider\nprovider.overload(1)\n")
+    defer:
+      cleanTree(root)
+
+    let workspace = initWorkspace(root)
+    workspace.indexWorkspace()
+    let consumerId = workspace.fileIdForPath(consumerPath)
+    var resolution = resolveLast(workspace, consumerId, "overload")
+    check resolution.kind == definitionResolved
+    if resolution.kind == definitionResolved:
+      let provider = workspace.snapshotForFile(workspace.fileIdForPath(providerPath))
+      check provider.index.parsed.tokens[int(resolution.target.nameToken)].line == 0
+
+    discard workspace.changeDocument(
+      "file://" & consumerPath,
+      consumerPath,
+      "import provider\nprovider.overload(1, \"text\")\n",
+      2,
+    )
+    resolution = resolveLast(workspace, consumerId, "overload")
+    check resolution.kind == definitionResolved
+    if resolution.kind == definitionResolved:
+      let provider = workspace.snapshotForFile(workspace.fileIdForPath(providerPath))
+      check provider.index.parsed.tokens[int(resolution.target.nameToken)].line == 1
 
   test "labels resolved, unresolved, and ambiguous local call types":
     let text = """proc answer(): int = 1

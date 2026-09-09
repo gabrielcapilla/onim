@@ -1,4 +1,8 @@
 import ./imports
+import ./include_parser
+import ./export_parser
+import ./statement_ranges
+import ./tokens
 import ./lexer
 
 type

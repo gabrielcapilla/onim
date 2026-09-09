@@ -1,7 +1,7 @@
 import ../index/source_index
 import ../index/occurrences
 import ../index/symbols
-import ../syntax/lexer
+import ../syntax/tokens
 
 type
   SemanticTokenKind* = enum

@@ -1,16 +1,28 @@
 import std/[sets, strutils]
 
 import ../index/occurrences
+import ../index/bindings
 import ../index/documentation
 import ../index/scopes
+import ../index/scope_queries
 import ../index/source_index
 import ../index/symbols
+import ../index/type_kinds
+import ../index/type_local_models
+import ../index/type_queries
+import ../index/type_states
 import ../index/types
 import ../session/workspace
+import ../session/workspace_models
 import ../stdlib/map
 import ../syntax/imports
-import ../syntax/lexer
+import ../syntax/import_queries
+import ../syntax/module_names
+import ../syntax/tokens
 import ./definition
+import ./definition_models
+import ./definition_stdlib_type
+import ../stdlib/map_receivers
 
 type
   HoverState* = enum
@@ -200,6 +212,42 @@ proc stdlibHover(
       result.signature = candidate.signature
       result.documentation = candidate.documentation
 
+proc stdlibNominalHover(
+    workspace: Workspace, source: WorkspaceSnapshot, stdlib: StdlibMap, tokenIndex: int
+): HoverInfo =
+  if workspace == nil or stdlib == nil or tokenIndex < 0 or
+      tokenIndex >= source.index.parsed.tokens.len:
+    return
+  let qualifierToken = source.index.qualifierIndex(uint32(tokenIndex))
+  if qualifierToken < 0:
+    return
+  let binding = source.index.resolveBinding(uint32(qualifierToken))
+  if binding.state != bindingResolved:
+    return
+  let localType = workspace.resolveLocalType(source, binding.declarationToken)
+  let module = workspace.stdlibNominalTypeModule(source, stdlib, localType)
+  if module.len == 0 or localType.info.typeToken == InvalidTypeToken:
+    return
+  let typeName = source.index.parsed.tokens.tokenText(
+    source.index.parsed.tokens[int(localType.info.typeToken)]
+  )
+  let memberName =
+    source.index.parsed.tokens.tokenText(source.index.parsed.tokens[tokenIndex])
+  var matches = 0
+  var candidate: SymbolCandidate
+  for value in stdlib.directNominalMembers(module, typeName, memberName):
+    if sameIdentifier(value.name, memberName):
+      inc matches
+      candidate = value
+  if matches != 1:
+    return
+  result.state = hoverAvailable
+  result.name = candidate.name
+  result.module = candidate.module
+  result.kind = candidate.kind
+  result.signature = candidate.signature
+  result.documentation = candidate.documentation
+
 proc resolveHover*(
     workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int, stdlib: StdlibMap
 ): HoverInfo =
@@ -212,6 +260,10 @@ proc resolveHover*(
   if token.kind != tkIdentifier or source.index.parsed.tokenInsideImport(token):
     return
   let resolution = resolveDefinition(workspace, source, byteOffset)
-  if resolution.kind != definitionUnknown:
+  if resolution.kind == definitionResolved:
     return targetHover(workspace, source, resolution)
-  source.stdlibHover(stdlib, tokenIndex)
+  if resolution.kind notin {definitionUnknown, definitionUnsupported}:
+    return
+  result = source.stdlibHover(stdlib, tokenIndex)
+  if result.state == hoverUnavailable:
+    result = workspace.stdlibNominalHover(source, stdlib, tokenIndex)
