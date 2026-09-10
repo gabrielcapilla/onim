@@ -25,13 +25,24 @@ Onim indexes the project root, `src`, safe `nim.cfg` paths, local Nimble depende
 
 ## Standard-library data
 
-Regenerate the compiler-derived map after changing the active Nim installation:
+Onim resolves the active Nim compiler and library directory for the workspace. On
+the first use of a toolchain it generates an immutable binary map in the Onim
+cache, then reuses that map for later LSP requests and CLI runs. The cache key
+includes the compiler path, full Nim version, library path, host OS, and host
+CPU, so separate Nim installations do not share an incompatible map.
+
+Prewarm the cache explicitly when desired:
 
 ```sh
 nimble generateStdlibMap
 ```
 
-The generator walks the Nim `lib/` tree and uses Nim's JSON documentation output. `src/stdlib_map.json` is the readable generated source; `src/stdlib_map.bin` is the bundled binary form used for startup lookup and Nimble installation. Review generated changes together and run `nimble test` after regeneration.
+The generator walks the resolved Nim `lib/` tree and uses Nim's JSON
+documentation output. The generated files live under the configured Onim cache
+root (`$ONIM_CACHE_DIR`, `$XDG_CACHE_HOME/onim`, or `~/.cache/onim`) and are not
+part of the repository or package installation. `ONIM_STDLIB_MAP` remains an
+explicit JSON or binary override for development and tests; it disables
+automatic generation.
 
 ## Benchmarks
 

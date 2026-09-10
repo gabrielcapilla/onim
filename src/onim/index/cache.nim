@@ -73,6 +73,9 @@ proc cacheBaseDirectory(): string =
     return canonicalPath(xdg / "onim")
   canonicalPath(getHomeDir() / ".cache" / "onim")
 
+proc onimCacheRoot*(): string =
+  cacheBaseDirectory()
+
 proc projectKey(projectRoot: string): string =
   $contentFingerprint(canonicalPath(projectRoot))
 

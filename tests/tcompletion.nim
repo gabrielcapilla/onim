@@ -354,6 +354,7 @@ proc main() =
   filesystem.walkD
 """
     writeFile(path, direct)
+    let stdlib = loadStdlibMap("")
     let previous = getEnv("ONIM_CACHE_DIR")
     putEnv("ONIM_CACHE_DIR", cacheRoot)
     defer:
@@ -369,7 +370,6 @@ proc main() =
     let workspace = initWorkspace(root)
     workspace.indexWorkspace()
     check workspace.graphComplete
-    let stdlib = loadStdlibMap("")
     let directId = workspace.fileIdForPath(path)
     let directSnapshot = workspace.snapshotForFile(directId)
     let directOffset = direct.find("filesystem.walkD") + "filesystem.".len + "walkD".len
@@ -495,13 +495,6 @@ proc main() =
     check result.items.anyIt(it.label == "get")
     check result.replaceStart == source.find("ge")
     check result.replaceEnd == offset
-
-    let jsonStdlib = loadStdlibMap(getCurrentDir() / "src" / "stdlib_map.json")
-    check jsonStdlib.directNominalReturn("std/httpclient", "newHttpClient") ==
-      "HttpClient"
-    check jsonStdlib.directNominalMembers("std/httpclient", "HttpClient", "ge").anyIt(
-      it.name == "get"
-    )
 
     let explicit = """import std/httpclient
 proc main() =

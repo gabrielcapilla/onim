@@ -6,7 +6,6 @@ description = "A standalone Nim language server"
 license = "MIT"
 srcDir = "src"
 bin = @["onim"]
-installFiles = @["src/stdlib_map.json", "src/stdlib_map.bin"]
 
 # Dependencies
 
@@ -16,6 +15,7 @@ requires "nim >= 2.2.0"
 
 task test, "run the organize-imports regression suite":
   exec "nim c -o:onim --path:src --hints:off --warnings:off src/onim.nim"
+  exec "./onim --generate-stdlib-map"
   exec "nim c -r --path:src --hints:off --warnings:off tests/torganize.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/tlsp.nim"
   exec "nim c -r --path:src --hints:off --warnings:off tests/tworkspace.nim"
@@ -37,7 +37,8 @@ task test, "run the organize-imports regression suite":
   exec "nim c -r --path:src --hints:off --warnings:off tests/tdiscovery.nim"
 
 task generateStdlibMap, "regenerate the compiler-derived stdlib symbol map":
-  exec "nim c -r --hints:off --warnings:off gen_stdlib_map.nim"
+  exec "nim c -o:onim --path:src --hints:off --warnings:off src/onim.nim"
+  exec "./onim --generate-stdlib-map"
 
 task bench, "measure organize-imports and workspace-index latency":
   exec "nim c --path:src --hints:off --warnings:off bench/bench_organize.nim"

@@ -249,6 +249,7 @@ suite "organize imports":
   test "keeps alias organization identical after source index cache reload":
     let root = getTempDir() / ("onim-alias-cache-project-" & $getCurrentProcessId())
     let cacheRoot = getTempDir() / ("onim-alias-cache-" & $getCurrentProcessId())
+    let stdlib = loadStdlibMap("")
     createDir(root)
     let filePath = root / "alias.nim"
     let source = "import std/os as fs\n\necho fmt(\"hi\")\n"
@@ -276,7 +277,6 @@ suite "organize imports":
       if dirExists(root):
         removeDir(root)
 
-    let stdlib = loadStdlibMap("")
     let directIndex = indexSource(source)
     let direct = tryOrganizeSourceWithIndex(filePath, source, directIndex, stdlib)
     check direct.handled

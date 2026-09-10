@@ -1,5 +1,8 @@
 import std/[json, os, osproc, streams, strutils, times, unittest]
 
+import onim/stdlib/cache_paths
+import onim/stdlib/toolchain
+
 proc sendMessage(input: Stream, message: JsonNode) =
   let body = $message
   input.write("Content-Length: " & $body.len & "\r\n\r\n" & body)
@@ -326,9 +329,19 @@ suite "stdio LSP":
         "  for kind, path in walkDir(\"/tmp\"): discard\n",
     )
     let projectRoot = currentSourcePath().parentDir.parentDir
+    let toolchain = resolveNimToolchain(projectRoot)
+    check toolchain.state == toolchainReady
+    let stdlibPath = stdlibBinaryPath(toolchain)
+    check fileExists(stdlibPath)
+    let previousStdlibPath = getEnv("ONIM_STDLIB_MAP")
     let previousPath = getEnv("PATH")
+    putEnv("ONIM_STDLIB_MAP", stdlibPath)
     putEnv("PATH", emptyPath)
     defer:
+      if previousStdlibPath.len > 0:
+        putEnv("ONIM_STDLIB_MAP", previousStdlibPath)
+      else:
+        delEnv("ONIM_STDLIB_MAP")
       putEnv("PATH", previousPath)
       removeFile(filePath)
       removeDir(emptyPath)

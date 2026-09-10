@@ -6,12 +6,16 @@ import std/[os, osproc, strutils]
 import onim/features/organize
 import onim/features/organize_file
 import onim/protocol/lsp
+import onim/stdlib/map_runtime
+import onim/stdlib/cache_worker
+import onim/stdlib/map
 import onim/semantic/worker
 
 const onimVersion = staticRead("../onim.nimble").split('"')[1]
 
 proc usage(output: File) =
   output.writeLine "usage: onim [--stdio] [--useStdPrefix:on|off] | onim file.nim"
+  output.writeLine "       onim --generate-stdlib-map"
   output.writeLine "       onim --version"
 
 proc version(output: File) =
@@ -42,6 +46,11 @@ when isMainModule:
   if commandLineParams().len > 0 and commandLineParams()[0] == "--semantic-worker":
     runSemanticWorkerProcess()
     quit(0)
+  if commandLineParams().len > 0 and commandLineParams()[0] == "--stdlib-worker":
+    quit(if runStdlibWorkerProcess(): 0 else: 1)
+  if commandLineParams().len > 0 and commandLineParams()[0] == "--generate-stdlib-map":
+    let map = stdlibMap(getCurrentDir())
+    quit(if map.surfaceIsComplete: 0 else: 1)
   var filePath = ""
   var options = defaultOrganizeOptions()
   var runServer = true

@@ -8,6 +8,7 @@ import ../index/source_index
 import ../session/ids
 import ../session/workspace
 import ../session/workspace_models
+import ../stdlib/map
 import ../syntax/tokens
 import ./positions
 import ./uris
@@ -71,7 +72,7 @@ proc appendRenameEdits(
   true
 
 proc renameResponse*(
-    params: JsonNode, workspace: Workspace
+    params: JsonNode, workspace: Workspace, stdlib: StdlibMap = nil
 ): tuple[value: JsonNode, needsBootstrap: bool] =
   result.value = newJNull()
   let textDocument = valueOrEmpty(params, "textDocument")
@@ -89,7 +90,8 @@ proc renameResponse*(
     return
   let positions = initPositionIndex(snapshot.text)
   let offset = offsetAt(positions, snapshot.text, valueOrEmpty(params, "position"))
-  let info = resolveRename(workspace, snapshot, offset, params["newName"].getStr)
+  let info =
+    resolveRename(workspace, snapshot, offset, params["newName"].getStr, stdlib)
   if info.state != renameAvailable:
     result.needsBootstrap = workspace.bootstrapPending
     return

@@ -10,6 +10,8 @@ import ./doc_normalize
 import ./map_binary_reader
 import ./map_decode
 import ./receiver_helpers
+import ./cache_paths
+import ./toolchain
 
 type
   CandidatePriority* = enum
@@ -44,7 +46,6 @@ type
     metadata: StdlibMetadataState
 
 const
-  bundledStdlibBinary = staticRead("../../stdlib_map.bin")
   stdlibBinaryMagic = "ONIMBIN1"
   stdlibBinaryVersion = 2'u32
   stdlibBinaryHeaderSize = 32
@@ -337,16 +338,17 @@ proc decodeStdlibBinary(data: string): StdlibMap =
   result.metadata = metadataComplete
   return result
 
-var cachedBundledMap: StdlibMap
-
-proc loadBundledStdlibMap(): StdlibMap =
-  if cachedBundledMap == nil:
-    cachedBundledMap = decodeStdlibBinary(bundledStdlibBinary)
-  cachedBundledMap
+proc defaultStdlibBinaryPath(): string =
+  let toolchain = resolveNimToolchain(getCurrentDir())
+  if toolchain.state == toolchainReady and validStdlibCache(toolchain):
+    result = stdlibBinaryPath(toolchain)
 
 proc loadStdlibBinary*(path: string): StdlibMap =
   if path.len == 0:
-    return loadBundledStdlibMap()
+    let defaultPath = defaultStdlibBinaryPath()
+    if defaultPath.len == 0:
+      return emptyStdlibMap()
+    return loadStdlibBinary(defaultPath)
   if not fileExists(path):
     return emptyStdlibMap()
   try:
@@ -356,7 +358,10 @@ proc loadStdlibBinary*(path: string): StdlibMap =
 
 proc loadStdlibMap*(path: string): StdlibMap =
   if path.len == 0:
-    return loadBundledStdlibMap()
+    let defaultPath = defaultStdlibBinaryPath()
+    if defaultPath.len == 0:
+      return emptyStdlibMap()
+    return loadStdlibBinary(defaultPath)
   var content = ""
   if fileExists(path):
     try:

@@ -39,7 +39,7 @@ var reader: Thread[pointer]
 var started = false
 var semanticPending: Atomic[bool]
 
-const semanticReceiveTimeoutMs = 5_000
+const semanticReceiveTimeoutMs = 30_000
 
 proc traceSemanticWorker(event: string) {.inline.} =
   if getEnv("ONIM_TRACE_WORKERS").len > 0:

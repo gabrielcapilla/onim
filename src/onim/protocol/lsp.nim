@@ -70,7 +70,7 @@ proc runLsp*() =
     bindToParentProcess()
   lspTraceEnabled = getEnv("ONIM_TRACE_LSP").len > 0
   let workspace = initWorkspace()
-  var stdlib = stdlibMap()
+  var stdlib = emptyStdlibMap()
   var actionCache: seq[CachedAction] = @[]
   var pending: SemanticKey
   var queued: seq[SemanticRequest] = @[]
@@ -94,6 +94,10 @@ proc runLsp*() =
 
   while true:
     let event = lspEvents.recv()
+    if initializeAccepted:
+      let wasComplete = stdlib.surfaceIsComplete
+      if pollStdlibMap(stdlib) == stdlibRuntimeReady and not wasComplete:
+        actionCache.setLen(0)
     if event.kind == lspEndEvent:
       break
     if event.kind == lspBootstrapEvent:
@@ -187,6 +191,13 @@ proc runLsp*() =
       if root.len > 0 and not broadWorkspaceRoot(root):
         discard workspace.prepareWorkspace(root)
       options.useStdPrefix = boolOption(params, "useStdPrefix", true)
+      discard startStdlibMap(
+        if root.len > 0:
+          root
+        else:
+          getCurrentDir(),
+        stdlib,
+      )
       sendResponse(id, initializeResult())
       discard scheduleBootstrap(bootstrap, workspace)
       continue
@@ -473,6 +484,7 @@ proc runLsp*() =
   finishSemanticWorkerStop()
   lspSemanticStopRequested.store(false)
   if exitRequested:
+    stopStdlibMapGeneration()
     terminateProcessNow(if shutdownRequested: 0 else: 1)
   if lspBootstrapBridgeStarted:
     stopBootstrapWorker()

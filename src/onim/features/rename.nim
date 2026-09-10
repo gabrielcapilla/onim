@@ -192,8 +192,9 @@ proc importedModuleCollision(
     source: WorkspaceSnapshot,
     target: DefinitionTarget,
     newKey: string,
+    stdlib: StdlibMap = nil,
 ): bool =
-  var stdlib: StdlibMap
+  var activeStdlib = stdlib
   for item in source.index.parsed.imports:
     if item.form != importModule or item.alias.len > 0:
       continue
@@ -215,13 +216,13 @@ proc importedModuleCollision(
         ) == newKey:
           return true
     else:
-      if stdlib == nil:
-        stdlib = stdlibMap()
-      let surface = stdlib.surfaceIndex
+      if activeStdlib == nil:
+        activeStdlib = stdlibMap()
+      let surface = activeStdlib.surfaceIndex
       if not surface.moduleKnown(item.module) and
           not surface.moduleKnown("std/" & item.module):
         return true
-      if stdlib.stdlibNameCollision(item.module, newKey):
+      if activeStdlib.stdlibNameCollision(item.module, newKey):
         return true
   false
 
@@ -238,6 +239,7 @@ proc validateMatches(
     target: DefinitionTarget,
     targetName, newName: string,
     matches: openArray[ReferenceMatch],
+    stdlib: StdlibMap = nil,
 ): bool =
   if target.kind != targetDeclaration:
     return false
@@ -316,12 +318,16 @@ proc validateMatches(
         return false
     if importedBindingCollision(workspace, current, target, targetName, newKey):
       return false
-    if importedModuleCollision(workspace, current, target, newKey):
+    if importedModuleCollision(workspace, current, target, newKey, stdlib):
       return false
   true
 
 proc resolveRename*(
-    workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int, newName: string
+    workspace: Workspace,
+    source: WorkspaceSnapshot,
+    byteOffset: int,
+    newName: string,
+    stdlib: StdlibMap = nil,
 ): RenameInfo =
   if workspace == nil or not source.valid or source.index == nil or
       not validRenameName(newName):
@@ -347,7 +353,7 @@ proc resolveRename*(
     return
   matches.sort(compareReferenceMatches)
   if not validateMatches(
-    workspace, source, references.target, targetName, newName, matches
+    workspace, source, references.target, targetName, newName, matches, stdlib
   ):
     return
   result.state = renameAvailable

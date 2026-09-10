@@ -28,5 +28,9 @@ tests/trename
 tests/tstdlibmap
 *.onim-*.nim
 gen_stdlib_map
+stdlib_map.json
+stdlib_map.bin
+src/stdlib_map.json
+src/stdlib_map.bin
 PLAN.md
 ROADMAP.md
