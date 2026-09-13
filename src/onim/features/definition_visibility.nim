@@ -4,7 +4,6 @@ import ../index/bindings
 import ../index/scopes
 import ../index/scope_queries
 import ../index/source_index
-import ../session/workspace
 import ../session/workspace_models
 import ../syntax/imports
 import ../syntax/module_names

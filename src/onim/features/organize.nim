@@ -1,14 +1,9 @@
-import std/[algorithm, os, sets, strutils, tables]
+import std/[os, sets, strutils]
 
-import ../index/bindings
 import ../index/occurrences
-import ../index/scopes
 import ../index/scope_validation
-import ../index/cache
 import ../index/source_index
-import ../index/symbols
 import ../index/surfaces
-import ../index/surface_resolution
 import ../semantic/compiler_api
 import ../session/module_catalog
 import ../stdlib/map
@@ -16,8 +11,6 @@ import ../stdlib/map_runtime
 import ../stdlib/map_resolution
 import ../syntax/imports
 import ../syntax/import_queries
-import ../syntax/module_names
-import ../syntax/source_lines
 import ../syntax/tokens
 import ./organize_includes
 import ./organize_materialization

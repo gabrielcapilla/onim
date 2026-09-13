@@ -2,7 +2,6 @@ import std/tables
 
 import ../index/source_index
 import ../index/type_index_models
-import ../index/types
 import ../syntax/tokens
 import ./completion_candidates
 import ./completion_models

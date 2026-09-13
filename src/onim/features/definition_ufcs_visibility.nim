@@ -1,10 +1,8 @@
-import ../index/types
 import ../index/type_states
 import ../session/ids
 import ../session/workspace
 import ../session/workspace_models
 import ../syntax/imports
-import ../syntax/import_queries
 import ../syntax/tokens
 import ./definition_source_queries
 import ./definition_visibility

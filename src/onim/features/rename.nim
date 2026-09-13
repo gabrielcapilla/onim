@@ -1,6 +1,5 @@
 import std/[algorithm, sets, strutils]
 
-import ./definition
 import ./definition_models
 import ./definition_target_validation
 import ./definition_visibility
@@ -259,13 +258,13 @@ proc validateMatches(
       identifierKey(targetView.index.parsed.tokens, targetToken) != oldKey:
     return false
   let targetSymbolIndex = targetView.index.symbols.symbolToken(target.nameToken)
-  let exported =
-    targetSymbolIndex >= 0 and targetView.index.symbols[targetSymbolIndex].exported
+  let moduleLevel = targetSymbolIndex >= 0
+  let exported = moduleLevel and targetView.index.symbols[targetSymbolIndex].exported
   if not exported and target.fileId.value != source.fileId.value:
     return false
-  if newKey != oldKey and exported and targetView.moduleNameCollision(target, newKey):
+  if newKey != oldKey and moduleLevel and targetView.moduleNameCollision(target, newKey):
     return false
-  if newKey != oldKey and not exported and
+  if newKey != oldKey and not moduleLevel and
       source.localTargetHasCompetingDeclaration(target):
     return false
   if newKey != oldKey and

@@ -7,7 +7,6 @@ import ../index/type_local_models
 import ../index/type_local_resolution
 import ../index/type_queries
 import ../index/type_states
-import ../index/types
 import ../session/ids
 import ../session/workspace
 import ../session/workspace_models

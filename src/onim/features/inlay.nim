@@ -7,7 +7,6 @@ import ../index/type_ids
 import ../index/type_local_models
 import ../index/type_local_resolution
 import ../index/type_states
-import ../index/types
 import ../session/workspace
 import ../session/workspace_models
 import ../syntax/tokens
@@ -36,8 +35,8 @@ proc appendInferredHint(
 proc inferredInlayHints*(
     workspace: Workspace, source: WorkspaceSnapshot, firstOffset, pastOffset: int
 ): seq[InlayHintInfo] =
-  if workspace == nil or not source.valid or source.index == nil or
-      not source.index.nativeIndexSafe() or firstOffset < 0 or pastOffset <= firstOffset:
+  if workspace == nil or not source.valid or source.index == nil or firstOffset < 0 or
+      pastOffset <= firstOffset:
     return
   for declaration in source.index.scopes.declarations:
     if declaration.kind notin {declarationLet, declarationVar, declarationConst} or

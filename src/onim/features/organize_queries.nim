@@ -3,7 +3,6 @@ import std/[sets, strutils]
 import ../semantic/compiler_api
 import ../stdlib/map
 import ../syntax/imports
-import ../syntax/module_names
 import ../syntax/tokens
 
 proc findFromImport*(imports: SourceImports, module: string, name: string): int =

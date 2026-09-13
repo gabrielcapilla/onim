@@ -5,6 +5,7 @@ import ./completion_models
 import ../index/scopes
 import ../index/scope_queries
 import ../index/source_index
+import ../index/symbols
 import ../syntax/tokens
 
 proc appendVisible*(
@@ -59,4 +60,39 @@ proc appendVisible*(
       candidates.add visible
     elif distance < candidates[candidateByName[key]].distance:
       candidates[candidateByName[key]] = visible
+  true
+
+proc appendVisibleModuleSymbols*(
+    index: SourceIndex,
+    cursorToken: uint32,
+    prefix: string,
+    candidates: var seq[VisibleCompletion],
+    candidateByName: var Table[string, int],
+): bool =
+  if index == nil:
+    return false
+  for symbol in index.symbols:
+    if symbol.nameToken >= cursorToken:
+      continue
+    let tokenIndex = int(symbol.nameToken)
+    if tokenIndex < 0 or tokenIndex >= index.parsed.tokens.len:
+      return false
+    let token = index.parsed.tokens[tokenIndex]
+    if token.kind != tkIdentifier or not token.validIdentifier or token.isStropped or
+        token.isNimKeyword:
+      return false
+    let key = identifierKey(index.parsed.tokens, token)
+    if key.len == 0 or not key.startsWith(identifierKey(prefix)) or
+        candidateByName.hasKey(key):
+      continue
+    candidateByName[key] = candidates.len
+    candidates.add VisibleCompletion(
+      item: CompletionItem(
+        label: index.parsed.tokens.tokenText(token),
+        kind: memberCompletionKind(symbol.kind),
+      ),
+      key: key,
+      distance: high(uint32),
+      declarationToken: symbol.nameToken,
+    )
   true

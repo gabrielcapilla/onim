@@ -1,11 +1,11 @@
 import std/tables
 
 import ./completion_candidates
-import ./completion_models
 import ./completion_stdlib_module
 import ../index/surfaces
 import ../index/surface_resolution
 import ../stdlib/map
+import ../syntax/module_names
 import ../syntax/tokens
 
 proc appendProjectMembers*(
@@ -45,11 +45,24 @@ proc appendStdlibMembers*(
     let exports = surface.exportsFor(binding)
     if exports.len == 0:
       return false
-    discard appendCompletionCandidate(
-      binding.name,
-      memberCompletionKind(exports[0].kind),
-      identifierKey(prefix),
-      candidates,
-      candidateByName,
-    )
+    var appended = false
+    for candidate in stdlib.candidatesFor(binding.name, moduleBase(moduleName), -1):
+      if not sameModule(candidate.module, moduleName):
+        continue
+      appended = true
+      discard appendStdlibCandidate(
+        candidate,
+        memberCompletionKind(exports[0].kind),
+        identifierKey(prefix),
+        candidates,
+        candidateByName,
+      )
+    if not appended:
+      discard appendCompletionCandidate(
+        binding.name,
+        memberCompletionKind(exports[0].kind),
+        identifierKey(prefix),
+        candidates,
+        candidateByName,
+      )
   true

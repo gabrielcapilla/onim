@@ -8,7 +8,6 @@ import ../stdlib/map
 import ../stdlib/map_resolution
 import ../syntax/imports
 import ../syntax/import_queries
-import ../syntax/module_names
 import ../syntax/tokens
 import ./organize_native_usage
 import ./organize_planning

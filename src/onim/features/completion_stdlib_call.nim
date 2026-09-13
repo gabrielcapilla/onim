@@ -5,10 +5,10 @@ import std/tables
 import ./completion_candidates
 import ./completion_imports
 import ./completion_models
+import ./signature
 import ./definition
 import ./definition_models
 import ./definition_visibility
-import ../index/types
 import ../index/type_local_models
 import ../index/type_queries
 import ../index/type_local_resolution
@@ -105,11 +105,12 @@ proc appendStdlibDirectCallMembers*(
   if call.module.len == 0:
     return false
   for candidate in stdlib.directNominalMembers(call.module, call.typeName, prefix):
-    discard appendCompletionCandidate(
-      candidate.name,
+    discard appendStdlibCandidate(
+      candidate,
       completionMethod,
       identifierKey(prefix),
       candidates,
       candidateByName,
+      signatureMemberCall,
     )
   candidates.len > 0

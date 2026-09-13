@@ -1,21 +1,14 @@
 import std/[algorithm, sets, strutils]
 
-import ../index/bindings
-import ../index/scopes
 import ../index/source_index
 import ../index/surfaces
-import ../index/surface_resolution
 import ../semantic/compiler_api
 import ../session/module_catalog
 import ../stdlib/map
-import ../stdlib/map_resolution
 import ../syntax/imports
-import ../syntax/import_queries
 import ../syntax/module_names
 import ../syntax/source_lines
-import ../syntax/tokens
 import ./organize_planning
-import ./organize_queries
 import ./organize_native_usage
 import ./organize_unused
 import ./organize_edits
@@ -128,9 +121,8 @@ proc nativeImportRemovalPlan*(
       continue
     case item.form
     of importModule:
-      if module.startsWith("std/"):
-        if module notin stdlib.modules:
-          return
+      if stdlib.knownModule(module):
+        discard
       elif project == nil or not project.universeIsComplete:
         return
       else:

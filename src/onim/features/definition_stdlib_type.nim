@@ -7,12 +7,10 @@ import ./definition_visibility
 import ../index/type_kinds
 import ../index/type_local_models
 import ../index/type_states
-import ../index/types
 import ../stdlib/map
 import ../session/workspace
 import ../session/workspace_models
 import ../syntax/imports
-import ../syntax/module_names
 import ../syntax/tokens
 
 proc stdlibNominalTypeModule*(

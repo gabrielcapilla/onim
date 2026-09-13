@@ -7,8 +7,6 @@ import ../index/scopes
 import ../index/source_index
 import ../index/type_expression_syntax
 import ../index/type_kinds
-import ../index/types
-import ../session/workspace
 import ../session/workspace_models
 import ../syntax/tokens
 
@@ -19,20 +17,38 @@ proc completePrimitiveTypes*(
       byteOffset > source.text.len:
     return
   let tokenIndex = source.index.prefixToken(byteOffset)
-  if tokenIndex < 0 or not source.index.completionContext(tokenIndex):
-    return
+  let tokens = source.index.parsed.tokens
+  var prefix = ""
+  var replaceStart = byteOffset
   var inAnnotation = false
-  for declaration in source.index.scopes.declarations:
-    if declaration.kind in {declarationLet, declarationVar, declarationConst} and
-        source.index.parsed.tokens.directTypeAnnotationToken(declaration, tokenIndex):
-      inAnnotation = true
-      break
+  if tokenIndex >= 0:
+    if not source.index.completionContext(tokenIndex):
+      return
+    prefix = tokens.tokenText(tokens[tokenIndex])
+    replaceStart = tokens[tokenIndex].startOffset
+    for declaration in source.index.scopes.declarations:
+      if declaration.kind in {declarationLet, declarationVar, declarationConst} and
+          tokens.directTypeAnnotationToken(declaration, tokenIndex):
+        inAnnotation = true
+        break
+  else:
+    let previous = source.index.previousToken(byteOffset)
+    if previous < 0 or not tokens.tokenTextEquals(tokens[previous], ":") or
+        not horizontalGap(source.text, tokens[previous].endOffset, byteOffset):
+      return
+    for declaration in source.index.scopes.declarations:
+      if declaration.kind notin {declarationLet, declarationVar, declarationConst} or
+          previous < int(declaration.firstToken) or
+          previous >= int(declaration.pastToken):
+        continue
+      let split = tokens.splitDeclaration(declaration)
+      if split.colon == previous and (split.equals < 0 or previous < split.equals):
+        inAnnotation = true
+        break
   if not inAnnotation:
     return
   var candidates: seq[VisibleCompletion] = @[]
   var candidateByName = initTable[string, int]()
-  let prefix =
-    source.index.parsed.tokens.tokenText(source.index.parsed.tokens[tokenIndex])
   for kind in TypeKind:
     if kind.isPrimitiveType:
       discard appendCompletionCandidate(
@@ -46,7 +62,9 @@ proc completePrimitiveTypes*(
     return
   candidates.sort(compareCompletion)
   result.state = completionAvailable
-  result.replaceStart = source.index.parsed.tokens[tokenIndex].startOffset
+  result.insertStart = replaceStart
+  result.insertEnd = byteOffset
+  result.replaceStart = replaceStart
   result.replaceEnd = byteOffset
   result.items = newSeqOfCap[CompletionItem](candidates.len)
   for candidate in candidates:

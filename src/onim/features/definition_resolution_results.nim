@@ -1,4 +1,3 @@
-import ../index/types
 import ../index/type_states
 import ../session/ids
 import ./definition_models

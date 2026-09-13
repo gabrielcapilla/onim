@@ -1,11 +1,9 @@
 import std/strutils
-import std/sets
 
 import ../index/bindings
 import ../index/source_index
 import ../index/symbols
 import ../index/scopes
-import ../index/types
 import ../index/surfaces
 import ../index/type_field_queries
 import ../index/type_ids
@@ -16,15 +14,12 @@ import ../index/type_object_queries
 import ../index/type_queries
 import ../index/type_routine_returns
 import ../index/type_states
-import ../index/type_declaration_syntax
 import ../session/ids
 import ../session/module_catalog
 import ../session/workspace
 import ../session/workspace_models
-import ../stdlib/map
 import ../syntax/imports
 import ../syntax/import_queries
-import ../syntax/module_names
 import ../syntax/tokens
 import ./definition_visibility
 import ./definition_models
@@ -39,7 +34,6 @@ import ./definition_resolution_results
 import ./definition_routine_filter
 import ./definition_symbol_target
 import ./definition_symbol_completeness
-import ./routine_body
 import ./ufcs_arity
 
 proc resolveDefinitionAtToken*(
@@ -415,7 +409,7 @@ proc collectUfcsFromProvider(
       return typeStateForDefinition(target.kind)
     let arity =
       ufcsFormalArity(provider.index.parsed.tokens, provider.index.scopes, parameter)
-    targets.addUfcsTarget(target.target, arity.kind, arity.count)
+    targets.addUfcsTarget(target.target, arity.kind, arity.count, arity.required)
   typeStateResolved
 
 proc collectUfcsTargetRecords(
@@ -555,15 +549,17 @@ proc resolveUfcsMember(
     for record in matches.targets:
       targets.addTarget(record.target)
     finishTargets(targets, unresolved = false)
+  of ufcsCallMalformed:
+    return unknownResolution(definitionUnsupported)
   of ufcsCallKnown:
     if call.count == high(uint32):
       return unknownResolution(definitionUnsupported)
     let wantedArity = call.count + 1'u32
     var targets: seq[DefinitionTarget] = @[]
     for record in matches.targets:
-      if record.arityKind != ufcsArityFixed:
+      if record.arityKind notin {ufcsArityFixed, ufcsArityOptional}:
         return unknownResolution(definitionUnsupported)
-      if record.arity == wantedArity:
+      if wantedArity >= record.requiredArity and wantedArity <= record.arity:
         targets.addTarget(record.target)
     if targets.len == 0:
       return unknownResolution(definitionUnsupported)
@@ -669,7 +665,12 @@ proc resolveDefinitionAtToken*(
         source.index.parsed.tokens[tokenIndex + 1], "."
       ):
     return
-  if not source.importedUseSupported(tokenIndex, tokenName):
+  let activeScope = source.index.scopes.innermostScopeAt(uint32(tokenIndex))
+  let activeOrdinal = activeScope.scopeOrdinal
+  let atModuleScope =
+    activeOrdinal >= 0 and activeOrdinal < source.index.scopes.scopes.len and
+    source.index.scopes.scopes[activeOrdinal].kind == scopeModule
+  if not atModuleScope and not source.importedUseSupported(tokenIndex, tokenName):
     return
 
   let fromState = fromBindingState(source, tokenName)
@@ -696,7 +697,44 @@ proc resolveDefinitionAtToken*(
     return
   if fromState.uncertain:
     return
+  result = resolvePlainImport(workspace, source, tokenName, tokenIndex)
+  if result.kind != definitionUnknown:
+    return
   result = resolveFrom(workspace, source, tokenName)
+
+proc resolveDefinitionAtName*(
+    workspace: Workspace, source: WorkspaceSnapshot, tokenIndex: int, name: string
+): DefinitionResolution =
+  if workspace == nil or not validSource(source) or source.index == nil or tokenIndex < 0 or
+      tokenIndex >= source.index.parsed.tokens.len:
+    return unknownResolution()
+  let local = resolveLocalDefinitionAtName(source, tokenIndex, name)
+  if local.kind != definitionUnknown:
+    return local
+  let matches = symbolMatches(source.index, name)
+  if matches.len == 0:
+    return resolveFrom(workspace, source, name)
+  let filtered =
+    filterRoutineMatches(source.index, matches, source.index.parsed.tokens, tokenIndex)
+  if filtered.len > 1:
+    return unknownResolution(definitionAmbiguous)
+  if filtered.len == 0:
+    return unknownResolution()
+  let symbolIndex = filtered[0]
+  let symbol = source.index.symbols[symbolIndex]
+  if symbol.nameToken >= uint32(source.index.parsed.tokens.len) or
+      source.index.parsed.tokens[int(symbol.nameToken)].startOffset >=
+      source.index.parsed.tokens[tokenIndex].startOffset or
+      not completeSymbol(source.index, symbolIndex):
+    return unknownResolution()
+  result.kind = definitionResolved
+  result.target = DefinitionTarget(
+    kind: targetDeclaration,
+    snapshotId: source.id,
+    fileId: source.fileId,
+    contentGeneration: source.contentGeneration,
+    nameToken: symbol.nameToken,
+  )
 
 proc resolveDefinition*(
     workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int

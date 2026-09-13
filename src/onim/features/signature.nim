@@ -20,6 +20,10 @@ type
     signatureUnavailable
     signatureAvailable
 
+  SignatureCallKind* = enum
+    signatureDirectCall
+    signatureMemberCall
+
   SignatureCandidate* = object
     label*: string
     parameters*: seq[string]
@@ -28,6 +32,7 @@ type
     state*: SignatureState
     activeParameter*: int
     signatures*: seq[SignatureCandidate]
+    needsBootstrap*: bool
 
   CallContext = object
     calleeToken: int
@@ -152,6 +157,66 @@ proc signatureParameters(signature: string): seq[string] =
     let closing = matchingCallClose(tokens, opening)
     if closing >= 0:
       result = signatureParameters(signature, tokens, opening, closing)
+
+proc snippetParameterName(parameter: string): string =
+  let tokens = lex(parameter)
+  if tokens.len == 0:
+    return
+  for index in 0 ..< tokens.len:
+    if tokenIs(tokens, index, "varargs"):
+      return
+  var depth = 0
+  var boundary = tokens.len
+  for index, token in tokens:
+    if tokenIs(tokens, index, "(") or tokenIs(tokens, index, "[") or
+        tokenIs(tokens, index, "{"):
+      inc depth
+    elif tokenIs(tokens, index, ")") or tokenIs(tokens, index, "]") or
+        tokenIs(tokens, index, "}"):
+      if depth > 0:
+        dec depth
+    elif depth == 0 and (tokenIs(tokens, index, ":") or tokenIs(tokens, index, "=")):
+      boundary = index
+      break
+  if boundary != 1 or tokens[0].kind != tkIdentifier or tokens[0].isNimKeyword or
+      tfStropped in tokens[0].flags:
+    return
+  tokens.tokenText(tokens[0])
+
+proc signatureCallSnippet*(
+    label, signature: string, callKind = signatureDirectCall
+): string =
+  if label.len == 0 or signature.len == 0:
+    return
+  let tokens = lex(signature)
+  var opening = -1
+  for index, token in tokens:
+    if tokenIs(tokens, index, "("):
+      opening = index
+      break
+  if opening < 0:
+    return
+  let closing = matchingCallClose(tokens, opening)
+  if closing < 0:
+    return
+  let parameters = signatureParameters(signature, tokens, opening, closing)
+  var names: seq[string] = @[]
+  var firstParameter = 0
+  if callKind == signatureMemberCall:
+    if parameters.len == 0:
+      return label & "()$0"
+    firstParameter = 1
+  for index in firstParameter ..< parameters.len:
+    let name = snippetParameterName(parameters[index])
+    if name.len == 0:
+      return
+    names.add name
+  result = label & "("
+  for index, name in names:
+    if index > 0:
+      result.add ", "
+    result.add "${" & $(index + 1) & ":" & name & "}"
+  result.add ")$0"
 
 proc sourceSignature(
     source: WorkspaceSnapshot, symbol: SourceSymbol
@@ -405,3 +470,8 @@ proc resolveSignatureHelp*(
           result.signatures = stdlibSignatures(source, stdlib, context.value)
   if result.signatures.len > 0:
     result.state = signatureAvailable
+  else:
+    let resolution =
+      resolveDefinitionAtToken(workspace, source, context.value.calleeToken)
+    if resolution.kind == definitionUnresolved:
+      result.needsBootstrap = workspace.bootstrapPending

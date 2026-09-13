@@ -1,6 +1,5 @@
 import ../index/source_index
 import ../session/ids
-import ../session/workspace
 import ../session/workspace_models
 import ./definition_models
 import ./definition_resolution_results

@@ -128,21 +128,25 @@ proc resolveReferences*(
       not targetView.index.nativeIndexSafe():
     return
   let targetSymbolIndex = targetView.index.symbols.symbolToken(result.target.nameToken)
-  if targetSymbolIndex < 0 or not targetView.index.symbols[targetSymbolIndex].exported:
+  if targetSymbolIndex < 0:
+    return
+  let targetExported = targetView.index.symbols[targetSymbolIndex].exported
+  if not targetExported and result.target.fileId.value != source.fileId.value:
     return
   let targetName = targetView.index.parsed.tokens.tokenText(
     targetView.index.parsed.tokens[int(result.target.nameToken)]
   )
 
   var candidateFiles: seq[FileId] = @[result.target.fileId]
-  for dependent in workspace.dependents(result.target.fileId):
-    var known = false
-    for existing in candidateFiles:
-      if existing.value == dependent.value:
-        known = true
-        break
-    if not known:
-      candidateFiles.add dependent
+  if targetExported:
+    for dependent in workspace.dependents(result.target.fileId):
+      var known = false
+      for existing in candidateFiles:
+        if existing.value == dependent.value:
+          known = true
+          break
+      if not known:
+        candidateFiles.add dependent
   candidateFiles.sort(
     proc(left, right: FileId): int =
       cmp(left.value, right.value)

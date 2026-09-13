@@ -25,9 +25,9 @@ proc filterRoutineMatches*(
     if not isRoutineKind(symbol.kind):
       return matches
     let arity = routineFormalArity(index.parsed.tokens, index.scopes, symbolIndex)
-    if arity.kind != ufcsArityFixed:
+    if arity.kind notin {ufcsArityFixed, ufcsArityOptional}:
       return matches
-    if arity.count == call.count:
+    if call.count >= arity.required and call.count <= arity.count:
       result.add symbolIndex
   if result.len == 0:
     return matches

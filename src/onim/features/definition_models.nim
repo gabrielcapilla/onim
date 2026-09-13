@@ -1,5 +1,4 @@
 import ../index/source_index
-import ../index/types
 import ../index/type_local_models
 import ../session/ids
 import ./ufcs_arity
@@ -55,14 +54,18 @@ type UfcsTargetRecord* = object
   target*: DefinitionTarget
   arityKind*: UfcsFormalArityKind
   arity*: uint32
+  requiredArity*: uint32
 
 proc addUfcsTarget*(
     targets: var seq[UfcsTargetRecord],
     target: DefinitionTarget,
     arityKind: UfcsFormalArityKind,
     arity: uint32,
+    requiredArity: uint32,
 ) =
   for existing in targets:
     if existing.target.sameDefinitionTarget(target):
       return
-  targets.add UfcsTargetRecord(target: target, arityKind: arityKind, arity: arity)
+  targets.add UfcsTargetRecord(
+    target: target, arityKind: arityKind, arity: arity, requiredArity: requiredArity
+  )

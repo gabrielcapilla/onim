@@ -1,8 +1,6 @@
 import ../index/source_index
 import ../index/type_index_models
 import ../index/type_field_queries
-import ../index/types
-import ../session/workspace
 import ../session/workspace_models
 import ../syntax/tokens
 import ./definition_models

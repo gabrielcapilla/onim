@@ -1,7 +1,6 @@
 import std/sets
 
 import ../index/source_index
-import ../session/workspace
 import ../session/workspace_models
 import ../syntax/imports
 import ../syntax/module_names

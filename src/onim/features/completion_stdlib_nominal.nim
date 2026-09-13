@@ -2,12 +2,12 @@ import std/tables
 
 import ./completion_candidates
 import ./completion_models
+import ./signature
 import ./definition
 import ./definition_models
 import ./definition_stdlib_type
 import ../index/type_kinds
 import ../index/type_local_models
-import ../index/types
 import ../session/workspace
 import ../session/workspace_models
 import ../stdlib/map
@@ -34,12 +34,13 @@ proc appendImplicitFileMembers*(
     return false
   for candidate in stdlib.implicitFileMembers(prefix):
     result = true
-    discard appendCompletionCandidate(
-      candidate.name,
+    discard appendStdlibCandidate(
+      candidate,
       completionMethod,
       identifierKey(prefix),
       candidates,
       candidateByName,
+      signatureMemberCall,
     )
 
 proc appendStdlibNominalMembers*(
@@ -59,11 +60,12 @@ proc appendStdlibNominalMembers*(
   )
   let before = candidates.len
   for candidate in stdlib.directNominalMembers(module, typeName, prefix):
-    discard appendCompletionCandidate(
-      candidate.name,
+    discard appendStdlibCandidate(
+      candidate,
       completionMethod,
       identifierKey(prefix),
       candidates,
       candidateByName,
+      signatureMemberCall,
     )
   candidates.len > before

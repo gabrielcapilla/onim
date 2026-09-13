@@ -4,7 +4,6 @@ import ./completion_candidates
 import ./completion_context
 import ./completion_models
 import ../index/source_index
-import ../session/workspace
 import ../session/workspace_models
 import ../stdlib/map
 import ../syntax/tokens
@@ -16,19 +15,31 @@ proc completeConditionNames*(
       byteOffset > source.text.len:
     return
   let tokenIndex = source.index.prefixToken(byteOffset)
-  if tokenIndex <= 0 or not source.index.completionContext(tokenIndex) or
-      not source.index.parsed.tokens[tokenIndex - 1].isKeyword(kwWhen):
-    return
+  let tokens = source.index.parsed.tokens
+  var prefix = ""
+  var replaceStart = byteOffset
+  if tokenIndex >= 0:
+    if tokenIndex <= 0 or not tokens[tokenIndex - 1].isKeyword(kwWhen):
+      return
+    let validContext =
+      source.index.completionContext(tokenIndex) or tokens[tokenIndex].isKeyword(kwIs)
+    if not validContext:
+      return
+    prefix = tokens.tokenText(tokens[tokenIndex])
+    replaceStart = tokens[tokenIndex].startOffset
+  else:
+    let previous = source.index.previousToken(byteOffset)
+    if previous < 0 or not tokens[previous].isKeyword(kwWhen) or
+        not horizontalGap(source.text, tokens[previous].endOffset, byteOffset):
+      return
   var candidates: seq[VisibleCompletion] = @[]
   var candidateByName = initTable[string, int]()
-  let prefix =
-    source.index.parsed.tokens.tokenText(source.index.parsed.tokens[tokenIndex])
   for _, values in stdlib.symbols:
     for candidate in values:
       if candidate.kind == "skConst" and candidate.signature.contains("{.magic") and
           stdlib.implicitModule(candidate.module):
-        discard appendCompletionCandidate(
-          candidate.name,
+        discard appendStdlibCandidate(
+          candidate,
           completionConstant,
           identifierKey(prefix),
           candidates,
@@ -38,7 +49,9 @@ proc completeConditionNames*(
     return
   candidates.sort(compareCompletion)
   result.state = completionAvailable
-  result.replaceStart = source.index.parsed.tokens[tokenIndex].startOffset
+  result.insertStart = replaceStart
+  result.insertEnd = byteOffset
+  result.replaceStart = replaceStart
   result.replaceEnd = byteOffset
   result.items = newSeqOfCap[CompletionItem](candidates.len)
   for candidate in candidates:

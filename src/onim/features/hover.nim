@@ -11,7 +11,8 @@ import ../index/type_kinds
 import ../index/type_local_models
 import ../index/type_queries
 import ../index/type_states
-import ../index/types
+import ../session/ids
+import ../session/module_catalog
 import ../session/workspace
 import ../session/workspace_models
 import ../stdlib/map
@@ -19,6 +20,7 @@ import ../syntax/imports
 import ../syntax/import_queries
 import ../syntax/module_names
 import ../syntax/tokens
+import ./completion_context
 import ./definition
 import ./definition_models
 import ./definition_stdlib_type
@@ -36,6 +38,22 @@ type
     kind*: string
     signature*: string
     documentation*: string
+    rangeStartOffset*: int
+    rangeEndOffset*: int
+    declarationLine*: int
+    declarationText*: string
+    needsBootstrap*: bool
+
+proc sourceLineAt(source: string, offset: int): string {.inline.} =
+  if offset < 0 or offset > source.len:
+    return
+  var first = offset
+  while first > 0 and source[first - 1] notin {'\n', '\r'}:
+    dec first
+  var past = offset
+  while past < source.len and source[past] notin {'\n', '\r'}:
+    inc past
+  source[first ..< past].strip
 
 proc targetHover(
     workspace: Workspace, source: WorkspaceSnapshot, resolution: DefinitionResolution
@@ -89,8 +107,10 @@ proc targetHover(
       return
     let declarationOrdinal =
       source.index.scopes.declarationOrdinalAt(resolution.target.nameToken)
-    if declarationOrdinal < 0 or
-        declarationOrdinal >= source.index.scopes.declarations.len:
+    if declarationOrdinal < 0:
+      if source.index.symbols.symbolToken(resolution.target.nameToken) < 0:
+        return
+    elif declarationOrdinal >= source.index.scopes.declarations.len:
       return
     let localType = workspace.resolveLocalType(source, resolution.target.nameToken)
     if localType.info.state != typeStateResolved or localType.info.kind == typeUnknown:
@@ -109,19 +129,34 @@ proc targetHover(
     let typeName = localTypeText(typeSource, typeInfo)
     if typeName.len == 0:
       return
-    let declaration = source.index.scopes.declarations[declarationOrdinal]
-    let prefix =
-      case declaration.kind
-      of declarationParameter: ""
-      of declarationLet: "let "
-      of declarationVar: "var "
-      of declarationConst: "const "
+    var prefix = "let "
+    if declarationOrdinal >= 0:
+      let declaration = source.index.scopes.declarations[declarationOrdinal]
+      prefix =
+        case declaration.kind
+        of declarationParameter: ""
+        of declarationLet: "let "
+        of declarationVar: "var "
+        of declarationConst: "const "
+    else:
+      let symbolIndex = source.index.symbols.symbolToken(resolution.target.nameToken)
+      if symbolIndex < 0:
+        return
+      prefix =
+        case source.index.symbols[symbolIndex].kind
+        of symbolVar: "var "
+        of symbolConst: "const "
+        else: "let "
     prefix & tokenName & ": " & typeName
 
   result.state = hoverAvailable
   result.name = tokenName
   result.documentation =
     documentationForDeclaration(view.index.parsed.tokens, resolution.target.nameToken)
+  if resolution.target.kind == targetDeclaration:
+    result.declarationLine = token.line + 1
+    result.declarationText =
+      sourceLineAt(view.index.parsed.tokens.sourceText(), token.startOffset)
   case resolution.target.kind
   of targetObjectField:
     result.kind = "field"
@@ -212,6 +247,33 @@ proc stdlibHover(
       result.signature = candidate.signature
       result.documentation = candidate.documentation
 
+proc stdlibImplicitMemberHover(
+    source: WorkspaceSnapshot, stdlib: StdlibMap, tokenIndex: int
+): HoverInfo =
+  if stdlib == nil or tokenIndex < 0 or tokenIndex >= source.index.parsed.tokens.len:
+    return
+  let qualifierToken = source.index.qualifierIndex(uint32(tokenIndex))
+  if qualifierToken < 0:
+    return
+  let qualifier =
+    source.index.parsed.tokens.tokenText(source.index.parsed.tokens[qualifierToken])
+  let member =
+    source.index.parsed.tokens.tokenText(source.index.parsed.tokens[tokenIndex])
+  var matches = 0
+  var candidate: SymbolCandidate
+  for value in stdlib.implicitFileMembers(qualifier, member):
+    if sameIdentifier(value.name, member):
+      inc matches
+      candidate = value
+  if matches != 1:
+    return
+  result.state = hoverAvailable
+  result.name = candidate.name
+  result.module = candidate.module
+  result.kind = candidate.kind
+  result.signature = candidate.signature
+  result.documentation = candidate.documentation
+
 proc stdlibNominalHover(
     workspace: Workspace, source: WorkspaceSnapshot, stdlib: StdlibMap, tokenIndex: int
 ): HoverInfo =
@@ -248,10 +310,96 @@ proc stdlibNominalHover(
   result.signature = candidate.signature
   result.documentation = candidate.documentation
 
+proc importAtOffset(
+    source: WorkspaceSnapshot, byteOffset: int
+): tuple[found: bool, item: ImportInfo] =
+  if byteOffset < 0 or source.index == nil:
+    return
+  for item in source.index.parsed.imports:
+    if item.synthetic or item.moduleStartOffset < 0 or
+        item.moduleEndOffset <= item.moduleStartOffset or
+        byteOffset < item.moduleStartOffset or byteOffset >= item.moduleEndOffset or
+        source.index.parsed.conditionalImportDisposition(item) notin
+        {importUnconditional, importConditionalActive}:
+      continue
+    if result.found:
+      result.found = false
+      return
+    result.found = true
+    result.item = item
+
+proc projectModuleHover(
+    workspace: Workspace, source: WorkspaceSnapshot, item: ImportInfo
+): HoverInfo =
+  let catalog = workspace.moduleCatalog()
+  if catalog == nil or not catalog.complete():
+    return
+  let resolved =
+    catalog.resolveModuleName(workspace.moduleForPath(source.path), item.module)
+  if resolved.kind != moduleResolved:
+    return
+  let targetId = workspace.resolveModule(source.fileId, item.module)
+  if not targetId.valid or targetId.value != resolved.id.value:
+    return
+  let target = workspace.indexViewForFile(targetId)
+  if not target.valid or target.index == nil:
+    return
+  result.state = hoverAvailable
+  result.name = resolved.module
+  result.module = resolved.module
+  result.kind = "module"
+  result.documentation = documentationForModule(target.index.parsed.tokens)
+  result.rangeStartOffset = item.moduleStartOffset
+  result.rangeEndOffset = item.moduleEndOffset
+
+proc moduleHover(
+    workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int, stdlib: StdlibMap
+): HoverInfo =
+  let matched = source.importAtOffset(byteOffset)
+  if not matched.found:
+    return
+  let item = matched.item
+  if stdlib != nil:
+    let module = canonicalModule(item.module)
+    if module in stdlib.modules:
+      result.state = hoverAvailable
+      result.name = module
+      result.module = module
+      result.kind = "module"
+      result.documentation = stdlib.documentationForModule(module)
+      result.rangeStartOffset = item.moduleStartOffset
+      result.rangeEndOffset = item.moduleEndOffset
+      return
+  result = projectModuleHover(workspace, source, item)
+
+proc interpolationHover(
+    workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int
+): HoverInfo =
+  let context = source.index.interpolationContext(byteOffset)
+  if context.state != interpolationReady or context.anchorToken < 0 or
+      context.identifierPast <= context.identifierStart:
+    return
+  let text = source.index.parsed.tokens.sourceText
+  let name = text[context.identifierStart ..< context.identifierPast]
+  result = targetHover(
+    workspace,
+    source,
+    resolveDefinitionAtName(workspace, source, context.anchorToken, name),
+  )
+  if result.state == hoverAvailable:
+    result.rangeStartOffset = context.identifierStart
+    result.rangeEndOffset = context.identifierPast
+
 proc resolveHover*(
     workspace: Workspace, source: WorkspaceSnapshot, byteOffset: int, stdlib: StdlibMap
 ): HoverInfo =
   if workspace == nil or not source.valid or source.index == nil:
+    return
+  result = moduleHover(workspace, source, byteOffset, stdlib)
+  if result.state == hoverAvailable:
+    return
+  result = interpolationHover(workspace, source, byteOffset)
+  if result.state == hoverAvailable:
     return
   let tokenIndex = tokenAtOffset(source.index.parsed.tokens, byteOffset)
   if tokenIndex < 0:
@@ -262,8 +410,13 @@ proc resolveHover*(
   let resolution = resolveDefinition(workspace, source, byteOffset)
   if resolution.kind == definitionResolved:
     return targetHover(workspace, source, resolution)
+  if resolution.kind == definitionUnresolved:
+    result.needsBootstrap = workspace.bootstrapPending
+    return
   if resolution.kind notin {definitionUnknown, definitionUnsupported}:
     return
   result = source.stdlibHover(stdlib, tokenIndex)
+  if result.state == hoverUnavailable:
+    result = source.stdlibImplicitMemberHover(stdlib, tokenIndex)
   if result.state == hoverUnavailable:
     result = workspace.stdlibNominalHover(source, stdlib, tokenIndex)

@@ -1,4 +1,4 @@
-import std/[sets, tables]
+import std/[sets, strutils, tables]
 
 import ./completion_candidates
 import ./completion_imports
@@ -92,14 +92,35 @@ proc appendStdlibImport*(
     let localName = selection.selectedImportedName(binding.name)
     if localName.len == 0:
       continue
-    discard appendImportedCandidate(
-      localName,
-      module & "|" & identifierKey(binding.name),
-      memberCompletionKind(exports[0].kind),
-      prefixKey,
-      candidates,
-      candidateByName,
-      importedProviders,
-      ambiguousNames,
-    )
+    let provider = module & "|" & identifierKey(binding.name)
+    var appended = false
+    for candidate in stdlib.candidatesFor(binding.name, moduleBase(module), -1):
+      if not sameModule(candidate.module, module):
+        continue
+      if candidate.module.startsWith("std/") and candidate.name.startsWith("c_"):
+        continue
+      appended = true
+      discard appendImportedCandidate(
+        localName,
+        provider,
+        memberCompletionKind(exports[0].kind),
+        prefixKey,
+        candidates,
+        candidateByName,
+        importedProviders,
+        ambiguousNames,
+        candidate.signature,
+        candidate.documentation,
+      )
+    if not appended:
+      discard appendImportedCandidate(
+        localName,
+        provider,
+        memberCompletionKind(exports[0].kind),
+        prefixKey,
+        candidates,
+        candidateByName,
+        importedProviders,
+        ambiguousNames,
+      )
   true

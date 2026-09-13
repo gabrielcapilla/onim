@@ -1,5 +1,4 @@
 import ../index/source_index
-import ../session/workspace
 import ../session/workspace_models
 import ../syntax/tokens
 

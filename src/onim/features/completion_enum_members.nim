@@ -5,8 +5,6 @@ import ./completion_context
 import ./completion_models
 import ./completion_object_fields
 import ./definition_models
-import ../index/types
-import ../session/workspace
 import ../session/workspace_models
 import ../syntax/tokens
 
@@ -33,6 +31,8 @@ proc completeEnumMembers*(
     return
   candidates.sort(compareCompletion)
   result.state = completionAvailable
+  result.insertStart = context.insertStart
+  result.insertEnd = context.insertEnd
   result.replaceStart = context.replaceStart
   result.replaceEnd = context.replaceEnd
   result.items = newSeqOfCap[CompletionItem](candidates.len)

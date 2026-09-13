@@ -6,16 +6,18 @@ type
   UfcsFormalArityKind* = enum
     ufcsArityUnknown
     ufcsArityFixed
+    ufcsArityOptional
     ufcsArityVariable
 
   UfcsCallKind* = enum
     ufcsNotCall
     ufcsCallKnown
     ufcsCallUncertain
+    ufcsCallMalformed
 
 proc formalArityForScope*(
     tokens: TokenStore, scopes: ScopeIndex, scope: ScopeId
-): tuple[kind: UfcsFormalArityKind, count: uint32] =
+): tuple[kind: UfcsFormalArityKind, count, required: uint32] =
   result.kind = ufcsArityUnknown
   if scope == InvalidScopeId:
     return
@@ -24,6 +26,7 @@ proc formalArityForScope*(
       scopes.scopes[scopeOrdinal].kind != scopeRoutine or
       scopeUnsupportedHeader in scopes.uncertainty:
     return
+  var seenDefault = false
   for declaration in scopes.declarations:
     if declaration.scope != scope or declaration.kind != declarationParameter:
       continue
@@ -32,8 +35,16 @@ proc formalArityForScope*(
       return
     inc result.count
     var delimiters: seq[char] = @[]
+    var defaultToken = -1
+    var hasDefault = false
     for tokenIndex in int(declaration.firstToken) ..< int(declaration.pastToken):
       let token = tokens[tokenIndex]
+      if defaultToken >= 0 and tokenIndex > defaultToken:
+        if token.kind == tkPunctuation and tokens.tokenTextLen(token) == 1:
+          let value = tokens.tokenTextChar(token, 0)
+          if delimiters.len == 0 and value in {'=', ',', ';'}:
+            return
+        hasDefault = true
       if token.kind == tkPunctuation and tokens.tokenTextLen(token) == 1:
         let value = tokens.tokenTextChar(token, 0)
         if isOpeningDelimiter(value):
@@ -45,25 +56,37 @@ proc formalArityForScope*(
           delimiters.setLen(delimiters.len - 1)
           continue
         if delimiters.len == 0 and value == '=':
-          result.kind = ufcsArityVariable
-          return
+          if defaultToken >= 0:
+            return
+          defaultToken = tokenIndex
+          continue
       if delimiters.len == 0 and tokens.tokenTextEquals(token, "varargs"):
         result.kind = ufcsArityVariable
         return
     if delimiters.len > 0:
       return
-  result.kind = ufcsArityFixed
+    if defaultToken >= 0 and not hasDefault:
+      return
+    if hasDefault:
+      seenDefault = true
+    else:
+      if seenDefault:
+        result.kind = ufcsArityUnknown
+        return
+      inc result.required
+  result.kind =
+    if result.required == result.count: ufcsArityFixed else: ufcsArityOptional
 
 proc ufcsFormalArity*(
     tokens: TokenStore, scopes: ScopeIndex, first: LexicalDeclaration
-): tuple[kind: UfcsFormalArityKind, count: uint32] =
+): tuple[kind: UfcsFormalArityKind, count, required: uint32] =
   if first.kind != declarationParameter:
     return
   formalArityForScope(tokens, scopes, first.scope)
 
 proc routineFormalArity*(
     tokens: TokenStore, scopes: ScopeIndex, symbolIndex: int
-): tuple[kind: UfcsFormalArityKind, count: uint32] =
+): tuple[kind: UfcsFormalArityKind, count, required: uint32] =
   if symbolIndex < 0 or symbolIndex > int(high(uint32)):
     return
   for ordinal, scope in scopes.scopes:
@@ -80,6 +103,7 @@ proc ufcsCallArity*(
   result.kind = ufcsCallUncertain
   var delimiters = @['(']
   var hasArgument = false
+  var argumentCanEnd = false
   for tokenIndex in memberToken + 2 ..< tokens.len:
     let token = tokens[tokenIndex]
     if token.kind == tkPunctuation and tokens.tokenTextLen(token) == 1:
@@ -87,24 +111,46 @@ proc ufcsCallArity*(
       if isOpeningDelimiter(value):
         delimiters.add value
         hasArgument = true
+        argumentCanEnd = false
         continue
       if isClosingDelimiter(value):
         if delimiters.len == 0 or not matchingDelimiter(delimiters[^1], value):
           return
         delimiters.setLen(delimiters.len - 1)
         if delimiters.len == 0:
+          if hasArgument and not argumentCanEnd:
+            result.kind = ufcsCallMalformed
+            return
           if hasArgument:
             inc result.count
           elif result.count > 0:
             return
           result.kind = ufcsCallKnown
           return
+        hasArgument = true
+        argumentCanEnd = true
         continue
       if delimiters.len == 1 and value == ',':
         if not hasArgument:
           return
         inc result.count
         hasArgument = false
+        argumentCanEnd = false
         continue
+      if delimiters.len == 1 and value == '=':
+        result.kind = ufcsCallMalformed
+        return
     if delimiters.len == 1:
+      let canEnd =
+        token.kind in {tkNumber, tkString} or (
+          token.kind == tkIdentifier and
+          token.keyword notin {
+            kwAddr, kwAnd, kwAs, kwDiv, kwIn, kwIs, kwIsnot, kwMod, kwNot, kwOr, kwShl,
+            kwShr, kwWithout, kwXor,
+          }
+        )
+      if canEnd and hasArgument and argumentCanEnd:
+        result.kind = ufcsCallMalformed
+        return
       hasArgument = true
+      argumentCanEnd = canEnd

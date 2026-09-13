@@ -5,7 +5,6 @@ import ../session/ids
 import ../session/workspace
 import ../session/workspace_models
 import ../syntax/imports
-import ../syntax/import_queries
 import ../syntax/tokens
 import ./definition_models
 import ./definition_resolution_results
@@ -49,6 +48,51 @@ proc resolveQualified*(
       symbolMatches(view.index, member, exportedOnly = true),
       source.index.parsed.tokens,
       memberToken,
+    )
+    if matches.len > 1:
+      return unknownResolution(definitionAmbiguous)
+    for symbolIndex in matches:
+      let candidate = targetFor(source, view, symbolIndex)
+      if candidate.kind != definitionResolved:
+        return candidate
+      targets.addTarget(candidate.target)
+  if not matched:
+    return unknownResolution()
+  finishTargets(targets, unresolved)
+
+proc resolvePlainImport*(
+    workspace: Workspace, source: WorkspaceSnapshot, name: string, nameToken = -1
+): DefinitionResolution =
+  var targets: seq[DefinitionTarget] = @[]
+  var matched = false
+  var unresolved = false
+  for item in source.index.parsed.imports:
+    if item.form != importModule or item.synthetic or item.alias.len > 0:
+      continue
+    case source.index.parsed.conditionalImportDisposition(item)
+    of importConditionalInactive:
+      continue
+    of importConditionalUnknown:
+      return unknownResolution()
+    of importUnconditional, importConditionalActive:
+      discard
+    if excludedImport(item, name):
+      continue
+    let moduleId = workspace.resolveModule(source.fileId, item.module)
+    if not moduleId.valid:
+      if not item.module.startsWith("std/"):
+        unresolved = true
+      continue
+    matched = true
+    let view = workspace.indexViewForFile(moduleId)
+    if not view.valid or view.index == nil:
+      unresolved = true
+      continue
+    let matches = filterRoutineMatches(
+      view.index,
+      symbolMatches(view.index, name, exportedOnly = true),
+      source.index.parsed.tokens,
+      nameToken,
     )
     if matches.len > 1:
       return unknownResolution(definitionAmbiguous)

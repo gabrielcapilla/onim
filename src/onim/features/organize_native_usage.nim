@@ -1,4 +1,4 @@
-import std/[sets, strutils]
+import std/sets
 
 import ../index/bindings
 import ../index/scopes
@@ -10,7 +10,6 @@ import ../session/module_catalog
 import ../stdlib/map
 import ../stdlib/map_resolution
 import ../syntax/imports
-import ../syntax/import_queries
 import ../syntax/module_names
 import ../syntax/tokens
 
@@ -307,7 +306,7 @@ proc nativeModuleUsed*(
       return nativeModuleUseUnknown
     if binding == nativeNoBinding:
       let use =
-        if module.startsWith("std/"):
+        if stdlib.knownModule(module):
           nativeUnqualifiedUse(stdlib, name, module)
         else:
           nativeProjectModuleUse(project, catalog, owner, name, module)

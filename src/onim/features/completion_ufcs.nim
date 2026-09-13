@@ -6,7 +6,6 @@ import ./definition
 import ./definition_models
 import ../index/source_index
 import ../index/symbols
-import ../index/types
 import ../index/type_states
 import ../session/ids
 import ../session/workspace
