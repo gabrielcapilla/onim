@@ -26,6 +26,10 @@ tests/tparser
 tests/treferences
 tests/trename
 tests/tstdlibmap
+tests/tharness
+tests/tfeature_harness
+tests/tinvariants
+tests/tsyntax
 *.onim-*.nim
 gen_stdlib_map
 stdlib_map.json

@@ -11,7 +11,10 @@ Requirements: Nim 2.2 or newer, Nimble, and `nph` for formatting Nim files.
 ```sh
 nimble build
 nimble test
+nimble zedCheck
 ```
+
+`nimble zedCheck` verifies the reproducible Linux organizer/formatter preflight; a clean Zed GUI session remains a manual acceptance step.
 
 The executable is `onim`. Running it with a file applies organize-imports edits:
 
@@ -58,6 +61,8 @@ Merge these keys into `~/.config/zed/settings.json` and keep the existing `nph` 
 - [Usage and supported behavior](docs/usage.md)
 - [Architecture](docs/architecture.md)
 - [Capabilities and measurements](docs/capabilities.md)
+- [Acceptance matrix](docs/acceptance.md)
+- [Testing](docs/testing.md)
 - [Development](docs/development.md)
 - [Known limitations](docs/known-limitations.md)
 

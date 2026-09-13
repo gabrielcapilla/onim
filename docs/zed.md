@@ -15,7 +15,8 @@ Add or merge the following settings in `~/.config/zed/settings.json`:
         "arguments": []
       },
       "initialization_options": {
-        "useStdPrefix": true
+        "useStdPrefix": true,
+        "opinionatedHints": true
       }
     }
   },
@@ -30,6 +31,14 @@ Add or merge the following settings in `~/.config/zed/settings.json`:
   }
 }
 ```
+
+Zed controls whether hints are visible; add this top-level setting if needed:
+
+```json
+"inlay_hints": {"enabled": true}
+```
+
+`opinionatedHints` is optional. When enabled, Onim displays narrow integer suggestions for bare literals (`99` → `uint8`, `-872048` → `int32`). It does not change Nim's semantic type, and explicit annotations do not receive a duplicate hint. Omit it to display Nim's inferred type (`int`).
 
 Use the absolute path produced by `nimble build`, or use an installed absolute path such as `/home/user/.local/bin/onim`. The `arguments` field is the Zed setting name; `args` is not used by the current extension launcher.
 

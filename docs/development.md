@@ -72,7 +72,7 @@ After closing the Zed workspace, verify that no Onim process remains:
 pgrep -af '(^|/)onim( |$)' || true
 ```
 
-The report is actionable only when it includes the client sequence and the corresponding trace. Convert that sequence into a focused `tests/tlsp.nim` replay before changing runtime behavior; an unreproduced report is not evidence for a speculative fix.
+ The report is actionable only when it includes the client sequence and the corresponding trace. Convert that sequence into a focused `tests/protocol/tlsp.nim` replay before changing runtime behavior; an unreproduced report is not evidence for a speculative fix.
 
 ## Source layout
 
