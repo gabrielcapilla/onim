@@ -33,7 +33,7 @@ type
 
 const
   stdlibBinaryMagic = "ONIMBIN1"
-  stdlibBinaryVersion = 2'u32
+  stdlibBinaryVersion = 3'u32
 
 proc binaryFingerprint(value: string): uint64 =
   var resultValue = 14695981039346656037'u64
@@ -87,6 +87,19 @@ proc writeStdlibBinary(root: JsonNode, outputPath: string) =
   var moduleSet = initTable[string, bool]()
   for module in json.keys(root["modules"]):
     moduleSet[module] = true
+
+  var moduleDocumentation = initTable[string, string]()
+  if root.hasKey("moduleDocumentation"):
+    if root["moduleDocumentation"].kind != JObject:
+      raise newException(ValueError, "stdlib module documentation is not an object")
+    for module in root["moduleDocumentation"].keys:
+      if root["moduleDocumentation"][module].kind != JString:
+        raise newException(ValueError, "stdlib module documentation is not a string")
+      if not moduleSet.hasKey(module):
+        raise newException(
+          ValueError, "stdlib module documentation names an unknown module"
+        )
+      moduleDocumentation[module] = root["moduleDocumentation"][module].getStr
 
   var implicitModules: seq[string] = @[]
   for item in root["implicitModules"].items:
@@ -146,6 +159,7 @@ proc writeStdlibBinary(root: JsonNode, outputPath: string) =
   var pool = BinaryStringPool(ids: initTable[string, uint32]())
   for module in moduleNames:
     discard pool.poolId(module)
+    discard pool.poolId(moduleDocumentation.getOrDefault(module, ""))
   for module in implicitModules:
     discard pool.poolId(module)
   for symbol in symbols:
@@ -180,6 +194,7 @@ proc writeStdlibBinary(root: JsonNode, outputPath: string) =
   payload.add blob
   for module in moduleNames:
     payload.appendUint32(pool.ids[module])
+    payload.appendUint32(pool.ids[moduleDocumentation.getOrDefault(module, "")])
   for module in implicitModules:
     payload.appendUint32(pool.ids[module])
   for symbol in symbols:
@@ -350,14 +365,20 @@ proc generate*(config: GeneratorConfig): bool =
   files.sort
 
   var modules = initTable[string, bool]()
+  var moduleDocumentation = initTable[string, string]()
   var symbols = initTable[string, seq[JsonNode]]()
   var documented = 0
   for filePath in files:
     let module = moduleName(config.libPath, filePath)
     modules[module] = true
     let docs = documentation(config.nimExe, filePath)
-    if docs == nil or docs.kind != JObject or not docs.hasKey("entries") or
-        docs["entries"].kind != JArray:
+    if docs == nil or docs.kind != JObject:
+      continue
+    if docs.hasKey("moduleDescription") and docs["moduleDescription"].kind == JString:
+      let description = docs["moduleDescription"].getStr
+      if description.len > 0:
+        moduleDocumentation[module] = description
+    if not docs.hasKey("entries") or docs["entries"].kind != JArray:
       continue
     inc documented
     for entry in docs["entries"].items:
@@ -397,6 +418,11 @@ proc generate*(config: GeneratorConfig): bool =
   moduleNames.sort
   for module in moduleNames:
     root["modules"][module] = %true
+
+  root["moduleDocumentation"] = newJObject()
+  for module in moduleNames:
+    if moduleDocumentation.hasKey(module):
+      root["moduleDocumentation"][module] = %moduleDocumentation[module]
 
   root["symbols"] = newJObject()
   var symbolNames = toSeq(tables.keys(symbols))

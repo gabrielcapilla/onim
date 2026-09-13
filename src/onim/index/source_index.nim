@@ -88,6 +88,39 @@ proc ordinaryReference(index: SourceIndex, tokenIndex: int): bool =
 proc includeReference(index: SourceIndex, tokenIndex: int): bool =
   tokenIndex > 0 and index.parsed.tokens[tokenIndex - 1].isKeyword(kwInclude)
 
+proc referenceOnlyConditional*(index: SourceIndex, tokenIndex: int): bool =
+  if index == nil or tokenIndex < 0 or tokenIndex >= index.parsed.tokens.len:
+    return false
+  for node in index.syntax.nodes:
+    let first = int(node.firstToken)
+    let past = int(node.pastToken)
+    if node.kind != syntaxWhen or first != tokenIndex or node.uncertainty != {} or
+        past <= first or past > index.parsed.tokens.len:
+      continue
+    var colon = -1
+    var conditionTokens = 0
+    for cursor in first + 1 ..< past:
+      if index.parsed.tokens.tokenTextEquals(index.parsed.tokens[cursor], ":"):
+        colon = cursor
+        break
+      if index.parsed.tokens[cursor].kind != tkIdentifier or
+          not index.parsed.tokens.tokenTextEquals(
+            index.parsed.tokens[cursor], "isMainModule"
+          ):
+        return false
+      inc conditionTokens
+    if colon < 0 or conditionTokens != 1:
+      return false
+    for cursor in colon + 1 ..< past:
+      let token = index.parsed.tokens[cursor]
+      if token.hasKeywordRole(roleDeclaration) or token.hasKeywordRole(roleImport) or
+          token.hasKeywordRole(roleFrom) or token.hasKeywordRole(roleInclude) or
+          token.hasKeywordRole(roleExport) or token.hasKeywordRole(roleGenerated) or
+          token.hasKeywordRole(roleConditional):
+        return false
+    return true
+  false
+
 proc moduleAliasesSafe(info: SourceImports): bool =
   var aliases = initHashSet[string]()
   var hasAlias = false
@@ -139,6 +172,12 @@ proc deriveNativeIndexSafety(
     case reason
     of uncertaintyNestedScope, uncertaintyDeclarationOrder:
       discard
+    of uncertaintyConditional:
+      for tokenIndex, token in info.tokens:
+        if token.hasKeywordRole(roleConditional) and
+            info.conditionalTokenDisposition(token) == importConditionalUnknown and
+            not index.referenceOnlyConditional(tokenIndex):
+          return nativeSafetyRejected
     of uncertaintyUnsupportedSyntax:
       for tokenIndex, token in index.parsed.tokens:
         if info.tokenInsideImport(token):

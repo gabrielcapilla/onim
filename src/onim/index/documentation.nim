@@ -89,3 +89,45 @@ proc documentationForDeclaration*(tokens: TokenStore, nameToken: uint32): string
     return bodyDocumentation(source, declarationIndent, declarationStart)
   lines.reverse
   lines.join("\n")
+
+proc moduleDocumentationLine(line: string): tuple[valid: bool, text: string] =
+  var start = 0
+  if line.len >= 3 and ord(line[0]) == 0xEF and ord(line[1]) == 0xBB and
+      ord(line[2]) == 0xBF:
+    start = 3
+  if start + 2 > line.len or line[start ..< start + 2] != "##":
+    return
+  start += 2
+  if start < line.len and line[start] == ' ':
+    inc start
+  result.valid = true
+  result.text = line[start ..< line.len].strip
+
+proc documentationForModule*(tokens: TokenStore): string =
+  let source = tokens.sourceText
+  if source.len == 0:
+    return
+  let firstCodeOffset =
+    if tokens.len > 0:
+      max(0, min(source.len, tokens[0].startOffset))
+    else:
+      source.len
+  var current = 0
+  var sawDocumentation = false
+  var lines: seq[string] = @[]
+  while current < firstCodeOffset:
+    let past = lineEnd(source, current)
+    let line = source[current ..< past]
+    let trimmed = line.strip
+    if trimmed.len == 0 or (trimmed[0] == '#' and not trimmed.startsWith("##")):
+      if sawDocumentation and trimmed.len > 0:
+        break
+      current = nextLineStart(source, past)
+      continue
+    let documentation = moduleDocumentationLine(line)
+    if not documentation.valid:
+      break
+    sawDocumentation = true
+    lines.add documentation.text
+    current = nextLineStart(source, past)
+  lines.join("\n")

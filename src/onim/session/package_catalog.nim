@@ -2,6 +2,7 @@ import std/[algorithm, os, strutils]
 
 import ../syntax/tokens
 import ../syntax/lexer
+import ./discovery_budget
 import ./paths
 
 type
@@ -32,6 +33,8 @@ type
     name: string
     operator: string
     version: string
+
+  PackageCancellation = proc(): bool {.gcsafe.}
 
 proc addUnique(values: var seq[string], value: string) =
   if value.len == 0:
@@ -216,14 +219,38 @@ proc packageFromManifest(
   result.state = requirementValid
 
 proc packageCandidates(
-    requirement: NimbleRequirement
-): tuple[state: RequirementState, candidates: seq[NimblePackage]] =
+    requirement: NimbleRequirement,
+    budget: var DiscoveryBudget,
+    cancellation: PackageCancellation,
+): tuple[
+  state: RequirementState,
+  candidates: seq[NimblePackage],
+  cancelled: bool,
+  limited: bool,
+] =
   result.state = requirementValid
   let store = nimbleStore()
   if not dirExists(store):
     return
   try:
     for kind, path in walkDir(store):
+      if cancellation != nil and cancellation():
+        result.cancelled = true
+        return
+      if not budget.admitEntry():
+        result.limited = true
+        return
+      case kind
+      of pcDir:
+        if not budget.admitDirectory():
+          result.limited = true
+          return
+      of pcFile:
+        if not budget.admitFile():
+          result.limited = true
+          return
+      else:
+        discard
       if kind != pcDir:
         continue
       let configPath = path / (requirement.name & ".nimble")
@@ -238,22 +265,31 @@ proc packageCandidates(
           ):
         result.candidates.add candidate.package
   except CatchableError:
-    result = (requirementInvalid, @[])
+    result.state = requirementInvalid
+    result.candidates.setLen(0)
   if result.state == requirementInvalid:
     return
   result.state = requirementValid
 
-proc resolveRequirement(requirement: NimbleRequirement): NimblePackageResolution =
-  result.name = requirement.name
-  let available = packageCandidates(requirement)
+proc resolveRequirement(
+    requirement: NimbleRequirement,
+    budget: var DiscoveryBudget,
+    cancellation: PackageCancellation,
+): tuple[value: NimblePackageResolution, cancelled: bool, limited: bool] =
+  result.value.name = requirement.name
+  let available = packageCandidates(requirement, budget, cancellation)
+  result.cancelled = available.cancelled
+  result.limited = available.limited
+  if result.cancelled or result.limited:
+    return
   if available.state == requirementInvalid:
-    result.kind = packageUnknown
+    result.value.kind = packageUnknown
     return
-  result.candidates = available.candidates
-  if result.candidates.len == 0:
-    result.kind = packageMissing
+  result.value.candidates = available.candidates
+  if result.value.candidates.len == 0:
+    result.value.kind = packageMissing
     return
-  result.candidates.sort(
+  result.value.candidates.sort(
     proc(left, right: NimblePackage): int =
       let byVersion = compareVersions(right.version, left.version)
       if byVersion != 0:
@@ -261,43 +297,111 @@ proc resolveRequirement(requirement: NimbleRequirement): NimblePackageResolution
       else:
         cmp(left.root, right.root)
   )
-  let best = result.candidates[0]
-  if result.candidates.len > 1 and
-      compareVersions(best.version, result.candidates[1].version) == 0:
-    result.kind = packageAmbiguous
+  let best = result.value.candidates[0]
+  if result.value.candidates.len > 1 and
+      compareVersions(best.version, result.value.candidates[1].version) == 0:
+    result.value.kind = packageAmbiguous
     return
-  result.kind = packageResolved
-  result.selected = best
+  result.value.kind = packageResolved
+  result.value.selected = best
 
-proc declaredNimblePackages*(root: string): seq[NimblePackageResolution] =
+proc declaredNimblePackagesBounded(
+    root: string, budget: var DiscoveryBudget, cancellation: PackageCancellation
+): tuple[values: seq[NimblePackageResolution], cancelled: bool, limited: bool] =
   let canonicalRoot = canonicalPath(root)
   if canonicalRoot.len == 0 or not dirExists(canonicalRoot):
     return
   try:
     for kind, path in walkDir(canonicalRoot):
+      if cancellation != nil and cancellation():
+        result.cancelled = true
+        return
+      if not budget.admitEntry():
+        result.limited = true
+        return
+      case kind
+      of pcDir:
+        if not budget.admitDirectory():
+          result.limited = true
+          return
+      of pcFile:
+        if not budget.admitFile():
+          result.limited = true
+          return
+      else:
+        discard
       if kind != pcFile or not path.toLowerAscii.endsWith(".nimble"):
         continue
       let requirements = declaredRequirements(path)
       if requirements.state != requirementValid:
-        result.add NimblePackageResolution(kind: packageUnknown)
+        result.values.add NimblePackageResolution(kind: packageUnknown)
         continue
       for requirement in requirements.values:
-        result.add resolveRequirement(requirement)
+        let resolution = resolveRequirement(requirement, budget, cancellation)
+        if resolution.cancelled or resolution.limited:
+          result.cancelled = resolution.cancelled
+          result.limited = resolution.limited
+          return
+        result.values.add resolution.value
   except CatchableError:
-    result.setLen(0)
+    result.values.setLen(0)
+
+proc declaredNimblePackages*(root: string): seq[NimblePackageResolution] =
+  var budget = initDiscoveryBudget()
+  let scanned = declaredNimblePackagesBounded(root, budget, nil)
+  if scanned.cancelled or scanned.limited:
+    return
+  scanned.values
 
 proc nimbleDependencyRoots*(root: string): seq[string] =
   for resolution in declaredNimblePackages(root):
     if resolution.kind == packageResolved:
       result.add resolution.selected.sourceRoot
 
-proc nimbleDependencySources*(root: string): seq[string] =
-  for sourceRoot in nimbleDependencyRoots(root):
-    try:
-      for path in walkDirRec(sourceRoot):
-        if fileExists(path) and path.toLowerAscii.endsWith(".nim"):
-          addUnique(result, canonicalPath(path))
-    except CatchableError:
-      result.setLen(0)
+proc nimbleDependencySourcesBounded*(
+    root: string, budget: var DiscoveryBudget, cancellation: proc(): bool {.gcsafe.}
+): tuple[paths: seq[string], cancelled: bool, limited: bool] =
+  let packages = declaredNimblePackagesBounded(root, budget, cancellation)
+  if packages.cancelled or packages.limited:
+    result.cancelled = packages.cancelled
+    result.limited = packages.limited
+    return
+  for resolution in packages.values:
+    if resolution.kind != packageResolved:
+      continue
+    let sourceRoot = resolution.selected.sourceRoot
+    if cancellation != nil and cancellation():
+      result.cancelled = true
       return
-  result.sort
+    if not budget.admitDirectory():
+      result.limited = true
+      return
+    try:
+      for path in walkDirRec(sourceRoot, yieldFilter = {pcFile, pcDir}):
+        if cancellation != nil and cancellation():
+          result.cancelled = true
+          return
+        if not budget.admitEntry():
+          result.limited = true
+          return
+        if dirExists(path):
+          if not budget.admitDirectory():
+            result.limited = true
+            return
+        elif fileExists(path):
+          if not budget.admitFile():
+            result.limited = true
+            return
+          if path.toLowerAscii.endsWith(".nim"):
+            addUnique(result.paths, canonicalPath(path))
+    except CatchableError:
+      result.paths.setLen(0)
+      return
+  result.paths.sort
+
+proc nimbleDependencySources*(root: string): seq[string] =
+  var budget = initDiscoveryBudget()
+  let scanned = nimbleDependencySourcesBounded(root, budget, nil)
+  if scanned.cancelled or scanned.limited:
+    return
+  scanned.paths

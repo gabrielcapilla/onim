@@ -1,6 +1,7 @@
 import std/[algorithm, os, sets, strutils, tables]
 
 import ../index/cache
+import ./discovery_budget
 import ./package_catalog
 import ./paths
 
@@ -26,6 +27,7 @@ type
     discoveryAttemptRunning
     discoveryAttemptCancelled
     discoveryAttemptFailed
+    discoveryAttemptLimited
     discoveryAttemptUnstable
 
   DiscoveryState = object
@@ -37,6 +39,7 @@ type
     changedDirectories: seq[string]
     outputDirectories: Table[string, FileStamp]
     outputFiles: HashSet[string]
+    budget: DiscoveryBudget
     output: DiscoveryResult
     attempt: DiscoveryAttemptState
 
@@ -63,11 +66,21 @@ proc markFailed(state: var DiscoveryState, path: string) {.inline.} =
   state.attempt = discoveryAttemptFailed
   state.output.errorPath = path
 
-proc addDirectory(state: var DiscoveryState, path: string, stamp: FileStamp) =
+proc addDirectory(state: var DiscoveryState, path: string, stamp: FileStamp): bool =
+  if not state.outputDirectories.hasKey(path) and not state.budget.admitDirectory():
+    state.attempt = discoveryAttemptLimited
+    state.output.errorPath = path
+    return false
   state.outputDirectories[path] = stamp
+  true
 
-proc addFile(state: var DiscoveryState, path: string) =
+proc addFile(state: var DiscoveryState, path: string): bool =
+  if not state.outputFiles.contains(path) and not state.budget.admitFile():
+    state.attempt = discoveryAttemptLimited
+    state.output.errorPath = path
+    return false
   state.outputFiles.incl path
+  true
 
 proc subtreeChanged(state: DiscoveryState, directory: string): bool {.inline.} =
   for changed in state.changedDirectories:
@@ -93,11 +106,13 @@ proc restoreSubtree(state: var DiscoveryState, directory: string): bool {.gcsafe
     ):
       state.markFailed(path)
       return false
-    state.addDirectory(path, state.currentStamps[path])
+    if not state.addDirectory(path, state.currentStamps[path]):
+      return false
     inc state.output.directoriesReused
   for path in state.oldFiles:
     if pathWithin(directory, path):
-      state.addFile(path)
+      if not state.addFile(path):
+        return false
   true
 
 proc scanDirectory(state: var DiscoveryState, directory: string): bool {.gcsafe.}
@@ -115,7 +130,8 @@ proc rebuildSubtree(state: var DiscoveryState, directory: string): bool {.gcsafe
   if not state.currentStamps.hasKey(directory):
     state.markFailed(directory)
     return false
-  state.addDirectory(directory, state.currentStamps[directory])
+  if not state.addDirectory(directory, state.currentStamps[directory]):
+    return false
   inc state.output.directoriesReused
   for path, _ in state.oldDirectories:
     if path == directory or not pathWithin(directory, path):
@@ -129,7 +145,8 @@ proc rebuildSubtree(state: var DiscoveryState, directory: string): bool {.gcsafe
       return false
   for path in state.oldFiles:
     if parentDir(path) == directory:
-      state.addFile(path)
+      if not state.addFile(path):
+        return false
   true
 
 proc scanDirectory(state: var DiscoveryState, directory: string): bool {.gcsafe.} =
@@ -142,12 +159,17 @@ proc scanDirectory(state: var DiscoveryState, directory: string): bool {.gcsafe.
   if not usableStamp(before):
     state.markFailed(directory)
     return false
-  state.addDirectory(directory, before)
+  if not state.addDirectory(directory, before):
+    return false
   inc state.output.directoriesVisited
   try:
     for kind, rawPath in walkDir(directory):
       if shouldCancel(state.cancellation):
         state.markCancelled()
+        return false
+      if not state.budget.admitEntry():
+        state.attempt = discoveryAttemptLimited
+        state.output.errorPath = directory
         return false
       inc state.output.entriesExamined
       let path = canonicalPath(rawPath)
@@ -165,7 +187,8 @@ proc scanDirectory(state: var DiscoveryState, directory: string): bool {.gcsafe.
           return false
       of pcFile:
         if nimSourcePath(path):
-          state.addFile(path)
+          if not state.addFile(path):
+            return false
       else:
         discard
   except CatchableError:
@@ -209,7 +232,7 @@ proc finish(state: DiscoveryState): DiscoveryResult {.gcsafe.} =
   result.status = discoveryComplete
 
 proc initState(
-    root: string, cancellation: DiscoveryCancellation
+    root: string, cancellation: DiscoveryCancellation, budget: DiscoveryBudget
 ): DiscoveryState {.gcsafe.} =
   result.root = root
   result.cancellation = cancellation
@@ -218,27 +241,53 @@ proc initState(
   result.currentStamps = initTable[string, FileStamp]()
   result.outputDirectories = initTable[string, FileStamp]()
   result.outputFiles = initHashSet[string]()
+  result.budget = budget
   result.attempt = discoveryAttemptRunning
   result.output.errorPath = root
 
 proc fullDiscovery(
-    root: string, cancellation: DiscoveryCancellation
-): DiscoveryResult {.gcsafe.} =
+    root: string, cancellation: DiscoveryCancellation, budget: DiscoveryBudget
+): tuple[value: DiscoveryResult, budget: DiscoveryBudget] {.gcsafe.} =
   for _ in 0 .. 1:
-    var state = initState(root, cancellation)
+    var state = initState(root, cancellation, budget)
     if state.scanDirectory(root):
-      return state.finish()
+      result.value = state.finish()
+      result.budget = state.budget
+      return
     if state.attempt == discoveryAttemptCancelled:
-      return state.finish()
+      result.value = state.finish()
+      result.budget = state.budget
+      return
     if state.attempt != discoveryAttemptUnstable:
-      return state.finish()
-  result.status = discoveryFailed
-  result.errorPath = root
+      result.value = state.finish()
+      result.budget = state.budget
+      return
+  result.value.status = discoveryFailed
+  result.value.errorPath = root
+  result.budget = budget
 
-proc appendNimbleSources(root: string, result: var DiscoveryResult) =
+proc appendNimbleSources(
+    root: string,
+    result: var DiscoveryResult,
+    budget: var DiscoveryBudget,
+    cancellation: DiscoveryCancellation,
+) =
   if result.status != discoveryComplete:
     return
-  for path in nimbleDependencySources(root):
+  let dependencies = nimbleDependencySourcesBounded(root, budget, cancellation)
+  if dependencies.cancelled:
+    result.status = discoveryCancelled
+    result.errorPath = root
+    result.paths.setLen(0)
+    result.directories.setLen(0)
+    return
+  if dependencies.limited:
+    result.status = discoveryFailed
+    result.errorPath = root
+    result.paths.setLen(0)
+    result.directories.setLen(0)
+    return
+  for path in dependencies.paths:
     var present = false
     for existing in result.paths:
       if existing == path:
@@ -249,11 +298,17 @@ proc appendNimbleSources(root: string, result: var DiscoveryResult) =
   result.paths.sort
 
 proc prepareWarmState(
-    root: string, previous: ProjectManifest, cancellation: DiscoveryCancellation
+    root: string,
+    previous: ProjectManifest,
+    cancellation: DiscoveryCancellation,
+    budget: DiscoveryBudget,
 ): tuple[available: bool, state: DiscoveryState] {.gcsafe.} =
-  result.state = initState(root, cancellation)
+  result.state = initState(root, cancellation, budget)
   if not previous.discoveryValid or previous.root != root or
       previous.directories.len == 0:
+    return
+  if previous.directories.len > int(budget.capacity) or
+      previous.entries.len > int(budget.capacity):
     return
   var hasRoot = false
   for directory in previous.directories:
@@ -287,30 +342,44 @@ proc prepareWarmState(
   result.available = true
 
 proc incrementalDiscovery(
-    root: string, previous: ProjectManifest, cancellation: DiscoveryCancellation
-): tuple[available: bool, value: DiscoveryResult] {.gcsafe.} =
-  let prepared = prepareWarmState(root, previous, cancellation)
+    root: string,
+    previous: ProjectManifest,
+    cancellation: DiscoveryCancellation,
+    budget: DiscoveryBudget,
+): tuple[available: bool, value: DiscoveryResult, budget: DiscoveryBudget] {.gcsafe.} =
+  let prepared = prepareWarmState(root, previous, cancellation, budget)
   if not prepared.available:
     return
   if prepared.state.attempt == discoveryAttemptCancelled:
     result.available = true
     result.value = prepared.state.finish()
+    result.budget = prepared.state.budget
     return
   var state = prepared.state
   if state.changedDirectories.len == 0:
-    discard state.restoreSubtree(root)
-    result.available = true
-    result.value = state.finish()
+    if state.restoreSubtree(root):
+      result.available = true
+      result.value = state.finish()
+      result.budget = state.budget
+    elif state.attempt in {discoveryAttemptCancelled, discoveryAttemptLimited}:
+      result.available = true
+      result.value = state.finish()
+      result.budget = state.budget
     return
   if state.rebuildSubtree(root):
     result.available = true
     result.value = state.finish()
-  elif state.attempt == discoveryAttemptCancelled:
+    result.budget = state.budget
+  elif state.attempt in {discoveryAttemptCancelled, discoveryAttemptLimited}:
     result.available = true
     result.value = state.finish()
+    result.budget = state.budget
 
-proc discoverSources*(
-    root: string, previous: ProjectManifest, cancellation: DiscoveryCancellation = nil
+proc discoverSourcesWithBudget(
+    root: string,
+    previous: ProjectManifest,
+    cancellation: DiscoveryCancellation,
+    budget: DiscoveryBudget,
 ): DiscoveryResult {.gcsafe.} =
   let canonicalRoot = canonicalPath(root)
   if canonicalRoot.len == 0 or not dirExists(canonicalRoot):
@@ -321,15 +390,32 @@ proc discoverSources*(
     result.status = discoveryCancelled
     result.errorPath = canonicalRoot
     return
-  let incremental = incrementalDiscovery(canonicalRoot, previous, cancellation)
+  let incremental = incrementalDiscovery(canonicalRoot, previous, cancellation, budget)
   if incremental.available:
-    if incremental.value.status == discoveryComplete or
-        incremental.value.status == discoveryCancelled:
-      result = incremental.value
-      appendNimbleSources(canonicalRoot, result)
-      return
-  result = fullDiscovery(canonicalRoot, cancellation)
-  appendNimbleSources(canonicalRoot, result)
+    result = incremental.value
+    if result.status == discoveryComplete:
+      var updatedBudget = incremental.budget
+      appendNimbleSources(canonicalRoot, result, updatedBudget, cancellation)
+    return
+  let cold = fullDiscovery(canonicalRoot, cancellation, budget)
+  result = cold.value
+  if result.status == discoveryComplete:
+    var updatedBudget = cold.budget
+    appendNimbleSources(canonicalRoot, result, updatedBudget, cancellation)
+
+proc discoverSources*(
+    root: string, previous: ProjectManifest, cancellation: DiscoveryCancellation = nil
+): DiscoveryResult {.gcsafe.} =
+  discoverSourcesWithBudget(root, previous, cancellation, initDiscoveryBudget())
+
+when defined(onimTest):
+  proc discoverSourcesWithLimit*(
+      root: string,
+      previous: ProjectManifest,
+      limit: uint32,
+      cancellation: DiscoveryCancellation = nil,
+  ): DiscoveryResult {.gcsafe.} =
+    discoverSourcesWithBudget(root, previous, cancellation, initDiscoveryBudget(limit))
 
 proc discoverSources*(
     root: string, cancellation: DiscoveryCancellation = nil

@@ -63,13 +63,14 @@ proc bindingsReady*(index: SourceIndex): bool =
     if reason != scopeConditional:
       return false
   if scopeConditional in index.scopes.uncertainty:
-    for token in index.parsed.tokens:
+    for tokenIndex, token in index.parsed.tokens:
       if token.hasKeywordRole(roleConditional) and
-          index.parsed.conditionalTokenDisposition(token) == importConditionalUnknown:
+          index.parsed.conditionalTokenDisposition(token) == importConditionalUnknown and
+          not index.referenceOnlyConditional(tokenIndex):
         return false
   for reason in index.occurrences.uncertainty:
     case reason
-    of uncertaintyNestedScope, uncertaintyDeclarationOrder:
+    of uncertaintyNestedScope, uncertaintyDeclarationOrder, uncertaintyConditional:
       discard
     of uncertaintyUnsupportedSyntax:
       for tokenIndex, token in index.parsed.tokens:
@@ -86,20 +87,12 @@ proc bindingsReady*(index: SourceIndex): bool =
       return false
   true
 
-proc resolveBinding*(index: SourceIndex, tokenIndex: uint32): BindingResolution =
+proc resolveBindingAtName*(
+    index: SourceIndex, tokenIndex: uint32, name: string
+): BindingResolution =
   if not index.bindingsReady or tokenIndex >= uint32(index.parsed.tokens.len):
     return
-  let token = index.parsed.tokens[int(tokenIndex)]
-  if token.kind != tkIdentifier or not validIdentifier(token) or isNimKeyword(token) or
-      index.parsed.tokenInsideImport(token):
-    return
-  let declarationIndex = index.declarationIndexAt(tokenIndex)
-  if declarationIndex >= 0:
-    if index.hasDuplicateDeclaration(declarationIndex):
-      return ambiguous()
-    return resolved(tokenIndex)
-
-  let wanted = identifierKey(index.parsed.tokens, token)
+  let wanted = identifierKey(name)
   if wanted.len == 0:
     return
   var scope = index.scopes.innermostScopeAt(tokenIndex)
@@ -117,6 +110,46 @@ proc resolveBinding*(index: SourceIndex, tokenIndex: uint32): BindingResolution 
     if found != InvalidBindingToken:
       return resolved(found)
     scope = index.scopes.parentScope(scope)
+
+proc resolveBinding*(index: SourceIndex, tokenIndex: uint32): BindingResolution =
+  if not index.bindingsReady or tokenIndex >= uint32(index.parsed.tokens.len):
+    return
+  let token = index.parsed.tokens[int(tokenIndex)]
+  if token.kind != tkIdentifier or not validIdentifier(token) or isNimKeyword(token) or
+      index.parsed.tokenInsideImport(token):
+    return
+  let declarationIndex = index.declarationIndexAt(tokenIndex)
+  if declarationIndex >= 0:
+    if index.hasDuplicateDeclaration(declarationIndex):
+      return ambiguous()
+    return resolved(tokenIndex)
+
+  index.resolveBindingAtName(tokenIndex, index.parsed.tokens.tokenText(token))
+
+proc resolveModuleValueBinding*(
+    index: SourceIndex, tokenIndex: uint32
+): BindingResolution =
+  if index == nil or not index.bindingsReady or
+      tokenIndex >= uint32(index.parsed.tokens.len):
+    return
+  let token = index.parsed.tokens[int(tokenIndex)]
+  if token.kind != tkIdentifier or not validIdentifier(token) or isNimKeyword(token) or
+      index.parsed.tokenInsideImport(token):
+    return
+  let wanted = identifierKey(index.parsed.tokens, token)
+  var found = InvalidBindingToken
+  for symbol in index.symbols:
+    if symbol.kind notin {symbolVar, symbolLet, symbolConst} or
+        symbol.nameToken >= tokenIndex:
+      continue
+    if identifierKey(index.parsed.tokens, index.parsed.tokens[int(symbol.nameToken)]) !=
+        wanted:
+      continue
+    if found != InvalidBindingToken:
+      return ambiguous()
+    found = symbol.nameToken
+  if found != InvalidBindingToken:
+    result = resolved(found)
 
 proc inRoutineScope*(index: SourceIndex, tokenIndex: uint32): bool =
   if index == nil or tokenIndex >= uint32(index.parsed.tokens.len):

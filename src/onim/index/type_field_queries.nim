@@ -1,4 +1,3 @@
-import ./types
 import ./type_index_models
 
 proc objectFieldOrdinal*(index: TypeIndex, nameToken: uint32): int {.inline.} =

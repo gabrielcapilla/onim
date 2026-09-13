@@ -100,6 +100,107 @@ proc numericLiteralKind*(tokens: TokenStore, token: Token): TypeKind =
       return typeFloat
   typeInt
 
+type IntegerLiteralSign = enum
+  integerLiteralInvalid
+  integerLiteralNonNegative
+  integerLiteralNegative
+
+proc integerDigit(character: char): int8 {.inline.} =
+  if character in {'0' .. '9'}:
+    return int8(ord(character) - ord('0'))
+  if character in {'a' .. 'f'}:
+    return int8(ord(character) - ord('a') + 10)
+  if character in {'A' .. 'F'}:
+    return int8(ord(character) - ord('A') + 10)
+  -1
+
+proc parseIntegerToken(
+    tokens: TokenStore, token: Token
+): tuple[sign: IntegerLiteralSign, magnitude: uint64] =
+  let length = tokens.tokenTextLen(token)
+  if length == 0:
+    return
+  for index in 0 ..< length:
+    if tokens.tokenTextChar(token, index) == '\'':
+      return
+  var base = 10'u8
+  var first = 0
+  if length >= 2 and tokens.tokenTextChar(token, 0) == '0':
+    case tokens.tokenTextChar(token, 1)
+    of 'b', 'B':
+      base = 2'u8
+      first = 2
+    of 'o', 'O':
+      base = 8'u8
+      first = 2
+    of 'x', 'X':
+      base = 16'u8
+      first = 2
+    else:
+      discard
+  if first >= length:
+    return
+  var magnitude = 0'u64
+  var digits = 0
+  for index in first ..< length:
+    let character = tokens.tokenTextChar(token, index)
+    if character == '_':
+      continue
+    let digit = integerDigit(character)
+    if digit < 0:
+      return
+    if uint8(digit) >= base:
+      return
+    if magnitude > (high(uint64) - uint64(digit)) div uint64(base):
+      return
+    magnitude = magnitude * uint64(base) + uint64(digit)
+    inc digits
+  if digits == 0:
+    return
+  (integerLiteralNonNegative, magnitude)
+
+proc parseIntegerLiteral(
+    tokens: TokenStore, first, past: int
+): tuple[sign: IntegerLiteralSign, magnitude: uint64] =
+  if first < 0 or first >= past or past > tokens.len:
+    return
+  if past == first + 1 and tokens[first].kind == tkNumber:
+    return parseIntegerToken(tokens, tokens[first])
+  if past != first + 2 or tokens[first + 1].kind != tkNumber:
+    return
+  let sign =
+    tokens.tokenTextEquals(tokens[first], "-") or
+    tokens.tokenTextEquals(tokens[first], "+")
+  if not sign:
+    return
+  result = parseIntegerToken(tokens, tokens[first + 1])
+  if result.sign != integerLiteralInvalid and tokens.tokenTextEquals(tokens[first], "-"):
+    result.sign = integerLiteralNegative
+
+proc preferredIntegerLiteralKind*(tokens: TokenStore, first, past: int): TypeKind =
+  let literal = parseIntegerLiteral(tokens, first, past)
+  case literal.sign
+  of integerLiteralNonNegative:
+    if literal.magnitude <= 255'u64:
+      return typeUInt8
+    if literal.magnitude <= 65535'u64:
+      return typeUInt16
+    if literal.magnitude <= 4294967295'u64:
+      return typeUInt32
+    return typeUInt64
+  of integerLiteralNegative:
+    if literal.magnitude <= 128'u64:
+      return typeInt8
+    if literal.magnitude <= 32768'u64:
+      return typeInt16
+    if literal.magnitude <= 2147483648'u64:
+      return typeInt32
+    if literal.magnitude <= 9223372036854775808'u64:
+      return typeInt64
+  of integerLiteralInvalid:
+    discard
+  typeUnknown
+
 proc directLiteralKind*(tokens: TokenStore, first, past: int): TypeKind =
   if first < 0 or first >= past or past > tokens.len:
     return typeUnknown
@@ -117,8 +218,25 @@ proc directLiteralKind*(tokens: TokenStore, first, past: int): TypeKind =
       if tokens.tokenTextChar(token, 0) == char(39) and tokens.tokenTextLen(token) >= 3:
         return typeChar
     elif token.kind == tkNumber:
-      return numericLiteralKind(tokens, token)
+      let explicit = numericLiteralKind(tokens, token)
+      if explicit != typeInt:
+        return explicit
+      let preferred = preferredIntegerLiteralKind(tokens, first, past)
+      if preferred != typeUnknown:
+        return preferred
+      return explicit
     return typeUnknown
+  if past == first + 2 and tokens[first + 1].kind == tkNumber and (
+    tokens.tokenTextEquals(tokens[first], "-") or
+    tokens.tokenTextEquals(tokens[first], "+")
+  ):
+    let explicit = numericLiteralKind(tokens, tokens[first + 1])
+    if explicit != typeInt:
+      return explicit
+    let preferred = preferredIntegerLiteralKind(tokens, first, past)
+    if preferred != typeUnknown:
+      return preferred
+    return explicit
   typeUnknown
 
 proc primitiveTypeKind*(tokens: TokenStore, index: int): TypeKind =

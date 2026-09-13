@@ -3,7 +3,6 @@ import std/[sets, strutils]
 import ../index/bindings
 import ../index/occurrences
 import ../index/source_index
-import ../index/symbols
 import ../index/surfaces
 import ../index/surface_resolution
 import ../stdlib/map
@@ -22,6 +21,7 @@ type
     nativeUndeclaredIdentifier
     nativeMissingStdlibImport
     nativeMissingProjectImport
+    nativeTypo
 
   NativeDiagnosticMode = enum
     nativeImportsOnly
@@ -33,6 +33,7 @@ type
     endOffset*: int
     name*: string
     module*: string
+    suggestion*: string
 
 proc nativeSyntaxDiagnostics*(index: SourceIndex): seq[NativeDiagnostic]
 

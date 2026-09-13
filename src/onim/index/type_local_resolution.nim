@@ -3,7 +3,6 @@ import ./scopes
 import ./scope_queries
 import ./symbols
 import ./type_annotation_syntax
-import ./type_declaration_syntax
 import ./type_ids
 import ./type_index_models
 import ./type_interning
@@ -13,6 +12,24 @@ import ./type_local_models
 import ./type_expression_syntax
 import ./type_queries
 import ./type_states
+
+proc localTypeToken(
+    descriptor: TypeDescriptor, declarationToken: uint32, form: LocalTypeForm
+): uint32 =
+  case descriptor.kind
+  of typeNamed:
+    if form == localTypeFormLiteral and descriptor.nameToken == declarationToken:
+      InvalidTypeToken
+    else:
+      descriptor.nameToken
+  of typeRef:
+    descriptor.baseNameToken
+  of typeGenericInstance:
+    descriptor.nameToken
+  of typeSeq, typeArray:
+    if descriptor.baseKind == typeNamed: descriptor.baseNameToken else: InvalidTypeToken
+  else:
+    InvalidTypeToken
 
 proc localTypeAt*(
     types: TypeIndex, tokens: TokenStore, scopes: ScopeIndex, declarationToken: uint32
@@ -43,18 +60,7 @@ proc localTypeAt*(
     result.form = localTypeFormAnnotation
     result.typeId = expected
     result.typeToken =
-      if descriptor.kind == typeNamed:
-        descriptor.nameToken
-      elif descriptor.kind == typeRef:
-        descriptor.baseNameToken
-      elif descriptor.kind == typeGenericInstance:
-        descriptor.nameToken
-      elif descriptor.kind == typeSeq and descriptor.baseKind == typeNamed:
-        descriptor.baseNameToken
-      elif descriptor.kind == typeArray and descriptor.baseKind == typeNamed:
-        descriptor.baseNameToken
-      else:
-        InvalidTypeToken
+      localTypeToken(descriptor, declaration.nameToken, localTypeFormAnnotation)
     result.firstToken = uint32(split.colon + 1)
     result.pastToken = uint32(past)
     return
@@ -81,9 +87,9 @@ proc localTypeAt*(
     result.firstToken = uint32(split.equals + 1)
     result.pastToken = declaration.pastToken
 
-proc moduleValueTypeAt*(
-    types: TypeIndex, tokens: TokenStore, symbol: SourceSymbol
-): LocalTypeInfo =
+proc moduleValueDeclaration*(
+    tokens: TokenStore, symbol: SourceSymbol
+): LexicalDeclaration =
   if symbol.kind notin {symbolVar, symbolLet, symbolConst} or
       symbol.nameToken >= uint32(tokens.len):
     return
@@ -105,23 +111,58 @@ proc moduleValueTypeAt*(
     of symbolVar: declarationVar
     of symbolConst: declarationConst
     else: declarationLet
-  let declaration = LexicalDeclaration(
+  LexicalDeclaration(
     scope: ScopeId(1),
     kind: kind,
     nameToken: symbol.nameToken,
     firstToken: uint32(first),
     pastToken: uint32(past),
   )
-  let split = splitDeclaration(tokens, declaration)
-  if split.colon >= 0 or split.equals < 0:
+
+proc moduleValueDescriptor*(tokens: TokenStore, symbol: SourceSymbol): TypeDescriptor =
+  let declaration = moduleValueDeclaration(tokens, symbol)
+  if declaration.pastToken == 0:
     return
+  declarationTypeDescriptor(tokens, declaration)
+
+proc moduleValueTypeAt*(
+    types: TypeIndex, tokens: TokenStore, symbol: SourceSymbol
+): LocalTypeInfo =
+  let declaration = moduleValueDeclaration(tokens, symbol)
+  if declaration.pastToken == 0:
+    return
+  let split = splitDeclaration(tokens, declaration)
   let descriptor = declarationTypeDescriptor(tokens, declaration)
   let expected = types.descriptorTypeId(descriptor)
-  if expected == InvalidTypeId or not descriptor.kind.isPrimitiveType:
+  if expected == InvalidTypeId or descriptor.kind == typeUnknown:
+    return
+  if split.colon >= 0:
+    let past =
+      if split.equals > split.colon:
+        split.equals
+      else:
+        int(declaration.pastToken)
+    result.kind = descriptor.kind
+    result.state = typeStateResolved
+    result.form = localTypeFormAnnotation
+    result.typeId = expected
+    result.typeToken =
+      localTypeToken(descriptor, declaration.nameToken, localTypeFormLiteral)
+    result.firstToken = uint32(split.colon + 1)
+    result.pastToken = uint32(past)
+    return
+  if split.equals < 0:
+    return
+  let call = directCallInfo(tokens, split.equals + 1, int(declaration.pastToken))
+  if call.form == localTypeFormCall:
+    result = call
+    result.typeId = expected
+    return
+  if not descriptor.kind.isPrimitiveType:
     return
   result.kind = descriptor.kind
   result.state = typeStateResolved
   result.form = localTypeFormLiteral
   result.typeId = expected
   result.firstToken = uint32(split.equals + 1)
-  result.pastToken = uint32(past)
+  result.pastToken = declaration.pastToken

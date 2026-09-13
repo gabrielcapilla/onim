@@ -1,9 +1,9 @@
-import std/[os, strutils, times]
+import std/[os, times]
 
 import ../index/cache
 import ./toolchain
 
-const stdlibCacheSchema* = "v1"
+const stdlibCacheSchema* = "v2"
 
 proc stdlibCacheDirectory*(toolchain: NimToolchain): string =
   if toolchain.state != toolchainReady:

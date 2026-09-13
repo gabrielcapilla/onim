@@ -1,5 +1,3 @@
-import std/os
-
 import ../index/cache
 import ../index/source_index
 

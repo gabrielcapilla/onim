@@ -476,16 +476,24 @@ proc receiveBootstrap*(): BootstrapResult =
     return
   result = decodeBootstrapResult(bootstrapResults.recv())
 
-proc stopBootstrapWorker*() =
+proc stopBootstrapProducer*() =
   if bootstrapState != bootstrapWorkerRunning:
     return
   bootstrapStopRequested.store(true)
   bootstrapCancelGeneration.store(high(uint64))
   bootstrapRequests.send(BootstrapRequest(jobGeneration: high(uint64), root: ""))
   bootstrapThread.joinThread()
+
+proc finishBootstrapWorkerStop*() =
+  if bootstrapState != bootstrapWorkerRunning:
+    return
   bootstrapRequests.close()
   bootstrapResults.close()
   bootstrapRequests = default(Channel[BootstrapRequest])
   bootstrapResults = default(Channel[string])
   bootstrapState = bootstrapWorkerStopped
   traceBootstrapWorker("reap")
+
+proc stopBootstrapWorker*() =
+  stopBootstrapProducer()
+  finishBootstrapWorkerStop()

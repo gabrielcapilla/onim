@@ -32,10 +32,11 @@ proc validateScopes*(
         scope.startOffset < 0 or scope.startOffset > scope.endOffset or
         scope.endOffset > byteLength:
       return false
-    if scope.firstToken < uint32(tokens.len) and
+    # The module extent includes leading and trailing trivia.
+    if ordinal > 0 and scope.firstToken < uint32(tokens.len) and
         scope.startOffset != tokens[int(scope.firstToken)].startOffset:
       return false
-    if scope.pastToken < uint32(tokens.len) and
+    if ordinal > 0 and scope.pastToken < uint32(tokens.len) and
         scope.endOffset != tokens[int(scope.pastToken)].startOffset:
       return false
     if ordinal == 0:

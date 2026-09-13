@@ -2,7 +2,6 @@ import std/tables
 
 import ../index/source_index
 import ./disk_source
-import ./ids
 import ./workspace_models
 
 proc markMissingDiscoveredFiles*(

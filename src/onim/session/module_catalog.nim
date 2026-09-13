@@ -4,6 +4,7 @@ import std/os except FileId
 import ../syntax/tokens
 import ../syntax/lexer
 import ./ids
+import ./discovery_budget
 import ./package_catalog
 import ./paths
 
@@ -125,8 +126,23 @@ proc configureRoots(catalog: ModuleCatalog, root: string) =
   if dirExists(conventional):
     catalog.addRoot(conventional)
 
+  var budget = initDiscoveryBudget()
   try:
     for kind, path in walkDir(canonicalRoot):
+      if not budget.admitEntry():
+        catalog.complete = false
+        break
+      case kind
+      of pcDir:
+        if not budget.admitDirectory():
+          catalog.complete = false
+          break
+      of pcFile:
+        if not budget.admitFile():
+          catalog.complete = false
+          break
+      else:
+        discard
       if kind == pcFile and path.toLowerAscii.endsWith(".nimble") and
           not catalog.addNimbleRoots(path):
         catalog.complete = false
@@ -136,10 +152,20 @@ proc configureRoots(catalog: ModuleCatalog, root: string) =
   let dependencies = canonicalRoot / "nimbledeps"
   if dirExists(dependencies):
     try:
-      for path in walkDirRec(dependencies):
-        if fileExists(path) and path.toLowerAscii.endsWith(".nimble") and
-            not catalog.addNimbleRoots(path):
+      for path in walkDirRec(dependencies, yieldFilter = {pcFile, pcDir}):
+        if not budget.admitEntry():
           catalog.complete = false
+          break
+        if dirExists(path):
+          if not budget.admitDirectory():
+            catalog.complete = false
+            break
+        elif fileExists(path):
+          if not budget.admitFile():
+            catalog.complete = false
+            break
+          if path.toLowerAscii.endsWith(".nimble") and not catalog.addNimbleRoots(path):
+            catalog.complete = false
     except CatchableError:
       catalog.complete = false
 

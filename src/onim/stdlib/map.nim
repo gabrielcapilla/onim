@@ -2,8 +2,6 @@ import std/[json, os, sets, strutils, tables]
 
 import ../index/source_index
 import ../index/surfaces
-import ../index/symbols
-import ../syntax/imports
 import ../syntax/module_names
 import ../syntax/tokens
 import ./doc_normalize
@@ -39,6 +37,7 @@ type
   StdlibMap* = ref object
     symbols*: Table[string, seq[SymbolCandidate]]
     modules*: HashSet[string]
+    moduleDocumentation*: Table[string, string]
     surface*: SurfaceIndex
     symbolKeys: Table[string, seq[string]]
     implicitModules: HashSet[string]
@@ -47,7 +46,7 @@ type
 
 const
   stdlibBinaryMagic = "ONIMBIN1"
-  stdlibBinaryVersion = 2'u32
+  stdlibBinaryVersion = 3'u32
   stdlibBinaryHeaderSize = 32
   maxStdlibBinaryBytes = 64 * 1024 * 1024
   maxStdlibBinaryRecords = 1_000_000
@@ -69,6 +68,25 @@ type
 
 proc canonicalModule*(module: string): string =
   canonicalSurfaceModule(module)
+
+proc knownModule*(stdlib: StdlibMap, module: string): bool {.inline.} =
+  if stdlib == nil:
+    return false
+  let canonical = canonicalModule(module)
+  if canonical in stdlib.modules:
+    return true
+  if canonical.startsWith("std/"):
+    return canonical.len > 4 and canonical[4 .. ^1] in stdlib.modules
+  canonical.len > 0 and ("std/" & canonical) in stdlib.modules
+
+proc isPrivateModule*(module: string): bool {.inline.} =
+  let canonical = canonicalModule(module)
+  let path =
+    if canonical.len > 4 and canonical.startsWith("std/"):
+      canonical[4 .. ^1]
+    else:
+      canonical
+  path == "private" or path.startsWith("private/")
 
 proc sameModule*(left, right: string): bool =
   let a = canonicalModule(left)
@@ -138,6 +156,7 @@ proc newStdlibMap(): StdlibMap =
   new(result)
   result.symbols = initTable[string, seq[SymbolCandidate]]()
   result.modules = initHashSet[string]()
+  result.moduleDocumentation = initTable[string, string]()
   result.symbolKeys = initTable[string, seq[string]]()
   result.implicitModules = initHashSet[string]()
   result.receiverCandidates = initTable[string, seq[SymbolCandidate]]()
@@ -171,6 +190,17 @@ proc surfaceIsComplete*(stdlib: StdlibMap): bool =
 proc emptyStdlibMap*(): StdlibMap =
   result = newStdlibMap()
 
+proc documentationForModule*(stdlib: StdlibMap, module: string): string =
+  if stdlib == nil:
+    return
+  let canonical = canonicalModule(module)
+  if stdlib.moduleDocumentation.hasKey(canonical):
+    return stdlib.moduleDocumentation[canonical]
+  if not canonical.startsWith("std/"):
+    let stdModule = "std/" & canonical
+    if stdlib.moduleDocumentation.hasKey(stdModule):
+      return stdlib.moduleDocumentation[stdModule]
+
 proc decodeStdlibBinary(data: string): StdlibMap =
   if data.len < stdlibBinaryHeaderSize:
     return emptyStdlibMap()
@@ -179,7 +209,7 @@ proc decodeStdlibBinary(data: string): StdlibMap =
     return emptyStdlibMap()
   reader.position = stdlibBinaryMagic.len
   let version = reader.readUint32()
-  if (version != 1'u32 and version != stdlibBinaryVersion) or reader.readByte() != 1'u8 or
+  if version != stdlibBinaryVersion or reader.readByte() != 1'u8 or
       reader.readByte() != 0'u8 or reader.readByte() != 0'u8 or reader.readByte() != 0'u8:
     return emptyStdlibMap()
   let payloadLength = reader.readUint64()
@@ -233,16 +263,18 @@ proc decodeStdlibBinary(data: string): StdlibMap =
       let start = blobStart + int(offsets[index])
       strings[index] = reader.data[start ..< start + int(lengths[index])]
 
-  if not reader.ensureRecords(moduleCount, sizeof(uint32)):
+  if not reader.ensureRecords(moduleCount, 2 * sizeof(uint32)):
     return emptyStdlibMap()
   result = newStdlibMap()
   var previousModule = ""
   for _ in 0 ..< moduleCount:
     let module = reader.readStringId(strings)
+    let documentation = reader.readStringId(strings)
     if not reader.valid or module.len == 0 or canonicalModule(module) != module or
         (previousModule.len > 0 and module <= previousModule):
       return emptyStdlibMap()
     result.modules.incl module
+    result.moduleDocumentation[module] = normalizeDocumentation(documentation)
     previousModule = module
 
   if not reader.ensureRecords(implicitCount, sizeof(uint32)):
@@ -383,6 +415,17 @@ proc loadStdlibMap*(path: string): StdlibMap =
         if normalized.len == 0:
           return emptyStdlibMap()
         result.modules.incl normalized
+    if root.hasKey("moduleDocumentation"):
+      if root["moduleDocumentation"].kind != JObject:
+        return emptyStdlibMap()
+      for module in root["moduleDocumentation"].keys:
+        let normalized = canonicalModule(module)
+        if normalized.len == 0 or normalized notin result.modules:
+          return emptyStdlibMap()
+        if root["moduleDocumentation"][module].kind != JString:
+          return emptyStdlibMap()
+        result.moduleDocumentation[normalized] =
+          normalizeDocumentation(root["moduleDocumentation"][module].getStr)
     if not root.hasKey("implicitModules") or root["implicitModules"].kind != JArray:
       return emptyStdlibMap()
     for entry in root["implicitModules"].items:

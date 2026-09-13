@@ -1,28 +1,19 @@
 import std/algorithm
-import std/sets
 
 import ../syntax/tokens
 import ./scopes
-import ./scope_queries
 import ./symbols
-import ./type_declaration_syntax
 import ./type_declaration_index
 import ./type_expression_syntax
 import ./type_field_syntax
 import ./type_ids
 import ./type_kinds
-import ./type_literal_tokens
 import ./type_index_models
 import ./type_interning
 import ./type_annotation_syntax
-import ./type_local_models
-import ./type_local_calls
-import ./type_object_queries
-import ./type_queries
-import ./type_routine_returns
 import ./type_local_resolution
+import ./type_routine_returns
 import ./type_ufcs_index
-import ./type_states
 import ./type_tuple_literals
 
 proc indexTypes*(
@@ -68,6 +59,8 @@ proc indexTypes*(
   indexUfcsProcedures(tokens, symbols, scopes, result)
   result.routineReturnTypeIds = newSeq[TypeId](symbols.len)
   for symbolIndex, symbol in symbols:
+    if symbol.kind in {symbolVar, symbolLet, symbolConst}:
+      discard result.internDescriptor(moduleValueDescriptor(tokens, symbol))
     result.routineReturnTypeIds[symbolIndex] =
       result.internDescriptor(routineReturnSpan(tokens, symbol).descriptor)
     if symbol.kind == symbolType:

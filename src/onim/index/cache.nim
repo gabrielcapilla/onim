@@ -1,13 +1,6 @@
 import std/[algorithm, os, sets, streams, times]
 
-import ../syntax/imports
-import ../syntax/tokens
-import ../syntax/parser
 import ./source_index
-import ./occurrences
-import ./scopes
-import ./symbols
-import ./types
 import ./cache_wire
 import ./cache_source_index
 import ../session/paths

@@ -113,7 +113,11 @@ proc buildDiagnostic(
     line, column: int,
 ): CompilerDiagnostic =
   result = CompilerDiagnostic(
-    kind: if names.unused.len > 0: kind else: diagnosticError,
+    kind:
+      if names.unused.len > 0 or names.unusedDeclaration.len > 0:
+        kind
+      else:
+        diagnosticError,
     isUnusedImport: names.unused.len > 0,
     isUnusedDeclaration: names.unusedDeclaration.len > 0,
     name: diagnosticName(names),
@@ -302,7 +306,7 @@ when defined(onimEmbedded):
             else:
               undeclaredName,
           file: suggestion.filePath,
-          line: suggestion.line,
+          line: max(0, suggestion.line - 1),
           column: suggestion.column,
           message: suggestion.doc,
         )
@@ -322,9 +326,21 @@ else:
     for diagnostic in compilerDiagnostics(
       if dirtyPath.len > 0: dirtyPath else: filePath
     ) & nimsuggestDiagnostics(if dirtyPath.len > 0: dirtyPath else: filePath):
-      if diagnostic.name notin seen:
-        seen.add diagnostic.name
+      let key =
+        diagnostic.file & "|" & $diagnostic.line & "|" & $diagnostic.column & "|" &
+        $diagnostic.isUnusedImport & "|" & $diagnostic.isUnusedDeclaration & "|" &
+        diagnostic.message
+      if key notin seen:
+        seen.add key
         result.add diagnostic
+
+proc resetCompilerState*() =
+  diagnosticCache = initTable[DiagnosticCacheKey, seq[CompilerDiagnostic]]()
+  diagnosticCacheOrder.setLen(0)
+  diagnosticCacheBytes = 0
+  when defined(onimEmbedded):
+    cachedSuggest = nil
+    cachedProject = ""
 
 proc hash(key: DiagnosticCacheKey): Hash =
   result = hash(key.project)

@@ -1,8 +1,6 @@
 import std/strutils
 import std/tables
 
-import ../index/surfaces
-import ../syntax/module_names
 import ../syntax/tokens
 import ./map
 import ./receiver_helpers

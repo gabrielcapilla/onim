@@ -1,22 +1,17 @@
-import std/[algorithm, sets, strutils, tables]
+import std/[sets, strutils, tables]
 import std/os except FileId
 
 import ../index/cache
-import ../index/source_index
 import ../index/surfaces
-import ../index/surface_project_input
 import ./bootstrap_worker
 import ./bootstrap_manifest
-import ./bootstrap_paths
 import ./bootstrap_validation
 import ./ids
 import ./module_catalog
-import ./package_catalog
 import ./paths
 import ./disk_source
 import ./source_discovery
 import ./workspace_file_ids
-import ./workspace_graph
 import ./workspace_manifest_cache
 import ./workspace_manifest_restore
 import ./workspace_manifest_builder
@@ -124,6 +119,10 @@ proc moduleCatalog*(workspace: Workspace): ModuleCatalog =
   workspace.moduleCatalogCache =
     buildWorkspaceModuleCatalog(workspace.root, workspace.files)
   workspace.moduleCatalogCache
+
+proc moduleCatalogIfReady*(workspace: Workspace): ModuleCatalog {.inline.} =
+  if workspace != nil:
+    result = workspace.moduleCatalogCache
 
 proc cloneWorkspaceState(workspace: Workspace): Workspace =
   new(result)
@@ -709,6 +708,26 @@ proc snapshotForDocument*(workspace: Workspace, uri, path: string): WorkspaceSna
   )
   releaseDiskText(workspace.files[index])
 
+proc snapshotForOpenDocument*(
+    workspace: Workspace, uri, path: string
+): WorkspaceSnapshot =
+  if workspace == nil:
+    return
+  let id = workspace.fileIdForPath(path)
+  if not id.validRecordIndex(workspace.files.len):
+    return
+  let index = id.recordIndex
+  if workspace.files[index].state != workspaceOpen or
+      not workspace.files[index].textLoaded or workspace.files[index].index == nil:
+    return
+  snapshotForRecord(
+    workspace.files[index],
+    workspace.snapshotId,
+    workspace.configGeneration,
+    workspace.surfaceGeneration,
+    uri,
+  )
+
 proc snapshotForFile*(workspace: Workspace, id: FileId): WorkspaceSnapshot =
   let index = id.recordIndex
   if not id.validRecordIndex(workspace.files.len):
@@ -768,3 +787,8 @@ proc projectSurface*(workspace: Workspace): SurfaceIndex =
   )
   workspace.projectSurfaceBuiltGeneration = workspace.surfaceGeneration
   workspace.projectSurfaceCache
+
+proc projectSurfaceIfReady*(workspace: Workspace): SurfaceIndex {.inline.} =
+  if workspace != nil and workspace.projectSurfaceCache != nil and
+      workspace.projectSurfaceBuiltGeneration.value == workspace.surfaceGeneration.value:
+    result = workspace.projectSurfaceCache

@@ -1,6 +1,5 @@
 import ../index/source_index
 import ./disk_source
-import ./ids
 import ./workspace_models
 
 proc restoreDiskSource*(

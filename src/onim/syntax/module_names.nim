@@ -33,7 +33,17 @@ proc moduleBase*(module: string): string =
   moduleLeaf(module)
 
 proc moduleText*(tokens: TokenStore, first, last: int): string =
-  for index in first ..< last:
+  var cursor = first
+  if cursor + 2 < last and tokens.tokenTextEquals(tokens[cursor], ".") and
+      tokens.tokenTextEquals(tokens[cursor + 1], ".") and
+      tokens.tokenTextEquals(tokens[cursor + 2], "/"):
+    result.add "../"
+    cursor += 3
+  elif cursor + 1 < last and tokens.tokenTextEquals(tokens[cursor], ".") and
+      tokens.tokenTextEquals(tokens[cursor + 1], "/"):
+    result.add "./"
+    cursor += 2
+  for index in cursor ..< last:
     if tokens.tokenTextEquals(tokens[index], "."):
       result.add '/'
     else:
