@@ -1,0 +1,81 @@
+import std/[os, strutils, unittest]
+
+import onim/features/organize
+import onim/features/organize_edits
+import onim/index/cache
+import onim/index/occurrences
+import onim/index/source_index
+import onim/index/surfaces
+import onim/index/surface_project_input
+import onim/index/surface_resolution
+import onim/semantic/compiler_api
+import onim/session/ids
+import onim/session/module_catalog
+import onim/stdlib/map
+
+const cases = [
+  "walkdir", "table", "parsejson", "split", "from", "except", "qualified", "alias",
+  "conditional", "conditional_inactive", "included", "multiple", "order", "grouped",
+  "grouped_std", "unused", "unused_grouped", "unused_from", "unused_separate",
+  "shadowed", "unused_from_empty", "unused_except", "unused_keep", "unused_all",
+  "text_only",
+]
+
+suite "organize import edits":
+  for name in cases:
+    test name:
+      let root = currentSourcePath().parentDir.parentDir.parentDir
+      let beforePath = root / "tests" / "before" / (name & ".nim")
+      let afterPath = root / "tests" / "after" / (name & ".nim")
+      let before = readFile(beforePath)
+      let expected = readFile(afterPath)
+      let actual = applyEdits(before, organizeSource(beforePath, before))
+      check actual == expected
+
+  test "preserves BOM, CRLF, and a missing final newline":
+    let root = currentSourcePath().parentDir.parentDir.parentDir
+    let path = root / "tests" / "before" / "walkdir.nim"
+    let before =
+      "\xEF\xBB\xBF# header\r\n\r\nfor k, v in walkDir(\"/tmp\"):\r\n  echo k"
+    let expected =
+      "\xEF\xBB\xBF# header\r\n\r\nimport std/os\r\n\r\nfor k, v in walkDir(\"/tmp\"):\r\n  echo k"
+    let actual = applyEdits(before, organizeSource(path, before))
+    check actual == expected
+
+  test "can render the legacy stdlib spelling when requested":
+    let root = currentSourcePath().parentDir.parentDir.parentDir
+    let path = root / "tests" / "before" / "walkdir.nim"
+    var options = defaultOrganizeOptions()
+    options.useStdPrefix = false
+    let before = readFile(path)
+    let actual = applyEdits(before, organizeSource(path, before, options))
+    check actual.contains("import os\n\n")
+
+  test "keeps grouped stdlib modules valid in legacy spelling":
+    let root = currentSourcePath().parentDir.parentDir.parentDir
+    let path = root / "tests" / "before" / "grouped_std.nim"
+    var options = defaultOrganizeOptions()
+    options.useStdPrefix = false
+    let before = readFile(path)
+    let expected = readFile(root / "tests" / "after" / "grouped_std.nim").replace(
+        "import std/[os, strformat]", "import os\nimport strformat"
+      )
+    check applyEdits(before, organizeSource(path, before, options)) == expected
+
+  test "groups multiple new stdlib modules in one edit":
+    let root = currentSourcePath().parentDir.parentDir.parentDir
+    let path = root / "tests" / "before" / "multiple.nim"
+    let before = readFile(path)
+    let edits = organizeSource(path, before)
+    check edits.len == 1
+    check applyEdits(before, edits) ==
+      readFile(root / "tests" / "after" / "multiple.nim")
+
+  test "merges new stdlib modules into one existing import edit":
+    let root = currentSourcePath().parentDir.parentDir.parentDir
+    let path = root / "tests" / "before" / "grouped_std.nim"
+    let before = readFile(path)
+    let edits = organizeSource(path, before)
+    check edits.len == 1
+    check applyEdits(before, edits) ==
+      readFile(root / "tests" / "after" / "grouped_std.nim")
