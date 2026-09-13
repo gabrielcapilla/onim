@@ -1,6 +1,5 @@
 import std/[json, strutils]
 
-import ../features/definition
 import ../features/definition_models
 import ../features/references
 import ../features/rename
@@ -120,9 +119,10 @@ proc prepareRenameResponse*(
     return
   let positions = initPositionIndex(snapshot.text)
   let offset = offsetAt(positions, snapshot.text, valueOrEmpty(params, "position"))
-  let resolution = resolveDefinition(workspace, snapshot, offset)
-  result.needsBootstrap = resolution.kind == definitionUnresolved
-  if resolution.kind != definitionResolved or resolution.target.kind != targetDeclaration:
+  let references = resolveReferences(workspace, snapshot, offset, true)
+  result.needsBootstrap = not references.supported and workspace.bootstrapPending
+  if not references.supported or references.matches.len == 0 or
+      references.target.kind != targetDeclaration:
     return
   let tokenIndex = tokenAtOffset(snapshot.index.parsed.tokens, offset)
   if tokenIndex < 0 or tokenIndex >= snapshot.index.parsed.tokens.len:

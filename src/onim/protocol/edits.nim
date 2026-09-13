@@ -1,6 +1,5 @@
 import std/json
 
-import ../features/organize
 import ../features/organize_edits
 import ./positions
 

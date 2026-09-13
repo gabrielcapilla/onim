@@ -8,16 +8,21 @@ import ./action_cache
 import ./action_indexing
 import ./edits
 import ./semantic_key
-import ./semantic_queue
-import ./transport
 
-type PendingCodeAction* = object
-  id*: JsonNode
-  semantic*: SemanticKey
-  uri*: string
-  waitingForBootstrap*: bool
+type
+  PendingCodeAction* = object
+    id*: JsonNode
+    semantic*: SemanticKey
+    uri*: string
+    waitingForBootstrap*: bool
 
-proc finishPendingCodeActionsForUri*(pending: var seq[PendingCodeAction], uri: string) =
+  ResponseEffect* = object
+    id*: JsonNode
+    result*: JsonNode
+
+proc finishPendingCodeActionsForUri*(
+    pending: var seq[PendingCodeAction], uri: string
+): seq[ResponseEffect] =
   var completed: seq[PendingCodeAction] = @[]
   var writeIndex = 0
   for item in pending:
@@ -28,14 +33,14 @@ proc finishPendingCodeActionsForUri*(pending: var seq[PendingCodeAction], uri: s
       inc writeIndex
   pending.setLen(writeIndex)
   for item in completed:
-    sendResponse(item.id, newJArray())
+    result.add ResponseEffect(id: item.id, result: newJArray())
 
 proc finishPendingCodeActions*(
     pending: var seq[PendingCodeAction],
     workspace: Workspace,
     actionCache: seq[CachedAction],
     value: SemanticResult,
-): bool =
+): seq[ResponseEffect] =
   let terminal = value.failed and not value.fileId.valid
   let key = semanticKey(value)
   var completed: seq[PendingCodeAction] = @[]
@@ -56,14 +61,13 @@ proc finishPendingCodeActions*(
             snapshot,
             OrganizeOptions(useStdPrefix: item.semantic.useStdPrefix),
           ):
-        sendResponse(
-          item.id,
-          renderCodeActions(
+        result.add ResponseEffect(
+          id: item.id,
+          result: renderCodeActions(
             item.uri,
             snapshot.text,
             cachedActionFor(actionCache, item.semantic.fileId).edits,
           ),
         )
         continue
-    sendResponse(item.id, newJArray())
-  terminal
+    result.add ResponseEffect(id: item.id, result: newJArray())

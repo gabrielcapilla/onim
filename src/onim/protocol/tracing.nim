@@ -1,5 +1,4 @@
 import std/[json, monotimes, strutils, times]
-import std/os except FileId
 
 import ../index/source_index
 import ../session/ids

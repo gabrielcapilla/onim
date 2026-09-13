@@ -11,6 +11,20 @@ proc boolOption*(params: JsonNode, key: string, fallback: bool): bool =
   else:
     fallback
 
+proc clientSupportsCompletionItemBoolean(params: JsonNode, key: string): bool =
+  let capabilities = valueOrEmpty(params, "capabilities")
+  let textDocument = valueOrEmpty(capabilities, "textDocument")
+  let completion = valueOrEmpty(textDocument, "completion")
+  let completionItem = valueOrEmpty(completion, "completionItem")
+  completionItem.hasKey(key) and completionItem[key].kind == JBool and
+    completionItem[key].getBool
+
+proc clientSupportsInsertReplace*(params: JsonNode): bool =
+  clientSupportsCompletionItemBoolean(params, "insertReplaceSupport")
+
+proc clientSupportsSnippets*(params: JsonNode): bool =
+  clientSupportsCompletionItemBoolean(params, "snippetSupport")
+
 proc initializeRoot*(params: JsonNode): string =
   if params != nil and params.kind == JObject:
     if params.hasKey("rootUri") and params["rootUri"].kind == JString:
@@ -30,7 +44,7 @@ proc initializeRoot*(params: JsonNode): string =
 
 proc initializeResult*(): JsonNode =
   var provider = newJObject()
-  provider["codeActionKinds"] = %*["source.organizeImports"]
+  provider["codeActionKinds"] = %*["source.organizeImports", "quickfix"]
   provider["resolveProvider"] = %false
   var sync = newJObject()
   sync["openClose"] = %true
@@ -44,7 +58,7 @@ proc initializeResult*(): JsonNode =
   capabilities["implementationProvider"] = %true
   capabilities["callHierarchyProvider"] = %true
   capabilities["completionProvider"] =
-    %*{"resolveProvider": false, "triggerCharacters": ["."]}
+    %*{"resolveProvider": false, "triggerCharacters": [".", "{", ":", " "]}
   capabilities["hoverProvider"] = %true
   capabilities["renameProvider"] = %*{"prepareProvider": true}
   capabilities["referencesProvider"] = %true
@@ -59,8 +73,11 @@ proc initializeResult*(): JsonNode =
   var semanticTokenTypes = newJArray()
   for kind in SemanticTokenKind:
     semanticTokenTypes.add %semanticTokenTypeNames[kind]
-  capabilities["semanticTokensProvider"] =
-    %*{"legend": {"tokenTypes": semanticTokenTypes, "tokenModifiers": []}, "full": true}
+  capabilities["semanticTokensProvider"] = %*{
+    "legend": {"tokenTypes": semanticTokenTypes, "tokenModifiers": []},
+    "full": true,
+    "range": true,
+  }
   capabilities["workspaceSymbolProvider"] = %true
   capabilities["positionEncoding"] = %"utf-16"
   result = newJObject()

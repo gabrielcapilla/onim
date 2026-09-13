@@ -6,7 +6,11 @@ import ./pending_code_actions
 import ./pending_workspace
 import ./semantic_key
 import ./semantic_queue
-import ./transport
+
+type CancelOutcome* = object
+  found*: bool
+  stopWorker*: bool
+  id*: JsonNode
 
 proc sameRequestId*(left, right: JsonNode): bool =
   left != nil and right != nil and left.kind == right.kind and left == right
@@ -16,12 +20,12 @@ proc cancelPendingCodeAction*(
     queued: var seq[SemanticRequest],
     active: var SemanticKey,
     requestId: JsonNode,
-): tuple[found: bool, stopWorker: bool] =
+): CancelOutcome =
   for index, item in pending:
     if sameRequestId(item.id, requestId):
       let key = item.semantic
       pending.delete(index)
-      sendError(item.id, -32800, "Request cancelled")
+      result.id = item.id
       for other in pending:
         if sameSemanticKey(other.semantic, key):
           result.found = true
@@ -33,23 +37,50 @@ proc cancelPendingCodeAction*(
       result.found = true
       return
 
-proc cancelPendingCodeActions*(pending: var seq[PendingCodeAction]) =
+proc cancelPendingCodeActions*(pending: var seq[PendingCodeAction]): seq[JsonNode] =
   for item in pending:
-    sendError(item.id, -32800, "Request cancelled")
+    result.add item.id
   pending.setLen(0)
 
 proc cancelPendingWorkspaceRequest*(
     pending: var seq[PendingWorkspaceRequest], requestId: JsonNode
-): bool =
+): CancelOutcome =
   for index, item in pending:
     if sameRequestId(item.id, requestId):
-      let id = item.id
       pending.delete(index)
-      sendError(id, -32800, "Request cancelled")
-      return true
-  false
+      result.found = true
+      result.id = item.id
+      return
 
-proc cancelPendingWorkspaceRequests*(pending: var seq[PendingWorkspaceRequest]) =
+proc cancelPendingWorkspaceRequests*(
+    pending: var seq[PendingWorkspaceRequest]
+): seq[JsonNode] =
   for item in pending:
-    sendError(item.id, -32800, "Request cancelled")
+    result.add item.id
   pending.setLen(0)
+
+proc pendingWorkspaceRequestUri(item: PendingWorkspaceRequest): string =
+  if item.kind == pendingWorkspaceSymbol or item.params == nil or
+      item.params.kind != JObject:
+    return
+  let field =
+    case item.kind
+    of pendingIncomingCalls, pendingOutgoingCalls: "item"
+    else: "textDocument"
+  if not item.params.hasKey(field) or item.params[field].kind != JObject:
+    return
+  let value = item.params[field]
+  if value.hasKey("uri") and value["uri"].kind == JString:
+    result = value["uri"].getStr
+
+proc cancelPendingWorkspaceRequestsForUri*(
+    pending: var seq[PendingWorkspaceRequest], uri: string
+): seq[JsonNode] =
+  var writeIndex = 0
+  for item in pending:
+    if pendingWorkspaceRequestUri(item) == uri:
+      result.add item.id
+    else:
+      pending[writeIndex] = item
+      inc writeIndex
+  pending.setLen(writeIndex)

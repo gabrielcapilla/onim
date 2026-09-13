@@ -7,7 +7,13 @@ import ./positions
 import ./uris
 import ./validation
 
-proc semanticTokensResponse*(params: JsonNode, workspace: Workspace): JsonNode =
+type SemanticTokenResponseMode = enum
+  semanticTokenFull
+  semanticTokenRange
+
+proc semanticTokensResponseFor(
+    params: JsonNode, workspace: Workspace, mode: SemanticTokenResponseMode
+): JsonNode =
   result = newJObject()
   result["data"] = newJArray()
   let textDocument = valueOrEmpty(params, "textDocument")
@@ -23,6 +29,16 @@ proc semanticTokensResponse*(params: JsonNode, workspace: Workspace): JsonNode =
   if not snapshot.valid or snapshot.index == nil:
     return
   let positions = initPositionIndex(snapshot.text)
+  var rangeStart = -1
+  var rangeEnd = -1
+  if mode == semanticTokenRange:
+    let range = valueOrEmpty(params, "range")
+    if range.kind != JObject:
+      return
+    rangeStart = offsetAt(positions, snapshot.text, valueOrEmpty(range, "start"))
+    rangeEnd = offsetAt(positions, snapshot.text, valueOrEmpty(range, "end"))
+    if rangeStart < 0 or rangeEnd < rangeStart:
+      return
   var previousLine = 0
   var previousStart = 0
   for item in semanticTokens(snapshot.index):
@@ -31,6 +47,9 @@ proc semanticTokensResponse*(params: JsonNode, workspace: Workspace): JsonNode =
     let token = snapshot.index.parsed.tokens[int(item.token)]
     if token.startOffset < 0 or token.endOffset <= token.startOffset or
         token.endOffset > snapshot.text.len:
+      continue
+    if mode == semanticTokenRange and
+        (token.startOffset >= rangeEnd or rangeStart >= token.endOffset):
       continue
     let start = positionAt(positions, snapshot.text, token.startOffset)
     let finish = positionAt(positions, snapshot.text, token.endOffset)
@@ -54,3 +73,9 @@ proc semanticTokensResponse*(params: JsonNode, workspace: Workspace): JsonNode =
     result["data"].add %0
     previousLine = line
     previousStart = character
+
+proc semanticTokensResponse*(params: JsonNode, workspace: Workspace): JsonNode =
+  semanticTokensResponseFor(params, workspace, semanticTokenFull)
+
+proc semanticTokensRangeResponse*(params: JsonNode, workspace: Workspace): JsonNode =
+  semanticTokensResponseFor(params, workspace, semanticTokenRange)

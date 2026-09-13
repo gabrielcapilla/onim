@@ -1,6 +1,5 @@
 import std/json
 
-import ./positions
 import ./uris
 
 proc valueOrEmpty*(node: JsonNode, key: string): JsonNode =
@@ -207,9 +206,10 @@ proc validMethodForm*(methodName: string, hasId: bool): bool =
       "textDocument/documentSymbol", "textDocument/documentHighlight",
       "textDocument/foldingRange", "textDocument/selectionRange",
       "textDocument/signatureHelp", "textDocument/semanticTokens/full",
-      "textDocument/documentLink", "textDocument/inlayHint", "textDocument/codeAction",
-      "workspace/symbol", "textDocument/prepareCallHierarchy",
-      "callHierarchy/incomingCalls", "callHierarchy/outgoingCalls":
+      "textDocument/semanticTokens/range", "textDocument/documentLink",
+      "textDocument/inlayHint", "textDocument/codeAction", "workspace/symbol",
+      "textDocument/prepareCallHierarchy", "callHierarchy/incomingCalls",
+      "callHierarchy/outgoingCalls":
     hasId
   of "initialized", "textDocument/didOpen", "textDocument/didChange",
       "textDocument/didSave", "textDocument/didClose",
@@ -258,6 +258,9 @@ proc validMethodParams*(methodName: string, params: JsonNode): bool =
     validTextDocumentParams(params)
   of "textDocument/semanticTokens/full":
     validTextDocumentParams(params)
+  of "textDocument/semanticTokens/range":
+    validTextDocumentParams(params) and params.hasKey("range") and
+      validRangeValue(params["range"])
   of "workspace/symbol":
     params != nil and params.kind == JObject and params.hasKey("query") and
       params["query"] != nil and params["query"].kind == JString

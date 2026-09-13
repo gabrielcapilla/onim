@@ -1,5 +1,3 @@
-import std/os except FileId
-
 when defined(posix):
   import std/posix
 elif defined(windows):

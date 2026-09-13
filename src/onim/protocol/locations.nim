@@ -1,6 +1,5 @@
 import std/json
 
-import ../features/definition
 import ../features/definition_models
 import ../features/references
 import ../session/workspace

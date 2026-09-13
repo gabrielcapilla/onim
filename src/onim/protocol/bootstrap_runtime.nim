@@ -37,18 +37,35 @@ proc handleBootstrapEvent*(
     stdlib: StdlibMap,
     payload: string,
     traceEnabled: bool,
+    useStdPrefix: bool,
+    insertReplaceSupport: bool,
+    snippetSupport: bool,
 ): bool =
   let value = decodeBootstrapResult(payload)
   runtime.active = false
   let accepted = workspace.applyBootstrap(value)
-  if accepted:
+  let retryQueued = runtime.hasPending
+  if accepted and not retryQueued:
     publishOpenNativeDiagnostics(workspace, stdlib, traceEnabled)
-    finishPendingWorkspace(workspace, pendingWorkspace)
-  elif value.kind == bootstrapFailed:
-    finishPendingWorkspace(workspace, pendingWorkspace)
+    finishPendingWorkspace(
+      workspace, stdlib, pendingWorkspace, useStdPrefix, insertReplaceSupport,
+      snippetSupport,
+    )
+  elif not accepted and not retryQueued and
+      value.kind in {bootstrapComplete, bootstrapCancelled} and pendingWorkspace.len > 0:
+    if not scheduleBootstrap(runtime, workspace):
+      failPendingWorkspace(
+        pendingWorkspace, -32603, "Workspace bootstrap could not be restarted"
+      )
+  elif not accepted and not retryQueued and value.kind == bootstrapFailed:
+    failPendingWorkspace(pendingWorkspace, -32603, "Workspace bootstrap failed")
   if runtime.hasPending:
     let request = runtime.pending
     runtime.hasPending = false
     if submitBootstrap(request):
       runtime.active = true
+    elif pendingWorkspace.len > 0:
+      failPendingWorkspace(
+        pendingWorkspace, -32603, "Workspace bootstrap could not be restarted"
+      )
   accepted

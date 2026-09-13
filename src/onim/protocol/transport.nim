@@ -1,9 +1,17 @@
 import std/[json, streams, strutils]
 
+proc frameMessage*(body: string): string =
+  "Content-Length: " & $body.len & "\r\n\r\n" & body
+
+proc frameMessage*(message: JsonNode): string =
+  frameMessage($message)
+
+proc sendMessage*(output: Stream, message: JsonNode) =
+  output.write frameMessage(message)
+  output.flush
+
 proc sendMessage*(message: JsonNode) =
-  let body = $message
-  stdout.write "Content-Length: " & $body.len & "\r\n\r\n"
-  stdout.write body
+  stdout.write frameMessage(message)
   stdout.flushFile()
 
 proc sendResponse*(id, value: JsonNode) =
@@ -23,10 +31,10 @@ proc sendError*(id: JsonNode, code: int, messageText: string) =
   response["error"] = error
   sendMessage(response)
 
-proc readMessageText*(): string {.gcsafe.} =
+proc readMessageText*(input: Stream): string =
   var contentLength = -1
   var line = ""
-  while stdin.readLine(line):
+  while input.readLine(line):
     if line.len == 0:
       break
     let separator = line.find(':')
@@ -38,7 +46,9 @@ proc readMessageText*(): string {.gcsafe.} =
   if contentLength < 0:
     return
   try:
-    let input = newFileStream(stdin)
     result = input.readStr(contentLength)
   except CatchableError:
     result = ""
+
+proc readMessageText*(): string {.gcsafe.} =
+  readMessageText(newFileStream(stdin))

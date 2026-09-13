@@ -1,4 +1,6 @@
+import ../semantic/compiler_api
 import ../semantic/native_diagnostics
+import ../features/typo
 import ../session/ids
 import ../session/workspace
 import ../session/workspace_models
@@ -18,6 +20,7 @@ proc publishNativeDiagnostics*(
     stdlib: StdlibMap,
     reason: DiagnosticPublishReason,
     traceEnabled: bool,
+    compilerDiagnostics: seq[CompilerDiagnostic] = @[],
 ) =
   let uri =
     if snapshot.uri.len > 0:
@@ -26,7 +29,7 @@ proc publishNativeDiagnostics*(
       fileUri(snapshot.path)
   if uri.len == 0:
     return
-  let diagnostics =
+  var diagnostics =
     if snapshot.valid and snapshot.index != nil:
       nativeDiagnostics(
         snapshot.index,
@@ -40,6 +43,15 @@ proc publishNativeDiagnostics*(
       )
     else:
       @[]
+  if snapshot.valid and snapshot.index != nil:
+    for match in typoMatches(workspace, snapshot, stdlib):
+      diagnostics.add NativeDiagnostic(
+        kind: nativeTypo,
+        startOffset: match.startOffset,
+        endOffset: match.endOffset,
+        name: match.name,
+        suggestion: match.suggestion,
+      )
   traceLsp(
     traceEnabled,
     "publishDiagnostics",
@@ -55,7 +67,9 @@ proc publishNativeDiagnostics*(
   if diagnostics.len == 0 and workspace.bootstrapState != workspaceBootstrapComplete and
       reason == diagnosticOpen:
     return
-  sendNativeDiagnostics(uri, snapshot.text, diagnostics, snapshot.version)
+  sendDiagnostics(
+    uri, snapshot.text, diagnostics, compilerDiagnostics, snapshot.version
+  )
 
 proc clearNativeDiagnostics*(uri: string, traceEnabled: bool) =
   if uri.len > 0:
@@ -63,7 +77,7 @@ proc clearNativeDiagnostics*(uri: string, traceEnabled: bool) =
       traceEnabled, "clearDiagnostics", uri, -1, InvalidSnapshotId, InvalidFileId,
       InvalidContentGeneration, InvalidDependencyGeneration, -1, 0,
     )
-    sendNativeDiagnostics(uri, "", @[])
+    sendDiagnostics(uri, "", @[])
 
 proc publishOpenNativeDiagnostics*(
     workspace: Workspace, stdlib: StdlibMap, traceEnabled: bool

@@ -1,7 +1,6 @@
 import ../features/organize
 import ../semantic/worker
 import ../session/ids
-import ../session/workspace
 import ../session/workspace_models
 import ./lsp_event_bridges
 import ./semantic_key
@@ -63,6 +62,40 @@ proc enqueueSemantic*(
     useStdPrefix: options.useStdPrefix,
   )
   let key = semanticKey(request)
+  if pending.fileId.valid and (
+    (pending.workKind == semanticOrganize and sameSemanticGeneration(pending, key)) or
+    sameSemanticKey(pending, key)
+  ):
+    return true
+  queueSemantic(queued, request)
+  if not pending.fileId.valid and not dispatchSemantic(queued, pending):
+    removeQueued(queued, request.fileId)
+    return false
+  true
+
+proc enqueueSemanticDiagnostics*(
+    snapshot: WorkspaceSnapshot,
+    options: OrganizeOptions,
+    pending: var SemanticKey,
+    queued: var seq[SemanticRequest],
+): bool =
+  if not snapshot.valid:
+    return false
+  let request = SemanticRequest(
+    kind: semanticDiagnostics,
+    fileId: snapshot.fileId,
+    path: snapshot.path,
+    source: snapshot.text,
+    contentGeneration: snapshot.contentGeneration,
+    dependencyGeneration: snapshot.dependencyGeneration,
+    configGeneration: snapshot.configGeneration,
+    surfaceGeneration: snapshot.surfaceGeneration,
+    useStdPrefix: options.useStdPrefix,
+  )
+  let key = semanticKey(request)
+  if pending.fileId.valid and pending.workKind == semanticOrganize and
+      sameSemanticGeneration(pending, key):
+    return true
   if pending.fileId.valid and sameSemanticKey(pending, key):
     return true
   queueSemantic(queued, request)

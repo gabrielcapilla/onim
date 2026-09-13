@@ -2,8 +2,10 @@ import std/[json, strutils]
 
 import ../features/organize
 import ../features/organize_edits
+import ../features/typo
 import ../semantic/worker
 import ../session/workspace
+import ../session/workspace_models
 import ../stdlib/map
 import ./action_cache
 import ./action_indexing
@@ -14,7 +16,49 @@ import ./semantic_dispatch
 import ./semantic_key
 import ./transport
 import ./uris
+import ./positions
 import ./validation
+
+proc typoCodeActions(
+    params: JsonNode,
+    workspace: Workspace,
+    snapshot: WorkspaceSnapshot,
+    stdlib: StdlibMap,
+): JsonNode =
+  result = newJArray()
+  let context = valueOrEmpty(params, "context")
+  if context.kind != JObject or not context.hasKey("diagnostics") or
+      context["diagnostics"].kind != JArray:
+    return
+  let uriText = valueOrEmpty(params, "textDocument")["uri"].getStr
+  let positions = initPositionIndex(snapshot.text)
+  for diagnostic in context["diagnostics"].items:
+    if diagnostic == nil or diagnostic.kind != JObject or not diagnostic.hasKey("code") or
+        diagnostic["code"].kind != JString or diagnostic["code"].getStr != "onim.typo" or
+        not diagnostic.hasKey("range") or diagnostic["range"].kind != JObject or
+        not diagnostic["range"].hasKey("start") or not diagnostic["range"].hasKey("end") or
+        not diagnostic.hasKey("data") or diagnostic["data"].kind != JObject:
+      continue
+    let data = diagnostic["data"]
+    if not data.hasKey("replacement") or data["replacement"].kind != JString:
+      continue
+    let start = offsetAt(positions, snapshot.text, diagnostic["range"]["start"])
+    let finish = offsetAt(positions, snapshot.text, diagnostic["range"]["end"])
+    if start < 0 or finish <= start:
+      continue
+    let match = typoAt(workspace, snapshot, finish, stdlib)
+    if match.startOffset != start or match.endOffset != finish or
+        match.suggestion != data["replacement"].getStr:
+      continue
+    result.add %*{
+      "title": "Replace `" & match.name & "` with `" & match.suggestion & "`",
+      "kind": "quickfix",
+      "diagnostics": [diagnostic],
+      "edit": {
+        "changes":
+          {uriText: [{"range": diagnostic["range"], "newText": match.suggestion}]}
+      },
+    }
 
 proc codeActionOutcome*(
     params: JsonNode,
@@ -32,7 +76,7 @@ proc codeActionOutcome*(
   uri: string,
 ] =
   result.response = newJArray()
-  if not supportsOrganize(params):
+  if not supportsOrganize(params) and not supportsQuickFix(params):
     return
   if not validTextDocumentParams(params):
     return
@@ -45,6 +89,12 @@ proc codeActionOutcome*(
     return
   result.uri = uriText
   result.key = semanticKey(snapshot, options)
+  var quickFixes = newJArray()
+  if supportsQuickFix(params):
+    quickFixes = typoCodeActions(params, workspace, snapshot, stdlib)
+  if not supportsOrganize(params):
+    result.response = quickFixes
+    return
   let cacheKey = snapshot.fileId
   var edits: seq[ImportEdit] = @[]
   var cacheHit = false
@@ -59,15 +109,23 @@ proc codeActionOutcome*(
       edits = indexed.edits
     else:
       if bootstrapPending(workspace):
+        if quickFixes.len > 0:
+          result.response = quickFixes
+          return
         result.deferred = true
         result.waitingForBootstrap = true
         result.uri = uriText
         return
       if enqueueSemantic(snapshot, options, pending, queued):
+        if quickFixes.len > 0:
+          result.response = quickFixes
+          return
         result.deferred = true
         result.uri = uriText
         return
   result.response = renderCodeActions(uriText, snapshot.text, edits)
+  for action in quickFixes.items:
+    result.response.add action
 
 proc resolveBootstrapCodeActions*(
     pendingCodeActions: var seq[PendingCodeAction],

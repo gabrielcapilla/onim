@@ -1,31 +1,15 @@
-import std/[atomics, json, monotimes, strutils, times]
+import std/[atomics, json, monotimes]
 import std/os except FileId
 
-import ../features/completion
-import ../features/definition
-import ../features/hover
-import ../features/hierarchy
-import ../features/inlay
 import ../features/organize
-import ../features/rename
-import ../features/signature
-import ../features/semantic_tokens
 import ../semantic/worker
 import ../session/bootstrap_worker
 import ../session/ids
-import ../session/module_catalog
 import ../session/paths
 import ../session/workspace
 import ../index/source_index
-import ../index/surfaces
-import ../index/symbols
-import ../index/types
 import ../stdlib/map
 import ../stdlib/map_runtime
-import ../syntax/tokens
-import ../syntax/imports
-import ../syntax/parser
-import ./positions
 import ./call_hierarchy
 import ./location_responses
 import ./completion_response
@@ -40,7 +24,6 @@ import ./pending_code_actions
 import ./pending_cancellation
 import ./bootstrap_runtime
 import ./message_parsing
-import ./code_action_options
 import ./process_lifetime
 import ./tracing
 import ./diagnostic_publish
@@ -48,14 +31,12 @@ import ./semantic_tokens_response
 import ./rename
 import ./navigation
 import ./text_features
-import ./edits
 import ./transport
 import ./uris
 import ./validation
 import ./lsp_events as lspEventTypes
 import ./lsp_event_bridges
 import ./semantic_dispatch
-import ./semantic_results
 import ./semantic_event_handling
 import ./code_action_flow
 
@@ -64,6 +45,16 @@ var lspBootstrapBridge: Thread[void]
 var lspInputReaderStarted = false
 var lspBootstrapBridgeStarted = false
 var lspTraceEnabled = false
+
+proc sendResponseEffects(effects: openArray[ResponseEffect]) =
+  for effect in effects:
+    sendResponse(effect.id, effect.result)
+
+proc cancelPendingWorkspaceForUri(
+    pending: var seq[PendingWorkspaceRequest], uri: string
+) =
+  for requestId in cancelPendingWorkspaceRequestsForUri(pending, uri):
+    sendError(requestId, -32801, "Content modified")
 
 proc runLsp*() =
   when defined(linux):
@@ -78,6 +69,9 @@ proc runLsp*() =
   var pendingCodeActions: seq[PendingCodeAction] = @[]
   var bootstrap: BootstrapRuntime
   var options = defaultOrganizeOptions()
+  var opinionatedHints = false
+  var insertReplaceSupport = false
+  var snippetSupport = false
   var initializeAccepted = false
   var shutdownRequested = false
   var exitRequested = false
@@ -105,9 +99,13 @@ proc runLsp*() =
         continue
       let bootstrapResult = decodeBootstrapResult(event.payload)
       let accepted = handleBootstrapEvent(
-        bootstrap, workspace, pendingWorkspace, stdlib, event.payload, lspTraceEnabled
+        bootstrap, workspace, pendingWorkspace, stdlib, event.payload, lspTraceEnabled,
+        options.useStdPrefix, insertReplaceSupport, snippetSupport,
       )
       if bootstrapResult.kind != bootstrapStopped:
+        for fileId in workspace.openDocumentIds:
+          let snapshot = workspace.snapshotForFile(fileId)
+          discard enqueueSemanticDiagnostics(snapshot, options, pending, queued)
         if accepted and not bootstrap.active:
           resolveBootstrapCodeActions(
             pendingCodeActions, workspace, stdlib, actionCache, pending, queued, true
@@ -130,9 +128,22 @@ proc runLsp*() =
             )
       continue
     if event.kind == lspSemanticEvent:
-      if handleSemanticEvent(
-        event.payload, workspace, actionCache, pending, queued, pendingCodeActions
-      ):
+      let semantic = decodeSemanticResult(event.payload)
+      var responseEffects: seq[ResponseEffect] = @[]
+      let stopped =
+        if semantic.workKind == semanticDiagnostics:
+          handleSemanticDiagnostics(
+            semantic, workspace, stdlib, lspTraceEnabled, pending, queued
+          )
+        else:
+          discard
+            publishSemanticDiagnostics(semantic, workspace, stdlib, lspTraceEnabled)
+          handleSemanticEvent(
+            event.payload, workspace, actionCache, pending, queued, pendingCodeActions,
+            responseEffects,
+          )
+      sendResponseEffects(responseEffects)
+      if stopped:
         lspSemanticStopRequested.store(true)
         stopSemanticWorker()
         if lspSemanticBridgeStarted:
@@ -191,6 +202,9 @@ proc runLsp*() =
       if root.len > 0 and not broadWorkspaceRoot(root):
         discard workspace.prepareWorkspace(root)
       options.useStdPrefix = boolOption(params, "useStdPrefix", true)
+      opinionatedHints = boolOption(params, "opinionatedHints", false)
+      insertReplaceSupport = clientSupportsInsertReplace(params)
+      snippetSupport = clientSupportsSnippets(params)
       discard startStdlibMap(
         if root.len > 0:
           root
@@ -214,62 +228,50 @@ proc runLsp*() =
       discard
     of "shutdown":
       shutdownRequested = true
-      cancelPendingCodeActions(pendingCodeActions)
-      cancelPendingWorkspaceRequests(pendingWorkspace)
+      for requestId in cancelPendingCodeActions(pendingCodeActions):
+        sendError(requestId, -32800, "Request cancelled")
+      for requestId in cancelPendingWorkspaceRequests(pendingWorkspace):
+        sendError(requestId, -32800, "Request cancelled")
       pending = SemanticKey()
       queued.setLen(0)
       sendResponse(id, newJNull())
     of "exit":
       discard
     of "textDocument/didOpen":
-      let textDocument = params["textDocument"]
-      let uriText = textDocument["uri"].getStr
-      let path = uriToPath(uriText)
-      discard workspace.prepareWorkspaceForDocument(path)
-      if not workspace.isOpenDocument(path):
-        let fileId = workspace.openDocument(
-          uriText, path, textDocument["text"].getStr, textDocument["version"].getInt
+      let update = applyDidOpen(workspace, params)
+      if update.accepted:
+        sendResponseEffects(
+          finishPendingCodeActionsForUri(pendingCodeActions, update.uri)
         )
-        if fileId.valid:
-          let snapshot = workspace.snapshotForDocument(uriText, path)
-          if snapshot.valid:
-            finishPendingCodeActionsForUri(pendingCodeActions, uriText)
-            publishNativeDiagnostics(
-              workspace, snapshot, stdlib, diagnosticOpen, lspTraceEnabled
-            )
-            if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled and
-                not bootstrapPending(workspace):
-              discard enqueueSemantic(snapshot, options, pending, queued)
-            discard scheduleBootstrap(bootstrap, workspace)
+        publishNativeDiagnostics(
+          workspace, update.current, stdlib, diagnosticOpen, lspTraceEnabled
+        )
+        discard
+          cacheIndexedAction(workspace, update.current, options, stdlib, actionCache)
+        discard enqueueSemanticDiagnostics(update.current, options, pending, queued)
+        discard scheduleBootstrap(bootstrap, workspace)
     of "textDocument/didChange":
-      let change = parseDocumentChange(params)
-      if change.valid:
-        let path = uriToPath(change.uri)
-        if workspace.isOpenDocument(path):
-          let before = workspace.snapshotForFile(workspace.fileIdForPath(path))
-          let materialized = materializeDocumentChange(change, before.text)
-          if materialized.valid and
-              workspace.changeDocument(
-                change.uri, path, materialized.text, change.version
-              ):
-            let snapshot = workspace.snapshotForDocument(change.uri, path)
-            if before.contentGeneration.value != snapshot.contentGeneration.value:
-              finishPendingCodeActionsForUri(pendingCodeActions, change.uri)
-              publishNativeDiagnostics(
-                workspace, snapshot, stdlib, diagnosticEdit, lspTraceEnabled
-              )
-              if not cacheIndexedAction(
-                workspace, snapshot, options, stdlib, actionCache
-              ).handled and not bootstrapPending(workspace):
-                discard enqueueSemantic(snapshot, options, pending, queued)
-              discard scheduleBootstrap(bootstrap, workspace)
+      let update = applyDidChange(workspace, params)
+      if update.accepted and update.contentChanged:
+        cancelPendingWorkspaceForUri(pendingWorkspace, update.uri)
+        sendResponseEffects(
+          finishPendingCodeActionsForUri(pendingCodeActions, update.uri)
+        )
+        publishNativeDiagnostics(
+          workspace, update.current, stdlib, diagnosticEdit, lspTraceEnabled
+        )
+        discard
+          cacheIndexedAction(workspace, update.current, options, stdlib, actionCache)
+        discard enqueueSemanticDiagnostics(update.current, options, pending, queued)
+        discard scheduleBootstrap(bootstrap, workspace)
     of "textDocument/didClose":
       let textDocument = params["textDocument"]
       let uriText = textDocument["uri"].getStr
       let path = uriToPath(uriText)
       if workspace.isOpenDocument(path):
         let fileId = workspace.fileIdForPath(path)
-        finishPendingCodeActionsForUri(pendingCodeActions, uriText)
+        cancelPendingWorkspaceForUri(pendingWorkspace, uriText)
+        sendResponseEffects(finishPendingCodeActionsForUri(pendingCodeActions, uriText))
         removeQueued(queued, fileId)
         workspace.closeDocument(uriText, path)
         clearCachedAction(actionCache, fileId)
@@ -284,13 +286,16 @@ proc runLsp*() =
         if workspace.changeDocument(uriText, path, params["text"].getStr, -1):
           let snapshot = workspace.snapshotForDocument(uriText, path)
           if before.contentGeneration.value != snapshot.contentGeneration.value:
-            finishPendingCodeActionsForUri(pendingCodeActions, uriText)
+            cancelPendingWorkspaceForUri(pendingWorkspace, uriText)
+            sendResponseEffects(
+              finishPendingCodeActionsForUri(pendingCodeActions, uriText)
+            )
             publishNativeDiagnostics(
               workspace, snapshot, stdlib, diagnosticEdit, lspTraceEnabled
             )
-            if not cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache).handled and
-                not bootstrapPending(workspace):
-              discard enqueueSemantic(snapshot, options, pending, queued)
+            discard
+              cacheIndexedAction(workspace, snapshot, options, stdlib, actionCache)
+            discard enqueueSemanticDiagnostics(snapshot, options, pending, queued)
             discard scheduleBootstrap(bootstrap, workspace)
     of "workspace/didChangeWatchedFiles":
       let changes = params["changes"]
@@ -315,7 +320,18 @@ proc runLsp*() =
           sendResponse(id, response.value)
     of "textDocument/typeDefinition":
       if hasId:
-        sendResponse(id, typeDefinitionResponse(params, workspace))
+        var response = typeDefinitionResponse(params, workspace)
+        if response.needsBootstrap:
+          if bootstrap.active:
+            pendingWorkspace.add PendingWorkspaceRequest(
+              kind: pendingTypeDefinition, id: id, params: params
+            )
+          else:
+            discard workspace.bootstrapWorkspace()
+            response = typeDefinitionResponse(params, workspace)
+            sendResponse(id, response.value)
+        else:
+          sendResponse(id, response.value)
     of "textDocument/implementation":
       if hasId:
         var response = implementationResponse(params, workspace)
@@ -378,7 +394,18 @@ proc runLsp*() =
           sendResponse(id, response.value)
     of "textDocument/hover":
       if hasId:
-        sendResponse(id, hoverResponse(params, workspace, stdlib))
+        var response = hoverResponse(params, workspace, stdlib)
+        if response.needsBootstrap:
+          if bootstrap.active:
+            pendingWorkspace.add PendingWorkspaceRequest(
+              kind: pendingHover, id: id, params: params
+            )
+          else:
+            discard workspace.bootstrapWorkspace()
+            response = hoverResponse(params, workspace, stdlib)
+            sendResponse(id, response.value)
+        else:
+          sendResponse(id, response.value)
     of "textDocument/rename":
       if hasId:
         let response = renameResponse(params, workspace)
@@ -394,16 +421,43 @@ proc runLsp*() =
           sendResponse(id, response.value)
     of "textDocument/completion":
       if hasId:
-        sendResponse(id, completionResponse(params, workspace, stdlib))
+        let response = completionResponse(
+          params, workspace, stdlib, options.useStdPrefix, insertReplaceSupport,
+          snippetSupport,
+        )
+        if response.needsBootstrap:
+          pendingWorkspace.add PendingWorkspaceRequest(
+            kind: pendingCompletion, id: id, params: params
+          )
+          if not bootstrap.active:
+            if not scheduleBootstrap(bootstrap, workspace):
+              pendingWorkspace.setLen(pendingWorkspace.len - 1)
+              sendError(id, -32603, "Workspace bootstrap could not be restarted")
+        else:
+          sendResponse(id, response.value)
     of "textDocument/inlayHint":
       if hasId:
-        sendResponse(id, inlayHints(params, workspace))
+        sendResponse(id, inlayHints(params, workspace, opinionatedHints))
     of "textDocument/documentSymbol":
       if hasId:
         sendResponse(id, documentSymbols(params, workspace))
     of "textDocument/documentLink":
       if hasId:
-        sendResponse(id, documentLinks(params, workspace))
+        var response = documentLinks(params, workspace)
+        if response.needsBootstrap:
+          if bootstrap.active:
+            pendingWorkspace.add PendingWorkspaceRequest(
+              kind: pendingDocumentLink, id: id, params: params
+            )
+            if not scheduleBootstrap(bootstrap, workspace):
+              pendingWorkspace.setLen(pendingWorkspace.len - 1)
+              sendError(id, -32603, "Workspace bootstrap could not be restarted")
+          else:
+            discard workspace.bootstrapWorkspace()
+            response = documentLinks(params, workspace)
+            sendResponse(id, response.value)
+        else:
+          sendResponse(id, response.value)
     of "textDocument/documentHighlight":
       if hasId:
         sendResponse(id, documentHighlights(params, workspace))
@@ -415,17 +469,42 @@ proc runLsp*() =
         sendResponse(id, selectionRanges(params, workspace))
     of "textDocument/signatureHelp":
       if hasId:
-        sendResponse(id, signatureHelpResponse(params, workspace, stdlib))
+        var response = signatureHelpResponse(params, workspace, stdlib)
+        if response.needsBootstrap:
+          if bootstrap.active:
+            pendingWorkspace.add PendingWorkspaceRequest(
+              kind: pendingSignatureHelp, id: id, params: params
+            )
+          else:
+            discard workspace.bootstrapWorkspace()
+            response = signatureHelpResponse(params, workspace, stdlib)
+            sendResponse(id, response.value)
+        else:
+          sendResponse(id, response.value)
     of "textDocument/semanticTokens/full":
       if hasId:
         sendResponse(id, semanticTokensResponse(params, workspace))
+    of "textDocument/semanticTokens/range":
+      if hasId:
+        sendResponse(id, semanticTokensRangeResponse(params, workspace))
     of "workspace/symbol":
       if hasId:
-        sendResponse(id, workspaceSymbols(params, workspace))
+        if workspace.bootstrapPending:
+          if bootstrap.active:
+            pendingWorkspace.add PendingWorkspaceRequest(
+              kind: pendingWorkspaceSymbol, id: id, params: params
+            )
+          else:
+            discard workspace.bootstrapWorkspace()
+            sendResponse(id, workspaceSymbols(params, workspace))
+        else:
+          sendResponse(id, workspaceSymbols(params, workspace))
     of "$/cancelRequest":
       let requestId = params["id"]
       let cancellation =
         cancelPendingCodeAction(pendingCodeActions, queued, pending, requestId)
+      if cancellation.found:
+        sendError(cancellation.id, -32800, "Request cancelled")
       if cancellation.stopWorker:
         lspSemanticStopRequested.store(true, moRelaxed)
         discard interruptSemanticWorker()
@@ -436,7 +515,10 @@ proc runLsp*() =
         finishSemanticWorkerStop()
         lspSemanticStopRequested.store(false, moRelaxed)
       if not cancellation.found:
-        discard cancelPendingWorkspaceRequest(pendingWorkspace, requestId)
+        let workspaceCancellation =
+          cancelPendingWorkspaceRequest(pendingWorkspace, requestId)
+        if workspaceCancellation.found:
+          sendError(workspaceCancellation.id, -32800, "Request cancelled")
     of "textDocument/codeAction":
       if hasId:
         let startedAt =
@@ -461,7 +543,9 @@ proc runLsp*() =
               $contentFingerprint(outcome.uri),
         )
         if outcome.key.fileId.valid:
-          finishPendingCodeActionsForUri(pendingCodeActions, outcome.uri)
+          sendResponseEffects(
+            finishPendingCodeActionsForUri(pendingCodeActions, outcome.uri)
+          )
         if outcome.deferred:
           pendingCodeActions.add PendingCodeAction(
             id: id,
@@ -487,9 +571,12 @@ proc runLsp*() =
     stopStdlibMapGeneration()
     terminateProcessNow(if shutdownRequested: 0 else: 1)
   if lspBootstrapBridgeStarted:
-    stopBootstrapWorker()
+    stopBootstrapProducer()
     lspBootstrapBridge.joinThread()
     lspBootstrapBridgeStarted = false
+    finishBootstrapWorkerStop()
+  else:
+    stopBootstrapWorker()
   if lspInputReaderStarted:
     lspInputReader.joinThread()
     lspInputReaderStarted = false

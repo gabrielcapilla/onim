@@ -6,7 +6,6 @@ import ../index/symbols
 import ../index/type_ids
 import ../index/type_index_models
 import ../index/type_kinds
-import ../index/types
 import ../session/ids
 import ../session/module_catalog
 import ../session/workspace
@@ -102,7 +101,9 @@ proc inlayTypeLabel(
   else:
     discard
 
-proc inlayHints*(params: JsonNode, workspace: Workspace): JsonNode =
+proc inlayHints*(
+    params: JsonNode, workspace: Workspace, opinionated = false
+): JsonNode =
   result = newJArray()
   let textDocument = valueOrEmpty(params, "textDocument")
   if textDocument.kind != JObject or not textDocument.hasKey("uri") or
@@ -133,17 +134,30 @@ proc inlayHints*(params: JsonNode, workspace: Workspace): JsonNode =
         typeSource.id.value != hint.typeResolution.snapshotId.value or
         typeSource.contentGeneration.value != hint.typeResolution.contentGeneration.value:
       continue
-    let label = inlayTypeLabel(
-      typeSource.index.types, typeSource.index.parsed.tokens,
-      hint.typeResolution.info.typeId,
-    )
+    let preferred =
+      if opinionated:
+        preferredIntegerLiteralKind(
+          typeSource.index.parsed.tokens,
+          int(hint.typeResolution.info.firstToken),
+          int(hint.typeResolution.info.pastToken),
+        )
+      else:
+        typeUnknown
+    let label =
+      if preferred != typeUnknown:
+        preferred.primitiveTypeName
+      else:
+        inlayTypeLabel(
+          typeSource.index.types, typeSource.index.parsed.tokens,
+          hint.typeResolution.info.typeId,
+        )
     if label.len == 0:
       continue
     result.add %*{
       "position": positionAt(positions, source.text, token.endOffset),
       "label": ": " & label,
       "kind": 1,
-      "paddingLeft": true,
+      "paddingLeft": false,
     }
 
 proc workspaceSymbols*(params: JsonNode, workspace: Workspace): JsonNode =
@@ -187,14 +201,15 @@ proc addDocumentLink(
     source: WorkspaceSnapshot,
     positions: PositionIndex,
     item: ImportInfo,
-): bool =
+): tuple[added, needsBootstrap: bool] =
   if workspace == nil or not source.valid or source.index == nil or item.synthetic or
       item.conditional or item.module.len == 0 or item.moduleStartOffset < 0 or
       item.moduleEndOffset <= item.moduleStartOffset or
       item.moduleEndOffset > source.text.len:
     return
   let catalog = workspace.moduleCatalog()
-  if catalog == nil or not catalog.complete:
+  if catalog == nil or not catalog.complete or workspace.bootstrapPending:
+    result.needsBootstrap = workspace.bootstrapPending
     return
   let resolved =
     catalog.resolveModuleName(workspace.moduleForPath(source.path), item.module)
@@ -220,10 +235,12 @@ proc addDocumentLink(
     },
     "target": targetUri,
   }
-  true
+  result.added = true
 
-proc documentLinks*(params: JsonNode, workspace: Workspace): JsonNode =
-  result = newJArray()
+proc documentLinks*(
+    params: JsonNode, workspace: Workspace
+): tuple[value: JsonNode, needsBootstrap: bool] =
+  result.value = newJArray()
   let textDocument = valueOrEmpty(params, "textDocument")
   if textDocument.kind != JObject or not textDocument.hasKey("uri") or
       textDocument["uri"].kind != JString:
@@ -238,7 +255,8 @@ proc documentLinks*(params: JsonNode, workspace: Workspace): JsonNode =
     return
   let positions = initPositionIndex(snapshot.text)
   for item in snapshot.index.parsed.imports:
-    discard addDocumentLink(result, workspace, snapshot, positions, item)
+    let link = addDocumentLink(result.value, workspace, snapshot, positions, item)
+    result.needsBootstrap = result.needsBootstrap or link.needsBootstrap
   for node in snapshot.index.syntax.nodes:
     if node.kind != syntaxInclude or node.uncertainty != {}:
       continue
@@ -248,7 +266,8 @@ proc documentLinks*(params: JsonNode, workspace: Workspace): JsonNode =
     if parsed.uncertainty != {} or parsed.next != int(node.pastToken):
       continue
     for item in parsed.references:
-      discard addDocumentLink(result, workspace, snapshot, positions, item)
+      let link = addDocumentLink(result.value, workspace, snapshot, positions, item)
+      result.needsBootstrap = result.needsBootstrap or link.needsBootstrap
 
 proc documentHighlights*(params: JsonNode, workspace: Workspace): JsonNode =
   result = newJArray()

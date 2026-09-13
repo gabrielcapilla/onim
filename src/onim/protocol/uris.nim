@@ -2,7 +2,7 @@ import std/[strutils, uri]
 
 proc uriToPath*(uriText: string): string =
   if uriText.startsWith("file://"):
-    result = decodeUrl(uriText[7 .. ^1])
+    result = decodeUrl(uriText[7 .. ^1], decodePlus = false)
     when defined(windows):
       if result.len > 0 and result[0] == '/' and result.len > 2 and result[2] == ':':
         result = result[1 .. ^1]

@@ -1,15 +1,23 @@
 import std/json
 
 import ../session/workspace
+import ../stdlib/map
 import ./call_hierarchy
+import ./completion_response
 import ./location_responses
 import ./navigation
 import ./rename
+import ./text_features
 import ./transport
 
 type
   PendingWorkspaceKind* = enum
     pendingDefinition
+    pendingTypeDefinition
+    pendingHover
+    pendingCompletion
+    pendingSignatureHelp
+    pendingDocumentLink
     pendingReferences
     pendingPrepareRename
     pendingRename
@@ -17,6 +25,7 @@ type
     pendingPrepareCallHierarchy
     pendingIncomingCalls
     pendingOutgoingCalls
+    pendingWorkspaceSymbol
 
   PendingWorkspaceRequest* = object
     kind*: PendingWorkspaceKind
@@ -24,7 +33,12 @@ type
     params*: JsonNode
 
 proc finishPendingWorkspace*(
-    workspace: Workspace, pending: var seq[PendingWorkspaceRequest]
+    workspace: Workspace,
+    stdlib: StdlibMap,
+    pending: var seq[PendingWorkspaceRequest],
+    useStdPrefix: bool,
+    insertReplaceSupport: bool,
+    snippetSupport: bool,
 ) =
   for item in pending:
     case item.kind
@@ -37,6 +51,45 @@ proc finishPendingWorkspace*(
         else:
           response.value,
       )
+    of pendingTypeDefinition:
+      let response = typeDefinitionResponse(item.params, workspace)
+      sendResponse(
+        item.id,
+        if response.needsBootstrap:
+          newJNull()
+        else:
+          response.value,
+      )
+    of pendingHover:
+      let response = hoverResponse(item.params, workspace, stdlib)
+      sendResponse(
+        item.id,
+        if response.needsBootstrap:
+          newJNull()
+        else:
+          response.value,
+      )
+    of pendingCompletion:
+      let response = completionResponse(
+        item.params, workspace, stdlib, useStdPrefix, insertReplaceSupport,
+        snippetSupport,
+      )
+      if response.needsBootstrap:
+        sendError(item.id, -32603, "Workspace completion data unavailable")
+      else:
+        sendResponse(item.id, response.value)
+    of pendingSignatureHelp:
+      let response = signatureHelpResponse(item.params, workspace, stdlib)
+      sendResponse(
+        item.id,
+        if response.needsBootstrap:
+          newJNull()
+        else:
+          response.value,
+      )
+    of pendingDocumentLink:
+      let response = documentLinks(item.params, workspace)
+      sendResponse(item.id, response.value)
     of pendingReferences:
       let response = referencesResponse(item.params, workspace)
       sendResponse(
@@ -88,4 +141,13 @@ proc finishPendingWorkspace*(
         else:
           response.value,
       )
+    of pendingWorkspaceSymbol:
+      sendResponse(item.id, workspaceSymbols(item.params, workspace))
+  pending.setLen(0)
+
+proc failPendingWorkspace*(
+    pending: var seq[PendingWorkspaceRequest], code: int, message: string
+) =
+  for item in pending:
+    sendError(item.id, code, message)
   pending.setLen(0)

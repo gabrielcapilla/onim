@@ -1,6 +1,5 @@
 import std/[json, strutils]
 
-import ../features/definition
 import ../features/definition_models
 import ../features/hierarchy
 import ../session/ids
